@@ -93,12 +93,127 @@ def _resolve_device(torch) -> str:
     return DEVICE
 
 
-def _load_sd_text_encoder(sd_path: str):
+class _TextTower:
     """
-    从 SD1.x 的 .safetensors 里取出 CLIP 文本塔权重，覆盖到内置 CLIP 模型上。
+    把 HF CLIPTextModel（+ 可选投影层）封装成与 CLIPModel.get_text_features 等价的接口，
+    这样 SD1.x / SDXL 的 CLIP-L / SDXL 的 OpenCLIP bigG 都能走同一套下游代码。
+    """
 
-    只读 text_model 那部分张量（用 safe_open 懒加载，不必把 2GB 权重全读进内存）；
-    text_projection 保持原始权重 —— SD 训练时不走这个投影，所以它没被改过。
+    def __init__(self, text_model, projection=None):
+        self.text_model = text_model
+        self.projection = projection
+
+    def eval(self):
+        self.text_model.eval()
+        if self.projection is not None:
+            self.projection.eval()
+        return self
+
+    def to(self, device):
+        self.text_model.to(device)
+        if self.projection is not None:
+            self.projection.to(device)
+        return self
+
+    def get_text_features(self, input_ids=None, attention_mask=None, **kwargs):
+        out = self.text_model(input_ids=input_ids, attention_mask=attention_mask)
+        pooled = out.pooler_output
+        if self.projection is not None:
+            pooled = self.projection(pooled)
+        return pooled
+
+
+def _bigG_from_openclip(state: dict):
+    """
+    OpenCLIP(bigG) 的权重命名 -> HF CLIPTextModel 的命名。
+
+      token_embedding / positional_embedding -> embeddings.*
+      transformer.resblocks.N.attn.in_proj_*  -> self_attn.{q,k,v}_proj.*（按 3 等分拆开）
+      resblocks.N.ln_1 / ln_2                -> encoder.layers.N.layer_norm1 / layer_norm2
+      resblocks.N.mlp.c_fc / c_proj          -> mlp.fc1 / fc2
+      ln_final                               -> final_layer_norm
+    """
+    from transformers import CLIPTextConfig, CLIPTextModel
+
+    vocab_size, width = state["token_embedding.weight"].shape
+    pos = state["positional_embedding"]
+    n_layers = 1 + max(
+        int(k.split(".")[2]) for k in state if k.startswith("transformer.resblocks.")
+    )
+    intermediate = state["transformer.resblocks.0.mlp.c_fc.weight"].shape[0]
+
+    cfg = CLIPTextConfig(
+        vocab_size=int(vocab_size),
+        hidden_size=int(width),
+        intermediate_size=int(intermediate),
+        num_hidden_layers=int(n_layers),
+        num_attention_heads=int(width) // 64,
+        max_position_embeddings=int(pos.shape[0]),
+        hidden_act="gelu",  # OpenCLIP 系用 GELU（不是 OpenAI CLIP 的 quick_gelu）
+        layer_norm_eps=1e-5,
+        attention_dropout=0.0,
+        bos_token_id=49406,
+        eos_token_id=49407,
+        pad_token_id=49407,
+    )
+
+    out = {
+        "embeddings.token_embedding.weight": state["token_embedding.weight"],
+        "embeddings.position_embedding.weight": pos,
+        "final_layer_norm.weight": state["ln_final.weight"],
+        "final_layer_norm.bias": state["ln_final.bias"],
+    }
+
+    for i in range(int(n_layers)):
+        b = f"transformer.resblocks.{i}."
+        q, k, v = state[b + "attn.in_proj_weight"].chunk(3, dim=0)
+        out[f"encoder.layers.{i}.self_attn.q_proj.weight"] = q
+        out[f"encoder.layers.{i}.self_attn.k_proj.weight"] = k
+        out[f"encoder.layers.{i}.self_attn.v_proj.weight"] = v
+        qb, kb, vb = state[b + "attn.in_proj_bias"].chunk(3, dim=0)
+        out[f"encoder.layers.{i}.self_attn.q_proj.bias"] = qb
+        out[f"encoder.layers.{i}.self_attn.k_proj.bias"] = kb
+        out[f"encoder.layers.{i}.self_attn.v_proj.bias"] = vb
+        out[f"encoder.layers.{i}.self_attn.out_proj.weight"] = state[b + "attn.out_proj.weight"]
+        out[f"encoder.layers.{i}.self_attn.out_proj.bias"] = state[b + "attn.out_proj.bias"]
+        out[f"encoder.layers.{i}.layer_norm1.weight"] = state[b + "ln_1.weight"]
+        out[f"encoder.layers.{i}.layer_norm1.bias"] = state[b + "ln_1.bias"]
+        out[f"encoder.layers.{i}.layer_norm2.weight"] = state[b + "ln_2.weight"]
+        out[f"encoder.layers.{i}.layer_norm2.bias"] = state[b + "ln_2.bias"]
+        out[f"encoder.layers.{i}.mlp.fc1.weight"] = state[b + "mlp.c_fc.weight"]
+        out[f"encoder.layers.{i}.mlp.fc1.bias"] = state[b + "mlp.c_fc.bias"]
+        out[f"encoder.layers.{i}.mlp.fc2.weight"] = state[b + "mlp.c_proj.weight"]
+        out[f"encoder.layers.{i}.mlp.fc2.bias"] = state[b + "mlp.c_proj.bias"]
+
+    text_model = CLIPTextModel(cfg)
+    missing, _unexpected = text_model.load_state_dict(out, strict=False)
+    if missing:
+        raise ValueError(f"bigG 权重对不上，缺少 {len(missing)} 项，例如 {list(missing)[:3]}")
+
+    projection = None
+    proj = state.get("text_projection")
+    if proj is not None:
+        import torch.nn as nn
+
+        lin = nn.Linear(int(width), int(width))
+        # OpenCLIP 的用法是 x @ text_projection；HF nn.Linear 是 x @ weight.T，故存转置
+        lin.weight.data = proj.t().contiguous().float()
+        lin.bias.data.zero_()
+        projection = lin
+
+    print(f"[ok] bigG: {n_layers} 层 / hidden {width} / vocab {vocab_size}")
+    return text_model, projection
+
+
+def _load_sd_text_encoder(sd_path: str, which: str = "auto"):
+    """
+    从 SD 单文件 ckpt 里取 CLIP 文本塔，返回 (model, label, source)。
+
+      SD1.x : cond_stage_model.transformer.text_model.*             -> CLIPModel（768）
+      SDXL  : conditioner.embedders.0.transformer.text_model.*      -> CLIPModel（CLIP-L，768）
+              conditioner.embedders.1.model.*                       -> OpenCLIP bigG（CLIP-G，1280）
+
+    which: 'auto'（默认优先 CLIP-L）/ 'l' / 'g'
     """
     from safetensors import safe_open
     from transformers import CLIPModel
@@ -106,42 +221,66 @@ def _load_sd_text_encoder(sd_path: str):
     if not os.path.isfile(sd_path):
         raise FileNotFoundError(f"文件不存在: {sd_path}")
 
-    model = CLIPModel.from_pretrained(MODEL_NAME)
+    base = os.path.basename(sd_path)
+    prefixes = SD_TEXT_PREFIXES + ("conditioner.embedders.0.transformer.",)
 
     with safe_open(sd_path, framework="pt", device="cpu") as f:
         all_keys = list(f.keys())
+
         prefix = None
-        for p in SD_TEXT_PREFIXES:
+        for p in prefixes:
             if any(k.startswith(p + "text_model.") for k in all_keys):
                 prefix = p
                 break
-        if prefix is None:
-            raise ValueError("该文件里找不到 CLIP text_model 权重（不是 SD1.x 格式的 ckpt？）")
 
-        tm_keys = [k for k in all_keys if k.startswith(prefix + "text_model.")]
-        inner = prefix + "text_model."
-        # 目标是 model.text_model（CLIPTextModel），所以 "…text_model." 整段都要剥掉
-        state = {k[len(inner):]: f.get_tensor(k).float() for k in tm_keys}
+        has_bigg = any(k.startswith("conditioner.embedders.1.model.") for k in all_keys)
+
+        if which == "g" and not has_bigg:
+            raise ValueError("该 ckpt 里没有 OpenCLIP bigG 文本塔（conditioner.embedders.1）")
+
+        use_g = which == "g" or (which == "auto" and prefix is None and has_bigg)
+
+        if use_g:
+            gp = "conditioner.embedders.1.model."
+            gkeys = [k for k in all_keys if k.startswith(gp)]
+            gstate = {k[len(gp):]: f.get_tensor(k).float() for k in gkeys}
+
+        if not use_g:
+            if prefix is None:
+                raise ValueError("该文件里找不到 CLIP text_model 权重（既不是 SD1.x 也不是 SDXL？）")
+            inner = prefix + "text_model."
+            tm_keys = [k for k in all_keys if k.startswith(inner)]
+            # 目标是 model.text_model（CLIPTextModel），所以 "…text_model." 整段都要剥掉
+            lstate = {k[len(inner):]: f.get_tensor(k).float() for k in tm_keys}
+
+    if use_g:
+        text_model, projection = _bigG_from_openclip(gstate)
+        print(f"[ok] 已从 {base} 载入 CLIP-G（OpenCLIP bigG，{len(gkeys)} 个张量）")
+        return _TextTower(text_model, projection), f"SDXL CLIP-G · {base}", "sd-ckpt-g"
 
     # transformers 里 position_ids 是 non-persistent buffer，不在 state_dict 里
-    state.pop("embeddings.position_ids", None)
+    lstate.pop("embeddings.position_ids", None)
 
-    missing, unexpected = model.text_model.load_state_dict(state, strict=False)
+    model = CLIPModel.from_pretrained(MODEL_NAME)
+    missing, _unexpected = model.text_model.load_state_dict(lstate, strict=False)
     if missing:
         raise ValueError(f"权重对不上，缺少 {len(missing)} 项，例如 {list(missing)[:3]}")
 
-    print(f"[ok] 已从 {os.path.basename(sd_path)} 载入 text encoder（{len(tm_keys)} 个张量）")
-    return model, f"SD ckpt text encoder · {os.path.basename(sd_path)}"
+    suffix = "CLIP-L" if prefix.startswith("conditioner.embedders.0") else "text encoder"
+    print(f"[ok] 已从 {base} 载入 {suffix}（{len(tm_keys)} 个张量）")
+    return model, f"SD ckpt {suffix} · {base}", "sd-ckpt"
 
 
-def build_model(clip_path: str | None = None, sd_path: str | None = None):
+def build_model(
+    clip_path: str | None = None, sd_path: str | None = None, sd_which: str = "auto"
+):
     """按优先级构建模型：SD ckpt > 自定义 CLIP 路径 > 内置。"""
     from transformers import CLIPModel, CLIPTokenizer
 
     if sd_path:
-        model, label = _load_sd_text_encoder(sd_path)
-        tokenizer = CLIPTokenizer.from_pretrained(MODEL_NAME)  # SD1.x 词表与 CLIP 相同
-        return model, tokenizer, label, "sd-ckpt", sd_path
+        model, label, source = _load_sd_text_encoder(sd_path, sd_which)
+        tokenizer = CLIPTokenizer.from_pretrained(MODEL_NAME)  # SD 系的词表与 CLIP 相同
+        return model, tokenizer, label, source, sd_path
 
     if clip_path:
         model = CLIPModel.from_pretrained(clip_path)
@@ -181,7 +320,9 @@ def _release_model() -> None:
     _baseline_cache.clear()
 
 
-def apply_model(clip_path: str | None = None, sd_path: str | None = None) -> dict:
+def apply_model(
+    clip_path: str | None = None, sd_path: str | None = None, sd_which: str = "auto"
+) -> dict:
     """
     切换模型：先在 CPU 上把新模型构建好，成功后才释放旧模型并挂载。
     这样即使新路径有问题、加载失败，旧的仍然可用。
@@ -201,7 +342,7 @@ def apply_model(clip_path: str | None = None, sd_path: str | None = None) -> dic
         _state["torch"] = torch
         device = _resolve_device(torch)
 
-        model, tokenizer, label, source, key = build_model(clip_path, sd_path)
+        model, tokenizer, label, source, key = build_model(clip_path, sd_path, sd_which)
         model.eval()
 
         actual_device = "cpu"
@@ -575,8 +716,11 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/model/reload":
                 clip_path = str(payload.get("clipPath") or "").strip() or None
                 sd_path = str(payload.get("sdPath") or "").strip() or None
+                sd_which = str(payload.get("sdWhich") or "auto").strip().lower()
+                if sd_which not in ("auto", "l", "g"):
+                    sd_which = "auto"
                 try:
-                    self._json(apply_model(clip_path, sd_path))
+                    self._json(apply_model(clip_path, sd_path, sd_which))
                 except Exception as exc:  # noqa: BLE001
                     self._json({"error": f"重载失败: {type(exc).__name__}: {exc}"}, 500)
                 return

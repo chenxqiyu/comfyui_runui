@@ -7,6 +7,7 @@ const backendMissing = ref(false)
 const open = ref(false)
 const clipPath = ref('')
 const sdPath = ref('')
+const sdWhich = ref('auto')
 const reloading = ref(false)
 const message = ref('')
 let timer = null
@@ -41,7 +42,11 @@ async function reload() {
     const res = await fetch('./api/model/reload', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ clipPath: clipPath.value.trim(), sdPath: sdPath.value.trim() }),
+      body: JSON.stringify({
+        clipPath: clipPath.value.trim(),
+        sdPath: sdPath.value.trim(),
+        sdWhich: sdWhich.value,
+      }),
     })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
@@ -113,9 +118,18 @@ function useBuiltin() {
 
       <div class="field">
         <div class="label">
-          SD 模型路径（.safetensors，留空 = 不使用；会从 ckpt 中提取 CLIP text encoder）
+          SD 模型路径（.safetensors，留空 = 不使用；会从 ckpt 中提取 CLIP text encoder，支持 SD1.x 与 SDXL）
         </div>
         <el-input v-model="sdPath" clearable :placeholder="sdPlaceholder" />
+      </div>
+
+      <div class="field">
+        <div class="label">取哪个文本塔（SDXL 有 CLIP-L 与 CLIP-G 两个；SD1.x 只有一个）</div>
+        <el-radio-group v-model="sdWhich" size="small">
+          <el-radio-button value="auto">自动（优先 CLIP-L）</el-radio-button>
+          <el-radio-button value="l">CLIP-L（768）</el-radio-button>
+          <el-radio-button value="g">CLIP-G / bigG（1280）</el-radio-button>
+        </el-radio-group>
       </div>
 
       <div class="actions">
