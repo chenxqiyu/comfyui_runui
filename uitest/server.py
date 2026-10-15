@@ -35,8 +35,8 @@ DIST = ROOT / "dist"
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("PORT", "5199"))
 MODEL_NAME = os.environ.get("CLIP_MODEL", "openai/clip-vit-large-patch14")
 COMFY_ROOT = os.environ.get("COMFYUI_ROOT", r"F:\ai\fastai")
-# SD1.x ckpt 里 CLIP 文本塔的 key 前缀（按顺序尝试）
-SD_TEXT_PREFIXES = ("cond_stage_model.transformer.", "cond_stage_model.", "transformer.")
+# SD1.x/SDXL ckpt 里 CLIP 文本塔的 key 前缀（按顺序尝试；空串 = 裸 text_model.*，如 clip_l.safetensors）
+SD_TEXT_PREFIXES = ("cond_stage_model.transformer.", "cond_stage_model.", "transformer.", "")
 # cuda / cpu / auto（默认 auto：有可用显卡就走显卡）
 DEVICE = os.environ.get("CLIP_DEVICE", "auto").strip().lower()
 
@@ -299,6 +299,67 @@ def build_model(
     return model, tokenizer, MODEL_NAME, "builtin", "builtin"
 
 
+# ------------------------------------------- 文件格式嗅探（决定走哪条路）
+def sniff_model_file(path: str) -> dict:
+    """
+    只读 safetensors 头部（毫秒级），判断这个文件该走哪条加载路径：
+
+      comfy -> ComfyUI 私有量化格式（convrot_w4a4 / fp8_scaled 等）或 LLM 文本塔，
+               只能用 ComfyUI 自己的加载栈；
+      hf    -> 标准 SD1.x / SDXL / CLIP 权重，可被 transformers 解析。
+    """
+    if os.path.isdir(path):
+        return {"route": "hf", "kind": "dir", "reason": "本地目录（HF 模型）"}
+
+    if not path.lower().endswith(".safetensors"):
+        return {"route": "hf", "kind": "other", "reason": "非 safetensors，交给 transformers 处理"}
+
+    import struct
+
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(n))
+
+    meta = header.pop("__metadata__", None) or {}
+    keys = list(header)
+
+    quant = None
+    raw_quant = meta.get("_quantization_metadata")
+    if raw_quant:
+        try:
+            quant = json.loads(raw_quant)
+        except Exception:  # noqa: BLE001
+            quant = {"format_version": "unparsed"}
+
+    if quant or any(k.endswith(".weight_scale") for k in keys[:3000]):
+        fmt = (quant or {}).get("format_version") or "unknown"
+        return {
+            "route": "comfy",
+            "kind": "quantized",
+            "reason": f"ComfyUI 量化格式（format_version={fmt}）",
+            "tensors": len(keys),
+        }
+
+    if any(k.startswith("conditioner.embedders.") for k in keys):
+        return {"route": "hf", "kind": "sdxl", "reason": "SDXL 单文件 ckpt"}
+
+    if any(k.startswith("cond_stage_model.transformer.text_model.") for k in keys):
+        return {"route": "hf", "kind": "sd1", "reason": "SD1.x 单文件 ckpt"}
+
+    if any(k.startswith("text_model.encoder.layers.") for k in keys):
+        return {"route": "hf", "kind": "clip", "reason": "独立的 CLIP text encoder"}
+
+    if any(k.startswith("model.language_model.") or k.startswith("model.layers.") for k in keys):
+        return {
+            "route": "comfy",
+            "kind": "llm",
+            "reason": "LLM 系文本塔（需要 ComfyUI 的 tokenizer / chat 模板）",
+            "tensors": len(keys),
+        }
+
+    return {"route": "hf", "kind": "unknown", "reason": "未识别的 safetensors，先按 transformers 尝试"}
+
+
 # --------------------------------------------- ComfyUI 原生加载（Qwen 系等）
 def _ensure_comfy():
     if COMFY_ROOT not in sys.path:
@@ -320,9 +381,14 @@ def _load_comfy_clip(sd_path: str, type_name: str):
     if not os.path.isfile(sd_path):
         raise FileNotFoundError(f"文件不存在: {sd_path}")
 
-    ct = getattr(comfy_sd.CLIPType, str(type_name).strip().upper(), None)
-    if ct is None:
-        raise ValueError(f"ComfyUI 里没有这个 CLIP 类型: {type_name}")
+    name = str(type_name or "").strip()
+    if name.lower() in ("", "auto"):
+        # 中性类型：comfy 自己会按权重 detect_te_model，LLM 文本塔一般落到通用分支
+        ct = comfy_sd.CLIPType.STABLE_DIFFUSION
+    else:
+        ct = getattr(comfy_sd.CLIPType, name.upper(), None)
+        if ct is None:
+            raise ValueError(f"ComfyUI 里没有这个 CLIP 类型: {name}")
 
     return comfy_sd.load_clip([sd_path], embedding_directory=None, clip_type=ct)
 
@@ -349,6 +415,61 @@ def _comfy_encode_features(words):
 
     mat = torch.stack(vecs, dim=0)
     return mat / mat.norm(dim=-1, keepdim=True)
+
+
+def _current_hf_tokenizer():
+    """拿到当前模型底层的 HF tokenizer（用于分词展示）。"""
+    if _state.get("comfy_clip") is not None:
+        tk = _state["comfy_clip"].tokenizer
+        inner = getattr(tk, getattr(tk, "clip_name", ""), None) or tk
+        return getattr(inner, "tokenizer", None)
+    return _state.get("tokenizer")
+
+
+def _raw_piece_to_text(tok, raw: str) -> str:
+    """byte-level BPE 片段 -> 可读文本（CLIP 与 Qwen 都用 byte_decoder 映射）。"""
+    body = raw[:-4] if raw.endswith("</w>") else raw
+    bd = getattr(tok, "byte_decoder", None)
+    if not bd:
+        return body
+    try:
+        data = bytes(bd[c] for c in body if c in bd)
+    except Exception:  # noqa: BLE001
+        return body
+    return data.decode("utf-8", errors="replace")
+
+
+def tokenize_with_current(text: str) -> dict:
+    """
+    用「当前加载的模型」的分词器切分文本，仅供展示 —— 不带 chat 模板，
+    这样切到 krea2/Qwen 时就能直接看到它的词表怎么切（例如 张三丰 -> 3 个 token）。
+    """
+    tok = _current_hf_tokenizer()
+    if tok is None:
+        raise ValueError("当前模型没有可用的 tokenizer")
+
+    ids = list(tok.encode(text, add_special_tokens=False))
+    pieces = tok.convert_ids_to_tokens(ids)
+
+    items = [
+        {"id": int(t), "token": raw, "text": _raw_piece_to_text(tok, raw)}
+        for t, raw in zip(ids, pieces)
+    ]
+
+    try:
+        decoded = tok.decode(ids, skip_special_tokens=True)
+    except Exception:  # noqa: BLE001
+        decoded = ""
+
+    return {
+        "text": text,
+        "tokenizer": type(tok).__name__,
+        "vocabSize": getattr(tok, "vocab_size", None),
+        "items": items,
+        "decoded": decoded,
+        "model": _state.get("model_label"),
+        "source": _state.get("model_source"),
+    }
 
 
 def _require_hf_tower(feature: str):
@@ -414,6 +535,17 @@ def apply_model(
         _state["torch"] = torch
         device = _resolve_device(torch)
 
+        # ---- 自动嗅探文件格式，决定走哪条路
+        sniff = None
+        if sd_path and not comfy_type:
+            try:
+                sniff = sniff_model_file(sd_path)
+                print(f"[·] 嗅探 {os.path.basename(sd_path)}: {sniff['reason']} => {sniff['route']}")
+                if sniff["route"] == "comfy":
+                    comfy_type = "auto"
+            except Exception as exc:  # noqa: BLE001
+                print(f"[!] 嗅探失败，按 transformers 尝试: {exc}")
+
         # ---- ComfyUI 原生加载（Qwen 系等 ComfyUI 私有量化格式）
         if comfy_type:
             if not sd_path:
@@ -432,6 +564,7 @@ def apply_model(
                 "label": _state["model_label"],
                 "source": "comfy",
                 "device": "由 ComfyUI 管理",
+                "detected": sniff,
             }
 
         model, tokenizer, label, source, key = build_model(clip_path, sd_path, sd_which)
@@ -457,7 +590,10 @@ def apply_model(
         _state["error"] = None
 
         print(f"[ok] 模型已就绪: {label}  source={source}  device={actual_device}")
-        return {"changed": True, "label": label, "source": source, "device": actual_device}
+        result = {"changed": True, "label": label, "source": source, "device": actual_device}
+        if sniff is not None:
+            result["detected"] = sniff
+        return result
 
 
 def load_model() -> None:
@@ -805,7 +941,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         path = unquote(urlparse(self.path).path)
-        if path not in ("/api/similarity", "/api/nearest", "/api/matrix/build", "/api/model/reload"):
+        if path not in ("/api/similarity", "/api/nearest", "/api/matrix/build", "/api/model/reload", "/api/tokenize"):
             self._json({"error": "not found"}, 404)
             return
 
@@ -832,6 +968,15 @@ class Handler(BaseHTTPRequestHandler):
                     {"error": _state["error"] or "模型仍在加载中，请稍候重试", "loading": not _state["error"]},
                     503,
                 )
+                return
+
+            # ---- 用当前模型的分词器切分（仅供展示，不带 chat 模板）
+            if path == "/api/tokenize":
+                text = str(payload.get("text") or "")
+                try:
+                    self._json(tokenize_with_current(text))
+                except Exception as exc:  # noqa: BLE001
+                    self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
                 return
 
             # ---- 触发/重建词表嵌入矩阵（自定义预计算的 token 数）

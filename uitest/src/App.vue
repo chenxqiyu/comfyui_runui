@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { createClipTokenizer, MAX_LENGTH, START_TOKEN, END_TOKEN } from './lib/clipTokenizer.js'
 import SimilarityPanel from './components/SimilarityPanel.vue'
@@ -69,6 +69,36 @@ const encodeResult = computed(() => {
 const hasByteFragment = computed(() =>
   Boolean(encodeResult.value?.rows?.some((r) => String(r.text).startsWith('\\x')))
 )
+
+/* ============================== 按当前后端模型分词 ============================== */
+const useBackend = ref(false)
+const backendLoading = ref(false)
+const backendTokens = ref(null)
+let backendTimer = null
+
+async function fetchBackendTokens() {
+  backendLoading.value = true
+  try {
+    const res = await fetch('./api/tokenize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: text.value }),
+    })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+    backendTokens.value = data
+  } catch (e) {
+    backendTokens.value = { error: e?.message || String(e), items: [] }
+  } finally {
+    backendLoading.value = false
+  }
+}
+
+watch([text, useBackend], () => {
+  if (!useBackend.value) return
+  clearTimeout(backendTimer)
+  backendTimer = setTimeout(fetchBackendTokens, 300)
+})
 
 /* ================================================== ID / 词表查询 */
 const query = ref('')
@@ -175,7 +205,64 @@ async function copyValue(v) {
             <span class="switch-text">解析 <code class="mono">(词:权重)</code> 语法</span>
           </div>
 
-          <template v-if="encodeResult && !encodeResult.error">
+          <div class="toolbar">
+            <el-switch v-model="useBackend" />
+            <span class="switch-text">
+              按<b>当前后端模型</b>的分词器切分（切到 krea2 时就能看到 Qwen 的词表，例如「张三丰」→ 3 个 token）
+            </span>
+          </div>
+
+          <!-- ============ 按当前后端模型分词 ============ -->
+          <template v-if="useBackend">
+            <div v-if="backendLoading" class="loading-line">正在用当前模型分词…</div>
+
+            <el-alert
+              v-else-if="backendTokens?.error"
+              type="error"
+              :closable="false"
+              :title="backendTokens.error"
+              class="mt"
+            />
+
+            <template v-else-if="backendTokens">
+              <div class="stats">
+                <div class="stat">
+                  <div class="num">{{ backendTokens.items.length }}</div>
+                  <div class="cap">Token 数</div>
+                </div>
+                <div class="stat">
+                  <div class="num">{{ Number(backendTokens.vocabSize || 0).toLocaleString() }}</div>
+                  <div class="cap">词表大小</div>
+                </div>
+                <div class="stat">
+                  <div class="num small">{{ backendTokens.tokenizer }}</div>
+                  <div class="cap">{{ backendTokens.model }}</div>
+                </div>
+              </div>
+
+              <el-table :data="backendTokens.items" size="small" stripe max-height="440" class="table">
+                <el-table-column prop="id" label="Token ID" width="140" />
+                <el-table-column label="BPE 片段" min-width="190">
+                  <template #default="{ row }">
+                    <span class="mono token-raw">{{ row.token }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="字面文本" min-width="190">
+                  <template #default="{ row }">
+                    <span class="mono token-text">{{ row.text || '—' }}</span>
+                  </template>
+                </el-table-column>
+                <template #empty>没有 token（输入为空）</template>
+              </el-table>
+
+              <div class="decode">
+                <div class="decode-label">分词还原</div>
+                <div class="mono decode-body">{{ backendTokens.decoded || '（空）' }}</div>
+              </div>
+            </template>
+          </template>
+
+          <template v-else-if="encodeResult && !encodeResult.error">
             <div class="stats">
               <div class="stat">
                 <div class="num">{{ encodeResult.count }}</div>
@@ -482,6 +569,23 @@ async function copyValue(v) {
   font-size: 12px;
   color: #8d9bb0;
   margin-top: 2px;
+}
+
+.stat .num.small {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.loading-line {
+  margin-top: 18px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: #f8faff;
+  border: 1px solid #e9effa;
+  font-size: 13px;
+  color: #5c6b7f;
 }
 
 .stat-wide {

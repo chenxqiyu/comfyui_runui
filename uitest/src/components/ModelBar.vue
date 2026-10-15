@@ -53,8 +53,19 @@ async function reload() {
     const data = await res.json()
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
 
+    const routeLabel =
+      data.source === 'sd-ckpt'
+        ? 'SD ckpt text encoder'
+        : data.source === 'sd-ckpt-g'
+          ? 'SDXL CLIP-G'
+          : data.source === 'clip-path'
+            ? '自定义 CLIP'
+            : data.source === 'comfy'
+              ? 'ComfyUI 加载栈'
+              : '内置'
     message.value = data.changed
-      ? `已切换为：${data.label}（${data.source === 'sd-ckpt' ? 'SD ckpt text encoder' : data.source === 'clip-path' ? '自定义 CLIP' : '内置'} · ${data.device}）`
+      ? `已切换为：${data.label}（${routeLabel} · ${data.device}）` +
+        (data.detected ? `\n自动判断：${data.detected.reason}` : '')
       : data.reason || '未发生变化'
     ElMessage.success(data.changed ? '模型已重载' : '已就绪')
     await refreshStatus()
@@ -136,15 +147,15 @@ function useBuiltin() {
 
       <div class="field">
         <div class="label">
-          ComfyUI 类型（可选）—— 填了就用 <b>ComfyUI 自己的加载栈</b>读文件，
-          这是唯一能吃下 ComfyUI 私有量化格式（如 convrot_w4a4 / Qwen 系）的方式。
-          取值就是 ComfyUI「加载CLIP」节点里那个下拉的值，例如 <code class="mono">krea2</code> /
-          <code class="mono">qwen_image</code> / <code class="mono">flux</code>。
+          ComfyUI 类型（可选）—— <b>留空会自动嗅探文件格式</b>：若是 ComfyUI 私有量化格式
+          （convrot_w4a4 / fp8_scaled）或 LLM 文本塔，就自动切到 ComfyUI 的加载栈；否则用 transformers
+          解析。需要指定具体用途时再填 ComfyUI「加载CLIP」节点里那个下拉值，例如
+          <code class="mono">krea2</code> / <code class="mono">qwen_image</code> / <code class="mono">flux</code>。
         </div>
         <el-input
           v-model="comfyType"
           clearable
-          placeholder="如 krea2（留空 = 用 transformers 解析 SD1.x / SDXL ckpt）"
+          placeholder="留空 = 自动判断；也可填 krea2 / qwen_image / flux …"
         />
         <div class="hint mt6">
           注意：LLM 系文本塔（Qwen 等）逐词套 chat 模板，结果与 CLIP 系不可直接比较，
