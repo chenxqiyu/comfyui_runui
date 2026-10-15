@@ -119,10 +119,12 @@ def _load_sd_text_encoder(sd_path: str):
             raise ValueError("该文件里找不到 CLIP text_model 权重（不是 SD1.x 格式的 ckpt？）")
 
         tm_keys = [k for k in all_keys if k.startswith(prefix + "text_model.")]
-        state = {k[len(prefix):]: f.get_tensor(k).float() for k in tm_keys}
+        inner = prefix + "text_model."
+        # 目标是 model.text_model（CLIPTextModel），所以 "…text_model." 整段都要剥掉
+        state = {k[len(inner):]: f.get_tensor(k).float() for k in tm_keys}
 
     # transformers 里 position_ids 是 non-persistent buffer，不在 state_dict 里
-    state.pop("text_model.embeddings.position_ids", None)
+    state.pop("embeddings.position_ids", None)
 
     missing, unexpected = model.text_model.load_state_dict(state, strict=False)
     if missing:
@@ -317,7 +319,11 @@ def _model_tag() -> str:
 
 
 def _matrix_cache_path(limit: int):
-    return CACHE_DIR / f"vocab_emb_{_model_tag()}_{limit}_fp16.npy"
+    tag = _model_tag()
+    # 内置模型沿用早期命名，避免历史缓存作废
+    if tag == "builtin":
+        return CACHE_DIR / f"vocab_emb_{limit}_fp16.npy"
+    return CACHE_DIR / f"vocab_emb_{tag}_{limit}_fp16.npy"
 
 
 def _compute_matrix(limit: int, start: int, end: int, batch_size: int, use_cuda: bool):
