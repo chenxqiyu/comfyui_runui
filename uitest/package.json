@@ -1,0 +1,22 @@
+{
+  "name": "clip-token-lookup",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "纯前端 CLIP (SD1.x) Token 查询器 —— 输入单词/提示词，查看对应的 token id",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 5199",
+    "serve": "node tools/serve.mjs",
+    "compare": "node tools/compare.mjs"
+  },
+  "dependencies": {
+    "element-plus": "latest",
+    "vue": "latest"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "latest",
+    "vite": "latest"
+  }
+}
