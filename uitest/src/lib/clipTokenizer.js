@@ -432,7 +432,13 @@ export class ClipTokenizer {
     return decoded.replace(/<\/w>/g, ' ').trim()
   }
 
-  /** 单个 BPE 片段的“字面文本”，用于表格展示 */
+  /**
+   * 单个 BPE 片段的“字面文本”。
+   *
+   * 注意：CLIP 是 byte-level BPE，一个汉字（3 字节 UTF-8）会被拆成 3 个字节级 token，
+   * 单个 token 往往是「半个字符」，硬解 UTF-8 只会得到 �。这种情况改用十六进制
+   * 展示字节本身（如 \xE5），信息量更大；完整文本请看「分词还原」那一栏。
+   */
   tokenToText(rawToken) {
     if (typeof rawToken !== 'string') return ''
     const body = rawToken.endsWith('</w>') ? rawToken.slice(0, -4) : rawToken
@@ -441,7 +447,11 @@ export class ClipTokenizer {
       const b = this.byteDecoder.get(ch)
       if (b !== undefined) bytes.push(b)
     }
-    return new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(bytes))
+    const decoded = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(bytes))
+    if (decoded.includes('\ufffd')) {
+      return bytes.map((b) => '\\x' + b.toString(16).toUpperCase().padStart(2, '0')).join('')
+    }
+    return decoded
   }
 
   /* --------------------------------------------------------- 词表检索 */

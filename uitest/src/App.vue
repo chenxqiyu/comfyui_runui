@@ -66,6 +66,10 @@ const encodeResult = computed(() => {
   }
 })
 
+const hasByteFragment = computed(() =>
+  Boolean(encodeResult.value?.rows?.some((r) => String(r.text).startsWith('\\x')))
+)
+
 /* ================================================== ID / 词表查询 */
 const query = ref('')
 const isNumericQuery = computed(() => /^\s*\d+\s*$/.test(query.value))
@@ -202,6 +206,12 @@ async function copyValue(v) {
                   title="长度在 CLIP 单段上限内"
                 />
               </div>
+            </div>
+
+            <div v-if="hasByteFragment" class="byte-tip">
+              提示：像 <code class="mono">\xE5</code> 这样的是 <b>UTF-8 字节片段</b> ——
+              CLIP 会把汉字 / emoji 拆成若干“字节级 token”，单个 token 无法独立成字，所以改用十六进制显示。
+              完整文本请看下面的「分词还原」。
             </div>
 
             <el-table :data="encodeResult.rows" size="small" stripe max-height="440" class="table">
@@ -482,6 +492,23 @@ async function copyValue(v) {
 .table {
   border-radius: 10px;
   overflow: hidden;
+}
+
+.byte-tip {
+  margin: 14px 0 10px;
+  padding: 10px 14px;
+  border-radius: 9px;
+  background: #f6f9ff;
+  border: 1px solid #e4ecfb;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: #5b6b86;
+}
+
+.byte-tip code {
+  background: #eaf0fc;
+  padding: 1px 5px;
+  border-radius: 4px;
 }
 
 .token-id {
