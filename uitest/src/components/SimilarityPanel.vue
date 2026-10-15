@@ -128,14 +128,14 @@ const rows = computed(() => {
 
     <el-alert
       v-else-if="!status.ready"
-      type="info"
+      type="warning"
       :closable="false"
       show-icon
-      title="CLIP 文本塔正在加载，首次约 10~30 秒…"
+      title="还没有加载模型"
       class="mb"
     >
       <template #default>
-        <div class="tip mono">{{ status.model || 'openai/clip-vit-large-patch14' }}</div>
+        <div class="tip">请在上方「自定义模型路径」里选择模型后点「重载」。</div>
       </template>
     </el-alert>
 

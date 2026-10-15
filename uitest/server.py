@@ -23,6 +23,7 @@ import random
 import sys
 import threading
 import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -35,6 +36,9 @@ DIST = ROOT / "dist"
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("PORT", "5199"))
 MODEL_NAME = os.environ.get("CLIP_MODEL", "openai/clip-vit-large-patch14")
 COMFY_ROOT = os.environ.get("COMFYUI_ROOT", r"F:\ai\fastai")
+# ComfyUI 服务地址 + 模型根目录（用于「从 ComfyUI 读取」可用 CLIP 列表）
+COMFY_API = os.environ.get("COMFYUI_API", "http://127.0.0.1:8189")
+COMFY_MODELS_ROOT = os.environ.get("COMFYUI_MODELS", os.path.join(COMFY_ROOT, "models"))
 # SD1.x/SDXL ckpt 里 CLIP 文本塔的 key 前缀（按顺序尝试；空串 = 裸 text_model.*，如 clip_l.safetensors）
 SD_TEXT_PREFIXES = ("cond_stage_model.transformer.", "cond_stage_model.", "transformer.", "")
 # cuda / cpu / auto（默认 auto：有可用显卡就走显卡）
@@ -75,8 +79,8 @@ _state = {
     "matrix_source": None,  # 'cache' | 'cuda' | 'cpu'
     "matrix_building": False,
     # 模型来源
-    "model_label": MODEL_NAME,
-    "model_source": "builtin",  # 'builtin' | 'clip-path' | 'sd-ckpt' | 'sd-ckpt-g' | 'comfy'
+    "model_label": "（未加载）",
+    "model_source": None,  # 'builtin' | 'clip-path' | 'sd-ckpt' | 'sd-ckpt-g' | 'comfy'
     "model_key": "builtin",
     "comfy_clip": None,  # ComfyUI 直接加载的 CLIP 对象（Qwen 系等）
 }
@@ -358,6 +362,60 @@ def sniff_model_file(path: str) -> dict:
         }
 
     return {"route": "hf", "kind": "unknown", "reason": "未识别的 safetensors，先按 transformers 尝试"}
+
+
+# ------------------------------------- 「从 ComfyUI 读取」可用 CLIP 列表
+def comfy_clip_list() -> dict:
+    """
+    问 ComfyUI 要 CLIPLoader 的可选项（clip_name / type），
+    再把 clip_name 还原成这台机器上的真实文件路径，供前端直接选用。
+    """
+    url = COMFY_API.rstrip("/") + "/object_info/CLIPLoader"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = json.load(resp)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"连不上 ComfyUI（{COMFY_API}）：{type(exc).__name__}: {exc}。"
+            "可用环境变量 COMFYUI_API 指定地址，例如 http://127.0.0.1:8188"
+        ) from exc
+
+    info = data.get("CLIPLoader") or {}
+    required = (info.get("input") or {}).get("required") or {}
+
+    def options(key):
+        v = required.get(key)
+        if isinstance(v, list) and v and isinstance(v[0], list):
+            return list(v[0])
+        return []
+
+    names = options("clip_name")
+    types = options("type")
+
+    roots = [
+        os.path.join(COMFY_MODELS_ROOT, "text_encoders"),
+        os.path.join(COMFY_MODELS_ROOT, "clip"),
+    ]
+
+    items = []
+    for name in names:
+        rel = str(name).replace("/", os.sep).replace("\\", os.sep)
+        resolved = None
+        for root in roots:
+            cand = os.path.join(root, rel)
+            if os.path.isfile(cand):
+                resolved = cand
+                break
+        items.append({"name": name, "path": resolved, "exists": resolved is not None})
+
+    return {
+        "api": COMFY_API,
+        "modelsRoot": COMFY_MODELS_ROOT,
+        "clipNames": names,
+        "types": types,
+        "items": items,
+        "found": sum(1 for i in items if i["exists"]),
+    }
 
 
 # --------------------------------------------- ComfyUI 原生加载（Qwen 系等）
@@ -924,7 +982,7 @@ class Handler(BaseHTTPRequestHandler):
                 "model": _state["model_label"],
                 "modelBuiltin": MODEL_NAME,
                 "modelSource": _state["model_source"],
-                "device": DEVICE,
+                "device": DEVICE if _state["ready"] else None,
                 "matrix": {
                     "ready": _state["matrix_ready"],
                     "building": _state["matrix_building"],
@@ -936,6 +994,12 @@ class Handler(BaseHTTPRequestHandler):
                     "source": _state["matrix_source"],
                 },
             })
+            return
+        if path == "/api/comfy/list":
+            try:
+                self._json(comfy_clip_list())
+            except Exception as exc:  # noqa: BLE001
+                self._json({"error": str(exc)}, 500)
             return
         self._static(path)
 
@@ -965,7 +1029,11 @@ class Handler(BaseHTTPRequestHandler):
 
             if not _state["ready"]:
                 self._json(
-                    {"error": _state["error"] or "模型仍在加载中，请稍候重试", "loading": not _state["error"]},
+                    {
+                        "error": _state["error"]
+                        or "还没有加载任何模型 —— 请在界面顶部「自定义模型路径」里选择后点「重载」",
+                        "loading": False,
+                    },
                     503,
                 )
                 return
@@ -1025,12 +1093,10 @@ def main() -> None:
     if not (DIST / "index.html").exists():
         print(f"[!] 未找到 {DIST / 'index.html'}，界面无法打开（可在项目目录执行 npm run build）")
 
-    threading.Thread(target=load_model, daemon=True).start()
-
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"CLIP Token 查询器 -> http://127.0.0.1:{PORT}")
-    print(f"模型 {MODEL_NAME} 后台加载中")
-    print("词表嵌入矩阵不会自动预计算，请在界面「相似词 Top-K」页设置范围后手动触发")
+    print("启动时不加载任何模型（内置 CLIP 也改为按需）")
+    print("请在界面「自定义模型路径」里选择后点「重载」；词表矩阵同样需在「相似词 Top-K」页手动预计算")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

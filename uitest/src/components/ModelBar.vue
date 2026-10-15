@@ -79,6 +79,33 @@ async function reload() {
   }
 }
 
+/* ---------------------------- 从 ComfyUI 读取可用 CLIP 列表 ---------------------------- */
+const listing = ref(false)
+const comfyList = ref(null)
+const pickedClip = ref('')
+
+async function loadComfyList() {
+  listing.value = true
+  try {
+    const res = await fetch('./api/comfy/list')
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+    comfyList.value = data
+    ElMessage.success(
+      `读到 ${data.clipNames.length} 个 CLIP 文件（${data.found} 个已定位）、${data.types.length} 个类型`
+    )
+  } catch (e) {
+    ElMessage.error(e?.message || String(e))
+  } finally {
+    listing.value = false
+  }
+}
+
+function onPickClip(name) {
+  const hit = comfyList.value?.items?.find((x) => x.name === name)
+  if (hit?.path) sdPath.value = hit.path
+}
+
 function useBuiltin() {
   clipPath.value = ''
   sdPath.value = ''
@@ -131,9 +158,36 @@ function useBuiltin() {
 
       <div class="field">
         <div class="label">
-          SD 模型路径（.safetensors，留空 = 不使用；会从 ckpt 中提取 CLIP text encoder，支持 SD1.x 与 SDXL）
+          SD 模型路径（.safetensors，留空 = 不使用；会从 ckpt 中提取 CLIP text encoder，
+          支持 SD1.x / SDXL / ComfyUI 量化格式）
         </div>
-        <el-input v-model="sdPath" clearable :placeholder="sdPlaceholder" />
+        <div class="path-row">
+          <el-input v-model="sdPath" clearable :placeholder="sdPlaceholder" />
+          <el-button :loading="listing" @click="loadComfyList">从 ComfyUI 读取</el-button>
+        </div>
+
+        <div v-if="comfyList" class="picker">
+          <el-select
+            v-model="pickedClip"
+            filterable
+            clearable
+            placeholder="选一个 ComfyUI 里可用的 CLIP 文件（自动填入路径）"
+            style="width: 100%"
+            @change="onPickClip"
+          >
+            <el-option
+              v-for="it in comfyList.items"
+              :key="it.name"
+              :label="it.name"
+              :value="it.name"
+              :disabled="!it.exists"
+            />
+          </el-select>
+          <div class="hint mt6">
+            来自 {{ comfyList.api }} · 已定位 {{ comfyList.found }}/{{ comfyList.clipNames.length }} 个文件 ·
+            根目录 <span class="mono">{{ comfyList.modelsRoot }}</span>
+          </div>
+        </div>
       </div>
 
       <div class="field">
@@ -167,7 +221,7 @@ function useBuiltin() {
         <el-button type="primary" :loading="reloading" :disabled="backendMissing" @click="reload">
           重载
         </el-button>
-        <el-button :disabled="reloading || backendMissing" @click="useBuiltin">恢复内置</el-button>
+        <el-button :disabled="reloading || backendMissing" @click="useBuiltin">内置 CLIP</el-button>
         <span class="hint">
           两个都填时优先用 SD 路径。切换模型后词表矩阵会失效，需在「相似词 Top-K」页重新预计算。
         </span>
@@ -267,6 +321,20 @@ function useBuiltin() {
 
 .hint.mt6 {
   margin-top: 6px;
+}
+
+.path-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.path-row .el-input {
+  flex: 1;
+}
+
+.picker {
+  margin-top: 10px;
 }
 
 .mb12 {

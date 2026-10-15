@@ -172,10 +172,10 @@ const sourceTokens = computed(() => {
 
     <el-alert
       v-else-if="!status.ready"
-      type="info"
+      type="warning"
       :closable="false"
       show-icon
-      title="CLIP 文本塔正在加载…"
+      title="还没有加载模型 —— 请在上方「自定义模型路径」里选择后点「重载」"
       class="mb"
     />
 
