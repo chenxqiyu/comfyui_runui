@@ -3,12 +3,13 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "description": "纯前端 CLIP (SD1.x) Token 查询器 —— 输入单词/提示词，查看对应的 token id",
+  "description": "CLIP (SD1.x) Token 查询器 —— 输入的单词/提示词对应哪些 token，附带词义相似度",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview --port 5199",
     "serve": "node tools/serve.mjs",
+    "api": "python server.py",
     "compare": "node tools/compare.mjs"
   },
   "dependencies": {

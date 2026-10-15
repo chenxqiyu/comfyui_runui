@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { createClipTokenizer, MAX_LENGTH, START_TOKEN, END_TOKEN } from './lib/clipTokenizer.js'
+import SimilarityPanel from './components/SimilarityPanel.vue'
 
 const tk = ref(null)
 const ready = ref(false)
@@ -324,6 +325,11 @@ async function copyValue(v) {
             </el-table>
             <el-empty v-else description="点按钮随机抽一批 token 看看" :image-size="90" />
           </template>
+        </el-tab-pane>
+
+        <!-- ============================================ 词义相似度 -->
+        <el-tab-pane label="词义相似度" name="similarity">
+          <SimilarityPanel />
         </el-tab-pane>
       </el-tabs>
     </el-card>
