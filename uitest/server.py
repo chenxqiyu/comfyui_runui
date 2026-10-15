@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("PORT", "5199"))
 MODEL_NAME = os.environ.get("CLIP_MODEL", "openai/clip-vit-large-patch14")
+COMFY_ROOT = os.environ.get("COMFYUI_ROOT", r"F:\ai\fastai")
 # SD1.x ckpt 里 CLIP 文本塔的 key 前缀（按顺序尝试）
 SD_TEXT_PREFIXES = ("cond_stage_model.transformer.", "cond_stage_model.", "transformer.")
 # cuda / cpu / auto（默认 auto：有可用显卡就走显卡）
@@ -75,8 +76,9 @@ _state = {
     "matrix_building": False,
     # 模型来源
     "model_label": MODEL_NAME,
-    "model_source": "builtin",  # 'builtin' | 'clip-path' | 'sd-ckpt'
+    "model_source": "builtin",  # 'builtin' | 'clip-path' | 'sd-ckpt' | 'sd-ckpt-g' | 'comfy'
     "model_key": "builtin",
+    "comfy_clip": None,  # ComfyUI 直接加载的 CLIP 对象（Qwen 系等）
 }
 _baseline_cache: dict = {}
 
@@ -186,7 +188,12 @@ def _bigG_from_openclip(state: dict):
         out[f"encoder.layers.{i}.mlp.fc2.bias"] = state[b + "mlp.c_proj.bias"]
 
     text_model = CLIPTextModel(cfg)
-    missing, _unexpected = text_model.load_state_dict(out, strict=False)
+    # CLIPTextModel 内部是 self.text_model = CLIPTextTransformer(...)，state_dict 自带
+    # "text_model." 前缀，所以要补上（SD1.x/SDXL-CLIP-L 那条路径走的是 model.text_model，
+    # 反而不带前缀，别搞混）
+    missing, _unexpected = text_model.load_state_dict(
+        {f"text_model.{k}": v for k, v in out.items()}, strict=False
+    )
     if missing:
         raise ValueError(f"bigG 权重对不上，缺少 {len(missing)} 项，例如 {list(missing)[:3]}")
 
@@ -292,11 +299,73 @@ def build_model(
     return model, tokenizer, MODEL_NAME, "builtin", "builtin"
 
 
+# --------------------------------------------- ComfyUI 原生加载（Qwen 系等）
+def _ensure_comfy():
+    if COMFY_ROOT not in sys.path:
+        sys.path.insert(0, COMFY_ROOT)
+    import comfy.sd as comfy_sd  # noqa: PLC0415
+
+    return comfy_sd
+
+
+def _load_comfy_clip(sd_path: str, type_name: str):
+    """
+    用 ComfyUI 自己的加载栈加载文本编码器 —— 与 ComfyUI 里「加载CLIP」节点同一条路。
+    这是唯一能吃下 ComfyUI 私有量化格式（如 convrot_w4a4）的方式。
+
+    type_name 取 ComfyUI 里「类型」下拉的值，例如 krea2 / qwen_image / flux …
+    """
+    comfy_sd = _ensure_comfy()
+
+    if not os.path.isfile(sd_path):
+        raise FileNotFoundError(f"文件不存在: {sd_path}")
+
+    ct = getattr(comfy_sd.CLIPType, str(type_name).strip().upper(), None)
+    if ct is None:
+        raise ValueError(f"ComfyUI 里没有这个 CLIP 类型: {type_name}")
+
+    return comfy_sd.load_clip([sd_path], embedding_directory=None, clip_type=ct)
+
+
+def _comfy_encode_features(words):
+    """
+    用 ComfyUI 的 CLIP 对象给文本算特征。
+
+    机制提醒：Qwen 系的文本塔是完整 LLM（会套 chat 模板），输出是
+    [B, seq, layers*hidden] 的序列表示，没有 CLIP 那种 pooled 语义向量。
+    这里取「最后一个位置」的向量（因果注意力下它聚合了整段）再归一化。
+    """
+    import torch
+
+    clip = _state["comfy_clip"]
+    vecs = []
+    for w in words:
+        tokens = clip.tokenize(w)
+        out = clip.encode_from_tokens(tokens, return_pooled=True)
+        cond = out[0] if isinstance(out, (tuple, list)) else out
+        if cond.dim() != 3:
+            raise ValueError(f"意外的编码输出形状: {tuple(cond.shape)}")
+        vecs.append(cond[0, -1, :].detach().float().cpu())
+
+    mat = torch.stack(vecs, dim=0)
+    return mat / mat.norm(dim=-1, keepdim=True)
+
+
+def _require_hf_tower(feature: str):
+    """整表检索类功能只支持 CLIP 系文本塔。"""
+    if _state.get("comfy_clip") is not None:
+        raise ValueError(
+            f"当前用的是从 ComfyUI 加载的 LLM 文本塔（逐词套 chat 模板），不支持{feature}。"
+            "请切回 CLIP 系模型（内置 / SD ckpt / 自定义 CLIP 路径）。"
+        )
+
+
 def _release_model() -> None:
     """释放当前模型，并清掉依赖它的缓存（词表矩阵 / 相似度基线）。"""
     old = _state.get("model")
     _state["model"] = None
     _state["tokenizer"] = None
+    _state["comfy_clip"] = None
     if old is not None:
         del old
     gc.collect()
@@ -321,7 +390,10 @@ def _release_model() -> None:
 
 
 def apply_model(
-    clip_path: str | None = None, sd_path: str | None = None, sd_which: str = "auto"
+    clip_path: str | None = None,
+    sd_path: str | None = None,
+    sd_which: str = "auto",
+    comfy_type: str | None = None,
 ) -> dict:
     """
     切换模型：先在 CPU 上把新模型构建好，成功后才释放旧模型并挂载。
@@ -341,6 +413,26 @@ def apply_model(
         torch.set_grad_enabled(False)
         _state["torch"] = torch
         device = _resolve_device(torch)
+
+        # ---- ComfyUI 原生加载（Qwen 系等 ComfyUI 私有量化格式）
+        if comfy_type:
+            if not sd_path:
+                raise ValueError("用 ComfyUI 类型加载时，必须同时给出文件路径")
+            clip = _load_comfy_clip(sd_path, comfy_type)
+            _release_model()
+            _state["comfy_clip"] = clip
+            _state["model_label"] = f"ComfyUI[{comfy_type}] · {os.path.basename(sd_path)}"
+            _state["model_source"] = "comfy"
+            _state["model_key"] = f"{comfy_type}:{sd_path}"
+            _state["ready"] = True
+            _state["error"] = None
+            print(f"[ok] 模型已就绪: {_state['model_label']}  source=comfy")
+            return {
+                "changed": True,
+                "label": _state["model_label"],
+                "source": "comfy",
+                "device": "由 ComfyUI 管理",
+            }
 
         model, tokenizer, label, source, key = build_model(clip_path, sd_path, sd_which)
         model.eval()
@@ -386,6 +478,9 @@ def load_model() -> None:
 
 def encode_features(words):
     """归一化后的文本特征向量（等价于 F.normalize(model.get_text_features(...), dim=-1)）"""
+    if _state.get("comfy_clip") is not None:
+        return _comfy_encode_features(list(words))
+
     tok = _state["tokenizer"]
     model = _state["model"]
     torch = _state["torch"]
@@ -492,6 +587,11 @@ def build_vocab_matrix(limit: int | None = None, force: bool = False) -> None:
 
     计算设备优先用显卡；显存不足或 OOM 时自动降级到 CPU 重算。
     """
+    if _state.get("comfy_clip") is not None:
+        _state["matrix_error"] = "当前是 ComfyUI 的 LLM 文本塔，不支持整表预计算（请切回 CLIP 系模型）"
+        print(f"[!] {_state['matrix_error']}")
+        return
+
     if not _matrix_lock.acquire(blocking=False):
         print("[!] 已有预计算任务在进行，忽略本次请求")
         return
@@ -595,6 +695,7 @@ def build_vocab_matrix(limit: int | None = None, force: bool = False) -> None:
 
 def nearest_words(word: str, top_k: int = 20) -> dict:
     """在整张词表里找与 word 最接近的 top_k 个 token。"""
+    _require_hf_tower("整表 Top-K 检索")
     torch = _state["torch"]
     tok = _state["tokenizer"]
     model = _state["model"]
@@ -719,8 +820,9 @@ class Handler(BaseHTTPRequestHandler):
                 sd_which = str(payload.get("sdWhich") or "auto").strip().lower()
                 if sd_which not in ("auto", "l", "g"):
                     sd_which = "auto"
+                comfy_type = str(payload.get("comfyType") or "").strip() or None
                 try:
-                    self._json(apply_model(clip_path, sd_path, sd_which))
+                    self._json(apply_model(clip_path, sd_path, sd_which, comfy_type))
                 except Exception as exc:  # noqa: BLE001
                     self._json({"error": f"重载失败: {type(exc).__name__}: {exc}"}, 500)
                 return

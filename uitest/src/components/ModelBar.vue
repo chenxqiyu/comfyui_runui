@@ -8,6 +8,7 @@ const open = ref(false)
 const clipPath = ref('')
 const sdPath = ref('')
 const sdWhich = ref('auto')
+const comfyType = ref('')
 const reloading = ref(false)
 const message = ref('')
 let timer = null
@@ -46,6 +47,7 @@ async function reload() {
         clipPath: clipPath.value.trim(),
         sdPath: sdPath.value.trim(),
         sdWhich: sdWhich.value,
+        comfyType: comfyType.value.trim(),
       }),
     })
     const data = await res.json()
@@ -130,6 +132,24 @@ function useBuiltin() {
           <el-radio-button value="l">CLIP-L（768）</el-radio-button>
           <el-radio-button value="g">CLIP-G / bigG（1280）</el-radio-button>
         </el-radio-group>
+      </div>
+
+      <div class="field">
+        <div class="label">
+          ComfyUI 类型（可选）—— 填了就用 <b>ComfyUI 自己的加载栈</b>读文件，
+          这是唯一能吃下 ComfyUI 私有量化格式（如 convrot_w4a4 / Qwen 系）的方式。
+          取值就是 ComfyUI「加载CLIP」节点里那个下拉的值，例如 <code class="mono">krea2</code> /
+          <code class="mono">qwen_image</code> / <code class="mono">flux</code>。
+        </div>
+        <el-input
+          v-model="comfyType"
+          clearable
+          placeholder="如 krea2（留空 = 用 transformers 解析 SD1.x / SDXL ckpt）"
+        />
+        <div class="hint mt6">
+          注意：LLM 系文本塔（Qwen 等）逐词套 chat 模板，结果与 CLIP 系不可直接比较，
+          且不支持「相似词 Top-K」整表检索。
+        </div>
       </div>
 
       <div class="actions">
@@ -232,6 +252,10 @@ function useBuiltin() {
   font-size: 12px;
   color: #9aa7b8;
   line-height: 1.6;
+}
+
+.hint.mt6 {
+  margin-top: 6px;
 }
 
 .mb12 {

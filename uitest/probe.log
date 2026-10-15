@@ -1,0 +1,20 @@
+[1] import comfy.sd  6.8s
+[2] loading clip_type=KREA2 ...
+    load_clip OK  16.8s  ->  CLIP
+    patcher model: Krea2TEModel_
+    load_device  : cuda:0
+[3] tokenizer: Krea2Tokenizer
+    tokenize('girl') -> dict keys=['qwen3vl_4b']
+      qwen3vl_4b: 1 batch, first batch len=40, head=[(151644, 1.0), (8948, 1.0), (198, 1.0), (74785, 1.0), (279, 1.0), (2168, 1.0)]
+[4] try encode_from_tokens ...
+    -> tuple
+      [0] Tensor shape=torch.Size([1, 6, 30720]) dtype=torch.float32
+          (B,S,H) = (1, 6, 30720)
+      [1] NoneType shape=None dtype=None
+[done]
+Exception ignored in: <function ModelPatcher.__del__ at 0x000001CC43E32DE0>
+Traceback (most recent call last):
+  File "F:\ai\fastai\comfy\model_patcher.py", line 1750, in __del__
+  File "F:\ai\fastai\comfy\model_patcher.py", line 1303, in detach
+AttributeError: 'NoneType' object has no attribute 'ON_DETACH'
+exit=0
