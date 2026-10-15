@@ -15,6 +15,8 @@ CLIP Token 查询器 —— 本地后端服务
 """
 from __future__ import annotations
 
+import gc
+import hashlib
 import json
 import os
 import random
@@ -32,6 +34,8 @@ ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("PORT", "5199"))
 MODEL_NAME = os.environ.get("CLIP_MODEL", "openai/clip-vit-large-patch14")
+# SD1.x ckpt 里 CLIP 文本塔的 key 前缀（按顺序尝试）
+SD_TEXT_PREFIXES = ("cond_stage_model.transformer.", "cond_stage_model.", "transformer.")
 # cuda / cpu / auto（默认 auto：有可用显卡就走显卡）
 DEVICE = os.environ.get("CLIP_DEVICE", "auto").strip().lower()
 
@@ -69,49 +73,172 @@ _state = {
     "matrix_error": None,
     "matrix_source": None,  # 'cache' | 'cuda' | 'cpu'
     "matrix_building": False,
+    # 模型来源
+    "model_label": MODEL_NAME,
+    "model_source": "builtin",  # 'builtin' | 'clip-path' | 'sd-ckpt'
+    "model_key": "builtin",
 }
 _baseline_cache: dict = {}
 
 
 # --------------------------------------------------------------------- 模型
-def load_model() -> None:
-    """懒加载 + 启动时预热。"""
+def _resolve_device(torch) -> str:
+    """按 DEVICE 设置解析实际计算设备。"""
     global DEVICE
+    if DEVICE == "auto":
+        DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    elif DEVICE == "cuda" and not torch.cuda.is_available():
+        print("[!] 未检测到可用 CUDA，自动回退到 CPU")
+        DEVICE = "cpu"
+    return DEVICE
 
+
+def _load_sd_text_encoder(sd_path: str):
+    """
+    从 SD1.x 的 .safetensors 里取出 CLIP 文本塔权重，覆盖到内置 CLIP 模型上。
+
+    只读 text_model 那部分张量（用 safe_open 懒加载，不必把 2GB 权重全读进内存）；
+    text_projection 保持原始权重 —— SD 训练时不走这个投影，所以它没被改过。
+    """
+    from safetensors import safe_open
+    from transformers import CLIPModel
+
+    if not os.path.isfile(sd_path):
+        raise FileNotFoundError(f"文件不存在: {sd_path}")
+
+    model = CLIPModel.from_pretrained(MODEL_NAME)
+
+    with safe_open(sd_path, framework="pt", device="cpu") as f:
+        all_keys = list(f.keys())
+        prefix = None
+        for p in SD_TEXT_PREFIXES:
+            if any(k.startswith(p + "text_model.") for k in all_keys):
+                prefix = p
+                break
+        if prefix is None:
+            raise ValueError("该文件里找不到 CLIP text_model 权重（不是 SD1.x 格式的 ckpt？）")
+
+        tm_keys = [k for k in all_keys if k.startswith(prefix + "text_model.")]
+        state = {k[len(prefix):]: f.get_tensor(k).float() for k in tm_keys}
+
+    # transformers 里 position_ids 是 non-persistent buffer，不在 state_dict 里
+    state.pop("text_model.embeddings.position_ids", None)
+
+    missing, unexpected = model.text_model.load_state_dict(state, strict=False)
+    if missing:
+        raise ValueError(f"权重对不上，缺少 {len(missing)} 项，例如 {list(missing)[:3]}")
+
+    print(f"[ok] 已从 {os.path.basename(sd_path)} 载入 text encoder（{len(tm_keys)} 个张量）")
+    return model, f"SD ckpt text encoder · {os.path.basename(sd_path)}"
+
+
+def build_model(clip_path: str | None = None, sd_path: str | None = None):
+    """按优先级构建模型：SD ckpt > 自定义 CLIP 路径 > 内置。"""
+    from transformers import CLIPModel, CLIPTokenizer
+
+    if sd_path:
+        model, label = _load_sd_text_encoder(sd_path)
+        tokenizer = CLIPTokenizer.from_pretrained(MODEL_NAME)  # SD1.x 词表与 CLIP 相同
+        return model, tokenizer, label, "sd-ckpt", sd_path
+
+    if clip_path:
+        model = CLIPModel.from_pretrained(clip_path)
+        tokenizer = CLIPTokenizer.from_pretrained(clip_path)
+        return model, tokenizer, clip_path, "clip-path", clip_path
+
+    model = CLIPModel.from_pretrained(MODEL_NAME)
+    tokenizer = CLIPTokenizer.from_pretrained(MODEL_NAME)
+    return model, tokenizer, MODEL_NAME, "builtin", "builtin"
+
+
+def _release_model() -> None:
+    """释放当前模型，并清掉依赖它的缓存（词表矩阵 / 相似度基线）。"""
+    old = _state.get("model")
+    _state["model"] = None
+    _state["tokenizer"] = None
+    if old is not None:
+        del old
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
+    _state.update(
+        matrix=None,
+        matrix_ready=False,
+        matrix_progress=0,
+        matrix_total=0,
+        matrix_limit=0,
+        matrix_error=None,
+        matrix_source=None,
+    )
+    _baseline_cache.clear()
+
+
+def apply_model(clip_path: str | None = None, sd_path: str | None = None) -> dict:
+    """
+    切换模型：先在 CPU 上把新模型构建好，成功后才释放旧模型并挂载。
+    这样即使新路径有问题、加载失败，旧的仍然可用。
+    """
+    import torch
+
+    with _lock:
+        if (
+            _state["ready"]
+            and not clip_path
+            and not sd_path
+            and _state["model_source"] == "builtin"
+        ):
+            return {"changed": False, "reason": "当前已经是内置模型"}
+
+        torch.set_grad_enabled(False)
+        _state["torch"] = torch
+        device = _resolve_device(torch)
+
+        model, tokenizer, label, source, key = build_model(clip_path, sd_path)
+        model.eval()
+
+        actual_device = "cpu"
+        if device == "cuda":
+            try:
+                model = model.to("cuda")
+                actual_device = "cuda"
+            except Exception as exc:  # noqa: BLE001
+                print(f"[!] 新模型放不上显卡（{exc}），改用 CPU")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        _release_model()
+        _state["model"] = model
+        _state["tokenizer"] = tokenizer
+        _state["model_label"] = label
+        _state["model_source"] = source
+        _state["model_key"] = key
+        _state["ready"] = True
+        _state["error"] = None
+
+        print(f"[ok] 模型已就绪: {label}  source={source}  device={actual_device}")
+        return {"changed": True, "label": label, "source": source, "device": actual_device}
+
+
+def load_model() -> None:
+    """启动时预热：加载内置模型（不预计算词表矩阵）。"""
     with _lock:
         if _state["ready"] or _state["error"]:
             return
-        try:
-            import torch
-            from transformers import CLIPModel, CLIPTokenizer
 
-            torch.set_grad_enabled(False)
+    try:
+        import torch
 
-            # 解析目标设备
-            if DEVICE == "auto":
-                DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-            elif DEVICE == "cuda" and not torch.cuda.is_available():
-                print("[!] 未检测到可用 CUDA，自动回退到 CPU")
-                DEVICE = "cpu"
-
-            model = CLIPModel.from_pretrained(MODEL_NAME).eval()
-            if DEVICE == "cuda":
-                model = model.to("cuda")
-
-            _state["model"] = model
-            _state["tokenizer"] = CLIPTokenizer.from_pretrained(MODEL_NAME)
-            _state["torch"] = torch
-            _state["ready"] = True
-
-            if DEVICE == "cuda":
-                name = torch.cuda.get_device_name(0)
-                alloc = torch.cuda.memory_allocated(0) / 1024**2
-                print(f"[ok] CLIP 文本塔已加载: {MODEL_NAME}  device=cuda ({name})  {alloc:.0f} MB")
-            else:
-                print(f"[ok] CLIP 文本塔已加载: {MODEL_NAME}  device=cpu")
-        except Exception as exc:  # noqa: BLE001
-            _state["error"] = f"{type(exc).__name__}: {exc}"
-            print(f"[x] 模型加载失败: {_state['error']}")
+        torch.set_grad_enabled(False)
+        apply_model()
+    except Exception as exc:  # noqa: BLE001
+        _state["error"] = f"{type(exc).__name__}: {exc}"
+        print(f"[x] 模型加载失败: {_state['error']}")
 
 
 def encode_features(words):
@@ -180,8 +307,17 @@ def compute_similarity(reference: str, words) -> dict:
 
 
 # ------------------------------------------- 词表嵌入矩阵 / Top-K 相似词
+def _model_tag() -> str:
+    """缓存标签：不同模型算出的词表矩阵不能混用。"""
+    source = _state.get("model_source") or "builtin"
+    if source == "builtin":
+        return "builtin"
+    key = _state.get("model_key") or ""
+    return f"{source}-{hashlib.md5(key.encode('utf-8')).hexdigest()[:8]}"
+
+
 def _matrix_cache_path(limit: int):
-    return CACHE_DIR / f"vocab_emb_{limit}_fp16.npy"
+    return CACHE_DIR / f"vocab_emb_{_model_tag()}_{limit}_fp16.npy"
 
 
 def _compute_matrix(limit: int, start: int, end: int, batch_size: int, use_cuda: bool):
@@ -401,7 +537,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json({
                 "ready": _state["ready"],
                 "error": _state["error"],
-                "model": MODEL_NAME,
+                "model": _state["model_label"],
+                "modelBuiltin": MODEL_NAME,
+                "modelSource": _state["model_source"],
                 "device": DEVICE,
                 "matrix": {
                     "ready": _state["matrix_ready"],
@@ -419,13 +557,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         path = unquote(urlparse(self.path).path)
-        if path not in ("/api/similarity", "/api/nearest", "/api/matrix/build"):
+        if path not in ("/api/similarity", "/api/nearest", "/api/matrix/build", "/api/model/reload"):
             self._json({"error": "not found"}, 404)
             return
 
         try:
             length = int(self.headers.get("Content-Length") or 0)
             payload = json.loads(self.rfile.read(length) or b"{}")
+
+            # ---- 切换 / 重载模型（两个路径都留空 = 回到内置模型）
+            if path == "/api/model/reload":
+                clip_path = str(payload.get("clipPath") or "").strip() or None
+                sd_path = str(payload.get("sdPath") or "").strip() or None
+                try:
+                    self._json(apply_model(clip_path, sd_path))
+                except Exception as exc:  # noqa: BLE001
+                    self._json({"error": f"重载失败: {type(exc).__name__}: {exc}"}, 500)
+                return
 
             if not _state["ready"]:
                 self._json(

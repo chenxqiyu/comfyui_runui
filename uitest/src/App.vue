@@ -4,6 +4,7 @@ import { ElMessage } from 'element-plus'
 import { createClipTokenizer, MAX_LENGTH, START_TOKEN, END_TOKEN } from './lib/clipTokenizer.js'
 import SimilarityPanel from './components/SimilarityPanel.vue'
 import NearestPanel from './components/NearestPanel.vue'
+import ModelBar from './components/ModelBar.vue'
 
 const tk = ref(null)
 const ready = ref(false)
@@ -131,6 +132,8 @@ async function copyValue(v) {
         纯前端复刻 ComfyUI 的分词逻辑 —— 输入单词或提示词，看它被切成了哪些 token
       </p>
     </header>
+
+    <ModelBar />
 
     <el-card v-if="loadError" shadow="never" class="panel">
       <el-alert type="error" :closable="false" title="词表加载失败" :description="loadError" />

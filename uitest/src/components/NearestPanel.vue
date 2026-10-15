@@ -37,12 +37,20 @@ function ensurePolling() {
   }, 1500)
 }
 
+function onModelChanged() {
+  // 模型换了 -> 词表矩阵作废，重新拉状态并继续轮询
+  refreshStatus()
+  ensurePolling()
+}
+
 onMounted(() => {
   refreshStatus()
   ensurePolling()
+  window.addEventListener('clip-model-changed', onModelChanged)
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('clip-model-changed', onModelChanged)
   if (timer) clearInterval(timer)
 })
 
