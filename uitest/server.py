@@ -20,6 +20,7 @@ import os
 import random
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -47,8 +48,24 @@ MIME = {
     ".woff2": "font/woff2",
 }
 
+CACHE_DIR = ROOT / ".cache"
+MATRIX_CACHE = CACHE_DIR / "vocab_emb_fp16.npy"
+
 _lock = threading.Lock()
-_state = {"model": None, "tokenizer": None, "torch": None, "ready": False, "error": None}
+_state = {
+    "model": None,
+    "tokenizer": None,
+    "torch": None,
+    "ready": False,
+    "error": None,
+    # 词表嵌入矩阵（Top-K 相似词检索用）
+    "matrix": None,
+    "matrix_ready": False,
+    "matrix_progress": 0,
+    "matrix_total": 0,
+    "matrix_error": None,
+    "matrix_source": None,  # 'cache' | 'computed'
+}
 _baseline_cache: dict = {}
 
 
@@ -141,6 +158,113 @@ def compute_similarity(reference: str, words) -> dict:
     }
 
 
+# ------------------------------------------- 词表嵌入矩阵 / Top-K 相似词
+def build_vocab_matrix(batch_size: int = 512) -> None:
+    """
+    预计算“词表里每个 token 单独作为一个输入”的文本特征，得到 [V, D] 归一化矩阵。
+    有了它，Top-K 相似词检索就是一次矩阵乘法，比逐条 forward 快几百倍。
+
+    每个 token 的输入形如 [<|startoftext|>, id, <|endoftext|>]，
+    因此当某个单词恰好是单个 token 时，它的向量与 tokenizer("word") 的结果完全一致。
+    """
+    try:
+        # 等模型加载完
+        while not _state["ready"] and not _state["error"]:
+            time.sleep(0.3)
+        if not _state["ready"]:
+            return
+
+        import numpy as np  # noqa: PLC0415
+        import torch  # noqa: PLC0415
+
+        tok = _state["tokenizer"]
+        model = _state["model"]
+        vocab_size = len(tok)
+        _state["matrix_total"] = vocab_size
+
+        # 1) 复用磁盘缓存
+        if MATRIX_CACHE.exists():
+            arr = np.load(MATRIX_CACHE)
+            mat = torch.from_numpy(arr.astype("float32"))
+            _state["matrix"] = mat
+            _state["matrix_ready"] = True
+            _state["matrix_progress"] = vocab_size
+            _state["matrix_source"] = "cache"
+            print(f"[ok] 复用词表嵌入缓存: {MATRIX_CACHE.name} {tuple(mat.shape)}")
+            return
+
+        # 2) 分批计算
+        start = tok.bos_token_id if tok.bos_token_id is not None else 49406
+        end = tok.eos_token_id if tok.eos_token_id is not None else 49407
+        use_cuda = DEVICE == "cuda" and torch.cuda.is_available()
+
+        rows = []
+        for i in range(0, vocab_size, batch_size):
+            ids = torch.tensor(
+                [[start, j, end] for j in range(i, min(i + batch_size, vocab_size))]
+            )
+            if use_cuda:
+                ids = ids.to("cuda")
+            feats = model.get_text_features(input_ids=ids)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            rows.append(feats.cpu())
+            _state["matrix_progress"] = min(i + batch_size, vocab_size)
+
+        mat = torch.cat(rows, dim=0)
+        _state["matrix"] = mat
+        _state["matrix_ready"] = True
+        _state["matrix_source"] = "computed"
+
+        # 3) 落盘（fp16 省一半空间）
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            np.save(MATRIX_CACHE, mat.numpy().astype("float16"))
+            print(f"[ok] 词表嵌入矩阵 {tuple(mat.shape)} 已计算并缓存 -> {MATRIX_CACHE.name}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[!] 缓存写入失败（不影响使用）: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        _state["matrix_error"] = f"{type(exc).__name__}: {exc}"
+        print(f"[x] 词表嵌入矩阵构建失败: {_state['matrix_error']}")
+
+
+def nearest_words(word: str, top_k: int = 20) -> dict:
+    """在整张词表里找与 word 最接近的 top_k 个 token。"""
+    torch = _state["torch"]
+    tok = _state["tokenizer"]
+    model = _state["model"]
+
+    enc = tok([word], padding=True, truncation=True, return_tensors="pt")
+    source_ids = enc["input_ids"][0].tolist()
+    if DEVICE == "cuda" and torch.cuda.is_available():
+        enc = {k: v.to("cuda") for k, v in enc.items()}
+
+    q = model.get_text_features(**enc)
+    q = (q / q.norm(dim=-1, keepdim=True))[0].float().cpu()
+
+    sims = _state["matrix"] @ q
+
+    # 屏蔽 begin / end / pad 等特殊 token
+    for sid in {tok.bos_token_id, tok.eos_token_id, tok.pad_token_id}:
+        if sid is not None and 0 <= sid < sims.numel():
+            sims[sid] = -1.0
+
+    k = max(1, min(int(top_k), 200))
+    values, indices = torch.topk(sims, k)
+
+    items = []
+    for score, idx in zip(values.tolist(), indices.tolist()):
+        items.append({"id": idx, "token": tok.decoder.get(idx, ""), "sim": round(float(score), 6)})
+
+    return {
+        "word": word,
+        "sourceIds": source_ids,
+        "scanned": int(_state["matrix"].shape[0]),
+        "items": items,
+        "model": MODEL_NAME,
+        "device": DEVICE,
+    }
+
+
 # ------------------------------------------------------------------- HTTP
 class Handler(BaseHTTPRequestHandler):
     server_version = "ClipTokenLookup/1.0"
@@ -196,25 +320,27 @@ class Handler(BaseHTTPRequestHandler):
                 "error": _state["error"],
                 "model": MODEL_NAME,
                 "device": DEVICE,
+                "matrix": {
+                    "ready": _state["matrix_ready"],
+                    "progress": _state["matrix_progress"],
+                    "total": _state["matrix_total"],
+                    "error": _state["matrix_error"],
+                    "source": _state["matrix_source"],
+                },
             })
             return
         self._static(path)
 
     def do_POST(self):  # noqa: N802
         path = unquote(urlparse(self.path).path)
-        if path != "/api/similarity":
+        if path not in ("/api/similarity", "/api/nearest"):
             self._json({"error": "not found"}, 404)
             return
 
         try:
             length = int(self.headers.get("Content-Length") or 0)
             payload = json.loads(self.rfile.read(length) or b"{}")
-            reference = str(payload.get("reference") or "").strip()
-            words = payload.get("words") or []
 
-            if not reference:
-                self._json({"error": "缺少参照词 reference"}, 400)
-                return
             if not _state["ready"]:
                 self._json(
                     {"error": _state["error"] or "模型仍在加载中，请稍候重试", "loading": not _state["error"]},
@@ -222,6 +348,30 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
 
+            # ---- Top-K 相似词
+            if path == "/api/nearest":
+                word = str(payload.get("word") or "").strip()
+                if not word:
+                    self._json({"error": "缺少待查词 word"}, 400)
+                    return
+                if not _state["matrix_ready"]:
+                    self._json(
+                        {
+                            "error": _state["matrix_error"] or "词表嵌入矩阵仍在构建中，请稍候",
+                            "building": not _state["matrix_error"],
+                        },
+                        503,
+                    )
+                    return
+                self._json(nearest_words(word, payload.get("topK") or 20))
+                return
+
+            # ---- 参照词相似度
+            reference = str(payload.get("reference") or "").strip()
+            words = payload.get("words") or []
+            if not reference:
+                self._json({"error": "缺少参照词 reference"}, 400)
+                return
             self._json(compute_similarity(reference, words))
         except Exception as exc:  # noqa: BLE001
             self._json({"error": f"{type(exc).__name__}: {exc}"}, 500)
@@ -232,10 +382,11 @@ def main() -> None:
         print(f"[!] 未找到 {DIST / 'index.html'}，界面无法打开（可在项目目录执行 npm run build）")
 
     threading.Thread(target=load_model, daemon=True).start()
+    threading.Thread(target=build_vocab_matrix, daemon=True).start()
 
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"CLIP Token 查询器 -> http://127.0.0.1:{PORT}")
-    print(f"模型 {MODEL_NAME} 正在后台加载，就绪后可查词义相似度（Ctrl+C 退出）")
+    print(f"模型 {MODEL_NAME} 正在后台加载，随后会自动构建词表嵌入矩阵（首次约 1 分钟）")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
