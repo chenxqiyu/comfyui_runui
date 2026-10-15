@@ -365,6 +365,74 @@ def sniff_model_file(path: str) -> dict:
 
 
 # ------------------------------------- 「从 ComfyUI 读取」可用 CLIP 列表
+def _comfy_get(path: str, timeout: int = 30):
+    url = COMFY_API.rstrip("/") + path
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def _resolve_comfy_clip_path(name: str):
+    """把 ComfyUI 的 clip_name 还原成本机真实文件路径。"""
+    rel = str(name).replace("/", os.sep).replace("\\", os.sep)
+    for root in (
+        os.path.join(COMFY_MODELS_ROOT, "text_encoders"),
+        os.path.join(COMFY_MODELS_ROOT, "clip"),
+    ):
+        cand = os.path.join(root, rel)
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def comfy_current_clip() -> dict:
+    """
+    读出「ComfyUI 当前在用的 CLIP」：从 /api/jobs + /history 里找最近一次实际执行的
+    CLIPLoader 节点，取它的 clip_name / type，再还原成本机真实路径。
+
+    ComfyUI 没有暴露"内存里加载了哪个模型对象"的接口，但最近执行过的工作流定义
+    就写在 history 里，而用过的模型一般都还在显存/内存里 —— 这是最接近的答案。
+    """
+    ids: list[str] = []
+    try:
+        jobs = _comfy_get("/api/jobs")
+        ids = [j.get("id") for j in (jobs.get("jobs") or []) if j.get("id")]
+    except Exception:  # noqa: BLE001
+        pass
+
+    history = _comfy_get("/history?max_items=10")
+    if not ids:
+        ids = list(history)
+
+    for pid in ids:
+        entry = history.get(pid)
+        if not entry:
+            continue
+        prompt = entry.get("prompt") or []
+        nodes = prompt[2] if len(prompt) > 2 else {}
+        for nid, node in nodes.items():
+            if str((node or {}).get("class_type")) != "CLIPLoader":
+                continue
+            ins = node.get("inputs") or {}
+            name = ins.get("clip_name")
+            if not name:
+                continue
+            resolved = _resolve_comfy_clip_path(name)
+            return {
+                "name": name,
+                "type": ins.get("type"),
+                "device": ins.get("device"),
+                "nodeId": nid,
+                "promptId": pid,
+                "path": resolved,
+                "exists": resolved is not None,
+                "api": COMFY_API,
+            }
+
+    raise RuntimeError(
+        "ComfyUI 的执行记录里还没有 CLIPLoader —— 先在 ComfyUI 里跑一次工作流（或历史被清空了）"
+    )
+
+
 def comfy_clip_list() -> dict:
     """
     问 ComfyUI 要 CLIPLoader 的可选项（clip_name / type），
@@ -392,20 +460,9 @@ def comfy_clip_list() -> dict:
     names = options("clip_name")
     types = options("type")
 
-    roots = [
-        os.path.join(COMFY_MODELS_ROOT, "text_encoders"),
-        os.path.join(COMFY_MODELS_ROOT, "clip"),
-    ]
-
     items = []
     for name in names:
-        rel = str(name).replace("/", os.sep).replace("\\", os.sep)
-        resolved = None
-        for root in roots:
-            cand = os.path.join(root, rel)
-            if os.path.isfile(cand):
-                resolved = cand
-                break
+        resolved = _resolve_comfy_clip_path(name)
         items.append({"name": name, "path": resolved, "exists": resolved is not None})
 
     return {
@@ -994,6 +1051,12 @@ class Handler(BaseHTTPRequestHandler):
                     "source": _state["matrix_source"],
                 },
             })
+            return
+        if path == "/api/comfy/current":
+            try:
+                self._json(comfy_current_clip())
+            except Exception as exc:  # noqa: BLE001
+                self._json({"error": str(exc)}, 404)
             return
         if path == "/api/comfy/list":
             try:

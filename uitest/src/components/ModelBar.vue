@@ -106,6 +106,37 @@ function onPickClip(name) {
   if (hit?.path) sdPath.value = hit.path
 }
 
+const loadingCurrent = ref(false)
+
+async function loadCurrentClip() {
+  loadingCurrent.value = true
+  try {
+    const res = await fetch('./api/comfy/current')
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+
+    if (data.path) {
+      sdPath.value = data.path
+      pickedClip.value = data.name
+    }
+    if (data.type) comfyType.value = data.type
+
+    if (!data.path) {
+      ElMessage.warning(
+        `ComfyUI 当前用的是 ${data.name}（type=${data.type}），但本地按模型目录没找到这个文件，请手动确认路径`
+      )
+      return
+    }
+
+    ElMessage.success(`读到 ComfyUI 当前在用的 CLIP：${data.name}（type=${data.type}），正在加载…`)
+    await reload()
+  } catch (e) {
+    ElMessage.error(e?.message || String(e))
+  } finally {
+    loadingCurrent.value = false
+  }
+}
+
 function useBuiltin() {
   clipPath.value = ''
   sdPath.value = ''
@@ -222,6 +253,13 @@ function useBuiltin() {
           重载
         </el-button>
         <el-button :disabled="reloading || backendMissing" @click="useBuiltin">内置 CLIP</el-button>
+        <el-button
+          :loading="loadingCurrent"
+          :disabled="reloading || backendMissing"
+          @click="loadCurrentClip"
+        >
+          读取当前已加载
+        </el-button>
         <span class="hint">
           两个都填时优先用 SD 路径。切换模型后词表矩阵会失效，需在「相似词 Top-K」页重新预计算。
         </span>
