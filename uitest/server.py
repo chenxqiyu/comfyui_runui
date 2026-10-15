@@ -32,7 +32,8 @@ ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("PORT", "5199"))
 MODEL_NAME = os.environ.get("CLIP_MODEL", "openai/clip-vit-large-patch14")
-DEVICE = os.environ.get("CLIP_DEVICE", "cpu")
+# cuda / cpu / auto（默认 auto：有可用显卡就走显卡）
+DEVICE = os.environ.get("CLIP_DEVICE", "auto").strip().lower()
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -49,9 +50,10 @@ MIME = {
 }
 
 CACHE_DIR = ROOT / ".cache"
-MATRIX_CACHE = CACHE_DIR / "vocab_emb_fp16.npy"
+DEFAULT_LIMIT = 10000  # 默认预计算前 1 万个 token（等于「只搜前 1 万词」）
 
 _lock = threading.Lock()
+_matrix_lock = threading.Lock()
 _state = {
     "model": None,
     "tokenizer": None,
@@ -63,15 +65,19 @@ _state = {
     "matrix_ready": False,
     "matrix_progress": 0,
     "matrix_total": 0,
+    "matrix_limit": 0,  # 已就绪的范围（词表前 N 个 token）
     "matrix_error": None,
-    "matrix_source": None,  # 'cache' | 'computed'
+    "matrix_source": None,  # 'cache' | 'cuda' | 'cpu'
+    "matrix_building": False,
 }
 _baseline_cache: dict = {}
 
 
 # --------------------------------------------------------------------- 模型
 def load_model() -> None:
-    """懒加载 + 启动时预热。CPU 上加载 CLIP-L 文本塔约 10~30 秒。"""
+    """懒加载 + 启动时预热。"""
+    global DEVICE
+
     with _lock:
         if _state["ready"] or _state["error"]:
             return
@@ -80,14 +86,29 @@ def load_model() -> None:
             from transformers import CLIPModel, CLIPTokenizer
 
             torch.set_grad_enabled(False)
+
+            # 解析目标设备
+            if DEVICE == "auto":
+                DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+            elif DEVICE == "cuda" and not torch.cuda.is_available():
+                print("[!] 未检测到可用 CUDA，自动回退到 CPU")
+                DEVICE = "cpu"
+
             model = CLIPModel.from_pretrained(MODEL_NAME).eval()
-            if DEVICE == "cuda" and torch.cuda.is_available():
+            if DEVICE == "cuda":
                 model = model.to("cuda")
+
             _state["model"] = model
             _state["tokenizer"] = CLIPTokenizer.from_pretrained(MODEL_NAME)
             _state["torch"] = torch
             _state["ready"] = True
-            print(f"[ok] CLIP 文本塔已加载: {MODEL_NAME}  device={DEVICE}")
+
+            if DEVICE == "cuda":
+                name = torch.cuda.get_device_name(0)
+                alloc = torch.cuda.memory_allocated(0) / 1024**2
+                print(f"[ok] CLIP 文本塔已加载: {MODEL_NAME}  device=cuda ({name})  {alloc:.0f} MB")
+            else:
+                print(f"[ok] CLIP 文本塔已加载: {MODEL_NAME}  device=cpu")
         except Exception as exc:  # noqa: BLE001
             _state["error"] = f"{type(exc).__name__}: {exc}"
             print(f"[x] 模型加载失败: {_state['error']}")
@@ -99,7 +120,7 @@ def encode_features(words):
     model = _state["model"]
     torch = _state["torch"]
     batch = tok(list(words), padding=True, truncation=True, return_tensors="pt")
-    if DEVICE == "cuda" and torch.cuda.is_available():
+    if DEVICE == "cuda":
         batch = {k: v.to("cuda") for k, v in batch.items()}
     feats = model.get_text_features(**batch)
     return feats / feats.norm(dim=-1, keepdim=True)
@@ -159,14 +180,39 @@ def compute_similarity(reference: str, words) -> dict:
 
 
 # ------------------------------------------- 词表嵌入矩阵 / Top-K 相似词
-def build_vocab_matrix(batch_size: int = 512) -> None:
-    """
-    预计算“词表里每个 token 单独作为一个输入”的文本特征，得到 [V, D] 归一化矩阵。
-    有了它，Top-K 相似词检索就是一次矩阵乘法，比逐条 forward 快几百倍。
+def _matrix_cache_path(limit: int):
+    return CACHE_DIR / f"vocab_emb_{limit}_fp16.npy"
 
-    每个 token 的输入形如 [<|startoftext|>, id, <|endoftext|>]，
-    因此当某个单词恰好是单个 token 时，它的向量与 tokenizer("word") 的结果完全一致。
+
+def _compute_matrix(limit: int, start: int, end: int, batch_size: int, use_cuda: bool):
+    """按 batch 逐段计算前 limit 个 token 的特征并归一化。"""
+    torch = _state["torch"]
+    model = _state["model"]
+    rows = []
+    for i in range(0, limit, batch_size):
+        ids = torch.tensor([[start, j, end] for j in range(i, min(i + batch_size, limit))])
+        if use_cuda:
+            ids = ids.to("cuda")
+        feats = model.get_text_features(input_ids=ids)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        rows.append(feats.detach().float().cpu())
+        _state["matrix_progress"] = min(i + batch_size, limit)
+    return torch.cat(rows, dim=0)
+
+
+def build_vocab_matrix(limit: int | None = None, force: bool = False) -> None:
     """
+    预计算词表**前 limit 个** token 的文本特征（limit 可自定义，默认 10000）。
+
+    每个 token 的输入形如 [<|startoftext|>, id, <|endoftext|>]，所以当某个单词恰好是
+    单个 token 时，它的向量与 tokenizer("word") 得到的结果完全一致。
+
+    计算设备优先用显卡；显存不足或 OOM 时自动降级到 CPU 重算。
+    """
+    if not _matrix_lock.acquire(blocking=False):
+        print("[!] 已有预计算任务在进行，忽略本次请求")
+        return
+
     try:
         # 等模型加载完
         while not _state["ready"] and not _state["error"]:
@@ -180,51 +226,88 @@ def build_vocab_matrix(batch_size: int = 512) -> None:
         tok = _state["tokenizer"]
         model = _state["model"]
         vocab_size = len(tok)
-        _state["matrix_total"] = vocab_size
+        limit = max(100, min(int(limit or DEFAULT_LIMIT), vocab_size))
+
+        _state.update(
+            matrix_total=limit,
+            matrix_progress=0,
+            matrix_error=None,
+            matrix_ready=False,
+            matrix_building=True,
+        )
 
         # 1) 复用磁盘缓存
-        if MATRIX_CACHE.exists():
-            arr = np.load(MATRIX_CACHE)
-            mat = torch.from_numpy(arr.astype("float32"))
-            _state["matrix"] = mat
-            _state["matrix_ready"] = True
-            _state["matrix_progress"] = vocab_size
-            _state["matrix_source"] = "cache"
-            print(f"[ok] 复用词表嵌入缓存: {MATRIX_CACHE.name} {tuple(mat.shape)}")
+        cache = _matrix_cache_path(limit)
+        if cache.exists() and not force:
+            mat = torch.from_numpy(np.load(cache).astype("float32"))
+            _state.update(
+                matrix=mat,
+                matrix_ready=True,
+                matrix_progress=limit,
+                matrix_limit=limit,
+                matrix_source="cache",
+            )
+            print(f"[ok] 复用词表嵌入缓存: {cache.name} {tuple(mat.shape)}")
             return
 
-        # 2) 分批计算
         start = tok.bos_token_id if tok.bos_token_id is not None else 49406
         end = tok.eos_token_id if tok.eos_token_id is not None else 49407
-        use_cuda = DEVICE == "cuda" and torch.cuda.is_available()
 
-        rows = []
-        for i in range(0, vocab_size, batch_size):
-            ids = torch.tensor(
-                [[start, j, end] for j in range(i, min(i + batch_size, vocab_size))]
-            )
-            if use_cuda:
-                ids = ids.to("cuda")
-            feats = model.get_text_features(input_ids=ids)
-            feats = feats / feats.norm(dim=-1, keepdim=True)
-            rows.append(feats.cpu())
-            _state["matrix_progress"] = min(i + batch_size, vocab_size)
+        # 2) 决定尝试序列：显存够就用显卡，否则直接 CPU
+        attempts: list[tuple[str, int]] = []
+        if DEVICE == "cuda":
+            free, _total = torch.cuda.mem_get_info()
+            if free > 2 * 1024**3:
+                attempts.append(("cuda", 2048))
+                attempts.append(("cuda", 256))
+            else:
+                print(f"[!] 显存仅剩 {free / 1024**3:.2f} GiB，词表矩阵改用 CPU 计算")
+        attempts.append(("cpu", 512))
 
-        mat = torch.cat(rows, dim=0)
-        _state["matrix"] = mat
-        _state["matrix_ready"] = True
-        _state["matrix_source"] = "computed"
+        last_err: Exception | None = None
+        for target, batch_size in attempts:
+            moved_to_cpu = False
+            try:
+                if target == "cpu" and DEVICE == "cuda":
+                    model.to("cpu")  # 临时挪到内存，避免占用显存
+                    torch.cuda.empty_cache()
+                    moved_to_cpu = True
 
-        # 3) 落盘（fp16 省一半空间）
-        try:
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            np.save(MATRIX_CACHE, mat.numpy().astype("float16"))
-            print(f"[ok] 词表嵌入矩阵 {tuple(mat.shape)} 已计算并缓存 -> {MATRIX_CACHE.name}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[!] 缓存写入失败（不影响使用）: {exc}")
+                _state["matrix_progress"] = 0
+                mat = _compute_matrix(limit, start, end, batch_size, target == "cuda")
+                _state.update(
+                    matrix=mat,
+                    matrix_ready=True,
+                    matrix_limit=limit,
+                    matrix_source=target,
+                )
+
+                try:
+                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    np.save(cache, mat.numpy().astype("float16"))
+                    saved = f" -> {cache.name}"
+                except Exception as exc:  # noqa: BLE001
+                    saved = f"（缓存写入失败: {exc}）"
+                print(f"[ok] 词表嵌入矩阵 {tuple(mat.shape)} 由 {target} 算完{saved}")
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_err = exc
+                if "out of memory" not in str(exc).lower():
+                    raise
+                print(f"[!] {target} 计算 OOM，尝试下一档…")
+            finally:
+                if moved_to_cpu:
+                    model.to("cuda")
+                    torch.cuda.empty_cache()
+
+        raise RuntimeError(f"所有计算设备均失败: {last_err}")
     except Exception as exc:  # noqa: BLE001
         _state["matrix_error"] = f"{type(exc).__name__}: {exc}"
+        _state["matrix_ready"] = False
         print(f"[x] 词表嵌入矩阵构建失败: {_state['matrix_error']}")
+    finally:
+        _state["matrix_building"] = False
+        _matrix_lock.release()
 
 
 def nearest_words(word: str, top_k: int = 20) -> dict:
@@ -235,7 +318,7 @@ def nearest_words(word: str, top_k: int = 20) -> dict:
 
     enc = tok([word], padding=True, truncation=True, return_tensors="pt")
     source_ids = enc["input_ids"][0].tolist()
-    if DEVICE == "cuda" and torch.cuda.is_available():
+    if DEVICE == "cuda":
         enc = {k: v.to("cuda") for k, v in enc.items()}
 
     q = model.get_text_features(**enc)
@@ -322,8 +405,11 @@ class Handler(BaseHTTPRequestHandler):
                 "device": DEVICE,
                 "matrix": {
                     "ready": _state["matrix_ready"],
+                    "building": _state["matrix_building"],
                     "progress": _state["matrix_progress"],
                     "total": _state["matrix_total"],
+                    "limit": _state["matrix_limit"],
+                    "vocabSize": len(_state["tokenizer"]) if _state["tokenizer"] is not None else 49408,
                     "error": _state["matrix_error"],
                     "source": _state["matrix_source"],
                 },
@@ -333,7 +419,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         path = unquote(urlparse(self.path).path)
-        if path not in ("/api/similarity", "/api/nearest"):
+        if path not in ("/api/similarity", "/api/nearest", "/api/matrix/build"):
             self._json({"error": "not found"}, 404)
             return
 
@@ -346,6 +432,19 @@ class Handler(BaseHTTPRequestHandler):
                     {"error": _state["error"] or "模型仍在加载中，请稍候重试", "loading": not _state["error"]},
                     503,
                 )
+                return
+
+            # ---- 触发/重建词表嵌入矩阵（自定义预计算的 token 数）
+            if path == "/api/matrix/build":
+                if _state["matrix_building"]:
+                    self._json({"started": False, "reason": "已有预计算任务正在进行"}, 409)
+                    return
+                limit = int(payload.get("limit") or DEFAULT_LIMIT)
+                force = bool(payload.get("force"))
+                threading.Thread(
+                    target=build_vocab_matrix, args=(limit, force), daemon=True
+                ).start()
+                self._json({"started": True, "limit": limit, "force": force})
                 return
 
             # ---- Top-K 相似词
@@ -382,11 +481,11 @@ def main() -> None:
         print(f"[!] 未找到 {DIST / 'index.html'}，界面无法打开（可在项目目录执行 npm run build）")
 
     threading.Thread(target=load_model, daemon=True).start()
-    threading.Thread(target=build_vocab_matrix, daemon=True).start()
 
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     print(f"CLIP Token 查询器 -> http://127.0.0.1:{PORT}")
-    print(f"模型 {MODEL_NAME} 正在后台加载，随后会自动构建词表嵌入矩阵（首次约 1 分钟）")
+    print(f"模型 {MODEL_NAME} 后台加载中")
+    print("词表嵌入矩阵不会自动预计算，请在界面「相似词 Top-K」页设置范围后手动触发")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
