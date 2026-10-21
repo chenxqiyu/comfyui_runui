@@ -1532,6 +1532,7 @@ onUnmounted(() => {
           <div class="send-row">
             <button
               class="primary"
+              :class="{ sending: state.submitting }"
               @click="send"
             >
               {{ state.submitting ? '发送中…' : variants.length > 1 ? '发送第一组' : '发送到 ComfyUI' }}
@@ -2460,6 +2461,16 @@ button.danger:hover:not(:disabled) { background: #b91c1c; border-color: #b91c1c;
 }
 
 .send-row { display: flex; align-items: center; gap: 10px; }
+button.primary.sending {
+  background: var(--warn);
+  border-color: var(--warn);
+  box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.2);
+  animation: send-pulse 1.1s ease-in-out infinite;
+}
+@keyframes send-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(217, 119, 6, 0.16); }
+  50% { box-shadow: 0 0 0 6px rgba(217, 119, 6, 0.3); }
+}
 
 .msg {
   margin: 12px 0 0;
