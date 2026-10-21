@@ -46,6 +46,12 @@ const state = reactive({
   progress: { done: 0, total: 0 },
   stopFlag: false,
   lightbox: null, // { items: [{img, tags, ms, promptId}], index }
+  // —— 参数收藏 ——
+  presets: [],
+  showSavePreset: false,
+  presetName: '',
+  samplerBaseline: null,
+  dialog: null, // 通用确认弹窗 { title, text, confirmText, danger, onConfirm }
 })
 
 const TEXT_KEYS = ['text', 'prompt', 'string', 'value', 'content', 'positive', 'text_g', 'text_l']
@@ -192,6 +198,26 @@ function addOptionValue(field, value) {
   state.samplerParams[field.key] = [...list, value]
 }
 
+/** 下拉选完后先归位再追加：Vue 重渲染 options 时不会把 value 顶到第一项 */
+function pickAddOption(field, event) {
+  const value = event.target.value
+  event.target.value = ''
+  if (value) addOptionValue(field, value)
+}
+
+/** 下拉里只列「还没添加过」的候选，避免选了没反应 */
+function remainingOptions(field) {
+  const list = valuesOf(field.key)
+  return (field.options || []).filter((o) => !list.includes(o))
+}
+
+/** 多值收回成单值：只留第一个，控件变回普通下拉 */
+function collapseValues(field) {
+  const list = valuesOf(field.key)
+  if (list.length <= 1) return
+  state.samplerParams[field.key] = [list[0]]
+}
+
 function shortKey(key) {
   return String(key)
     .replace('sampler_name', 'sampler')
@@ -215,6 +241,116 @@ function randomizeSamplerSeed() {
       state.samplerParams[key] = [Math.floor(Math.random() * 1e15)]
     }
   }
+}
+
+/* ------------------------------- 参数收藏 ------------------------------- */
+const PRESET_KEY = 'comfy-runui.presets'
+
+function loadPresets() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(PRESET_KEY) || '[]')
+    state.presets = Array.isArray(arr) ? arr : []
+  } catch {
+    state.presets = []
+  }
+}
+
+function persistPresets() {
+  localStorage.setItem(PRESET_KEY, JSON.stringify(state.presets))
+}
+
+function savePreset(name) {
+  const n = String(name || '').trim()
+  if (!n) return
+  const payload = {
+    name: n,
+    params: JSON.parse(JSON.stringify(state.samplerParams)),
+    samplerClass: state.nodes?.[state.samplerId]?.class_type || '',
+    updatedAt: Date.now(),
+  }
+  const exist = state.presets.find((p) => p.name === n)
+  if (exist) Object.assign(exist, payload)
+  else state.presets.push({ id: `p${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, isDefault: false, ...payload })
+  persistPresets()
+  state.showSavePreset = false
+  state.presetName = ''
+  state.message = exist ? `已更新收藏「${n}」` : `已收藏「${n}」`
+}
+
+function applyPreset(preset, silent = false) {
+  const node = state.nodes?.[state.samplerId]
+  if (!node) return
+  const inputs = node.inputs || {}
+  // 以工作流原始参数为底再叠加收藏值：收藏里缺某个字段时，那个控件也不会凭空消失
+  const base = state.samplerBaseline || state.samplerParams || {}
+  const next = JSON.parse(JSON.stringify(base))
+  for (const [key, val] of Object.entries(preset.params || {})) {
+    if (key in inputs) next[key] = JSON.parse(JSON.stringify(val))
+  }
+  // 兜底：原始值里也没有的字段（比如后加的 noise_seed）按节点当前值补上
+  for (const [key, val] of Object.entries(inputs)) {
+    if (!EDITABLE_SAMPLER.test(key) || next[key] !== undefined) continue
+    if (typeof val === 'boolean') next[key] = val
+    else if (['number', 'string'].includes(typeof val)) next[key] = [val]
+  }
+  state.samplerParams = next
+  if (!silent) state.message = `已应用收藏「${preset.name}」`
+}
+
+/** 破坏性操作统一走这个确认弹窗 */
+function openDialog(options) {
+  state.dialog = {
+    title: '',
+    text: '',
+    confirmText: '确定',
+    danger: false,
+    ...options,
+  }
+}
+
+function closeDialog() {
+  state.dialog = null
+}
+
+function runDialogConfirm() {
+  const d = state.dialog
+  state.dialog = null
+  d?.onConfirm?.()
+}
+
+/** 点收藏的 × → 弹窗确认 */
+function askDeletePreset(id) {
+  const preset = state.presets.find((p) => p.id === id)
+  if (!preset) return
+  openDialog({
+    title: '删除收藏',
+    text: `确定删除收藏「${preset.name}」吗？删除后无法恢复。`,
+    confirmText: '删除',
+    danger: true,
+    onConfirm: () => deletePreset(id),
+  })
+}
+
+function deletePreset(id) {
+  const target = state.presets.find((p) => p.id === id)
+  state.presets = state.presets.filter((p) => p.id !== id)
+  persistPresets()
+  state.message = `已删除收藏「${target?.name || ''}」`
+}
+
+function toggleDefaultPreset(id) {
+  const cur = state.presets.find((p) => p.id === id)
+  const makeDefault = !cur?.isDefault
+  for (const p of state.presets) p.isDefault = makeDefault && p.id === id
+  persistPresets()
+  state.message = makeDefault ? `默认收藏：${cur?.name}` : '已取消默认收藏'
+}
+
+/** 恢复成这个工作流刚载入时的原始参数 */
+function resetSamplerParams() {
+  if (!state.samplerBaseline) return
+  state.samplerParams = JSON.parse(JSON.stringify(state.samplerBaseline))
+  state.message = '已恢复工作流原始参数'
 }
 
 /* ------------------------------- 组合与变体 ------------------------------- */
@@ -431,6 +567,10 @@ function applyPicked(picked) {
   const firstSampler = samplerNodes.value[0]
   state.samplerId = firstSampler ? firstSampler.id : ''
   initSamplerParams(state.samplerId)
+  // 记下原始值，供「恢复原始」用；有默认收藏就直接套上去
+  state.samplerBaseline = JSON.parse(JSON.stringify(state.samplerParams))
+  const defPreset = state.presets.find((p) => p.isDefault)
+  if (defPreset) applyPreset(defPreset, true)
 
   // 带上这个作业已经出过的图，进来就能看到上次的结果
   const all = picked.entry ? collectImages(picked.entry, '') : []
@@ -742,6 +882,17 @@ function openSingle(index) {
 }
 
 function onLightboxKey(e) {
+  // 弹窗打开时优先处理弹窗的键
+  if (state.dialog) {
+    if (e.key === 'Escape') {
+      e.preventDefault()
+      closeDialog()
+    } else if (e.key === 'Enter') {
+      e.preventDefault()
+      runDialogConfirm()
+    }
+    return
+  }
   if (!state.lightbox) return
   if (e.key === 'ArrowLeft') {
     e.preventDefault()
@@ -756,6 +907,7 @@ function onLightboxKey(e) {
 }
 
 onMounted(() => {
+  loadPresets()
   refreshAll()
   window.addEventListener('keydown', onLightboxKey)
 })
@@ -911,9 +1063,50 @@ onUnmounted(() => {
         <section class="card sampler-card">
           <div class="card-head">
             <span>③ 采样参数 · KSampler</span>
-            <span class="tag" v-if="samplerFields.length">{{ samplerFields.length }} 项</span>
+            <div class="head-actions">
+              <span class="tag" v-if="samplerFields.length">{{ samplerFields.length }} 项</span>
+              <button class="mini" @click="state.showSavePreset = !state.showSavePreset">
+                ★ 收藏
+              </button>
+            </div>
           </div>
           <div class="card-body">
+            <!-- 收藏列表：★ 设默认 / 点名字应用 / × 删除 -->
+            <div class="preset-row" v-if="state.presets.length">
+              <span class="pkey mono">收藏</span>
+              <div class="preset-chips">
+                <span
+                  v-for="p in state.presets"
+                  :key="p.id"
+                  class="preset"
+                  :class="{ def: p.isDefault }"
+                >
+                  <span
+                    class="star"
+                    :class="{ on: p.isDefault }"
+                    :title="p.isDefault ? '取消默认' : '设为默认（载入工作流时自动套用）'"
+                    @click="toggleDefaultPreset(p.id)"
+                    >★</span
+                  >
+                  <span class="pname" title="点一下替换当前参数" @click="applyPreset(p)">{{
+                    p.name
+                  }}</span>
+                  <span class="x" title="删除" @click.stop="askDeletePreset(p.id)">×</span>
+                </span>
+              </div>
+            </div>
+
+            <!-- 保存当前参数为收藏 -->
+            <div class="preset-save" v-if="state.showSavePreset">
+              <input
+                v-model="state.presetName"
+                placeholder="收藏名称，例如「FLUX 8步 低cfg」"
+                @keyup.enter="savePreset(state.presetName)"
+              />
+              <button class="primary" @click="savePreset(state.presetName)">保存</button>
+              <button @click="state.showSavePreset = false">取消</button>
+            </div>
+
             <div class="node-pick">
               <span class="pkey mono">节点</span>
               <input v-model="state.samplerId" class="mono" type="text" placeholder="节点 id，例如 61" />
@@ -945,31 +1138,50 @@ onUnmounted(() => {
                   class="cbox"
                 />
 
-                <!-- 枚举：已选项做成 chip，下拉只负责追加 -->
+                <!-- 枚举：只有一个值时就是普通下拉，能直接切换；点 + 才进多值对比 -->
                 <div v-else-if="f.options" class="chips-edit">
-                  <span
-                    v-for="(v, vi) in valuesOf(f.key)"
-                    :key="vi"
-                    class="chip on"
-                    :class="{ multi: valuesOf(f.key).length > 1 }"
-                  >
-                    {{ v }}
-                    <button
-                      v-if="valuesOf(f.key).length > 1"
-                      class="x"
-                      title="移除"
-                      @click="removeValue(f, vi)"
-                    >
-                      ×
-                    </button>
-                  </span>
                   <select
-                    class="add-sel"
-                    @change="addOptionValue(f, $event.target.value); $event.target.value = ''"
+                    v-if="valuesOf(f.key).length === 1"
+                    class="single-sel"
+                    :value="valuesOf(f.key)[0]"
+                    @change="setValueAt(f, 0, $event.target.value)"
                   >
-                    <option value="">+</option>
                     <option v-for="o in f.options" :key="o" :value="o">{{ o }}</option>
                   </select>
+
+                  <template v-else>
+                    <span v-for="(v, vi) in valuesOf(f.key)" :key="vi" class="chip on">
+                      {{ v }}
+                      <button class="x" title="移除" @click="removeValue(f, vi)">×</button>
+                    </span>
+                    <select
+                      class="add-sel"
+                      :disabled="!remainingOptions(f).length"
+                      title="再添加一个候选值"
+                      @change="pickAddOption(f, $event)"
+                    >
+                      <option value="">
+                        {{ remainingOptions(f).length ? '＋ 添加' : '已全部添加' }}
+                      </option>
+                      <option v-for="o in remainingOptions(f)" :key="o" :value="o">{{ o }}</option>
+                    </select>
+                    <button
+                      class="clear-all"
+                      title="只保留第一个值，收回成普通下拉"
+                      @click="collapseValues(f)"
+                    >
+                      清空
+                    </button>
+                  </template>
+
+                  <button
+                    v-if="valuesOf(f.key).length === 1"
+                    class="add"
+                    title="再加一个值，做横向对比"
+                    @click="addValue(f)"
+                  >
+                    +
+                  </button>
                 </div>
 
                 <!-- 数字 / 文本：多个值并排 -->
@@ -1010,8 +1222,11 @@ onUnmounted(() => {
               <button @click="randomizeSamplerSeed" :disabled="!samplerFields.some((f) => f.key === 'seed' || f.key === 'noise_seed')">
                 随机 seed
               </button>
-              <span class="hint">提交时写回这些值，不影响连线</span>
+              <button :disabled="!state.samplerBaseline" @click="resetSamplerParams">
+                恢复原始
+              </button>
             </div>
+            <p class="hint" style="margin: 6px 0 0">提交时只写回这些值，不碰任何连线</p>
           </div>
         </section>
       </div>
@@ -1080,6 +1295,20 @@ onUnmounted(() => {
           </div>
       </section>
     </main>
+
+    <!-- 通用确认弹窗 -->
+    <div v-if="state.dialog" class="modal" @click.self="closeDialog">
+      <div class="modal-card">
+        <h3>{{ state.dialog.title }}</h3>
+        <p>{{ state.dialog.text }}</p>
+        <div class="modal-actions">
+          <button @click="closeDialog">取消</button>
+          <button :class="state.dialog.danger ? 'danger' : 'primary'" @click="runDialogConfirm">
+            {{ state.dialog.confirmText }}
+          </button>
+        </div>
+      </div>
+    </div>
 
     <div v-if="state.lightbox" class="lightbox" @click.self="closeLightbox">
       <div
@@ -1217,6 +1446,43 @@ onUnmounted(() => {
 }
 .card-body.scroll { overflow-y: auto; min-height: 0; }
 
+.head-actions { display: flex; align-items: center; gap: 6px; }
+button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
+
+/* 参数收藏 */
+.preset-row { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
+.preset-row .pkey { padding-top: 3px; }
+.preset-chips { display: flex; flex-wrap: wrap; gap: 5px; flex: 1; min-width: 0; }
+.preset {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 2px 4px 2px 5px;
+  font-size: 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--ink-2);
+  max-width: 100%;
+}
+.preset.def { border-color: var(--brand); background: var(--brand-soft); color: var(--brand); }
+.preset .star { color: var(--line-strong); cursor: pointer; font-size: 11px; padding: 0 1px; }
+.preset .star.on { color: var(--warn); }
+.preset .pname {
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 3px;
+  max-width: 130px;
+}
+.preset .pname:hover { text-decoration: underline; }
+.preset .x { cursor: pointer; color: var(--ink-3); padding: 0 2px; }
+.preset .x:hover { color: var(--bad); }
+.preset-save { display: flex; gap: 6px; margin-bottom: 8px; }
+.preset-save input { flex: 1 1 auto; min-width: 0; }
+.preset-save button { flex: 0 0 auto; padding: 6px 10px; font-size: 12px; }
+
 .params {
   margin-top: 8px;
   display: flex;
@@ -1240,6 +1506,7 @@ onUnmounted(() => {
 
 /* —— 多值编辑 —— */
 .chips-edit { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
+.chips-edit .single-sel { flex: 1 1 0; min-width: 0; padding: 3px 26px 3px 9px; }
 .chips-edit .chip {
   max-width: 100%;
   overflow: hidden;
@@ -1273,11 +1540,25 @@ onUnmounted(() => {
 .vals .add:hover { color: var(--ink); border-color: var(--ink-3); }
 .add-sel {
   width: auto;
-  min-width: 44px;
+  min-width: 86px;
   height: 24px;
   padding: 2px 20px 2px 8px;
   font-size: 11px;
+  flex: 0 0 auto;
 }
+.add-sel:disabled { color: var(--ink-3); background: #f9fafb; cursor: not-allowed; }
+.clear-all {
+  flex: 0 0 auto;
+  height: 22px;
+  padding: 0 7px;
+  font-size: 11px;
+  border-radius: 6px;
+  border: 1px solid var(--line-strong);
+  background: #fff;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.clear-all:hover { color: var(--bad); border-color: #fecaca; background: #fef2f2; }
 .vals { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
 .vals .val { display: flex; align-items: center; gap: 2px; flex: 1 1 96px; min-width: 0; }
 .vals .val input { padding: 3px 2px 3px 7px; }
@@ -1317,6 +1598,44 @@ onUnmounted(() => {
 .kv em { font-style: normal; color: var(--ink-3); margin-right: 3px; }
 .ms { font-size: 11px; color: var(--ink-3); margin-left: auto; }
 .err { font-size: 11px; color: var(--bad); }
+
+/* 通用确认弹窗 */
+.modal {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: rgba(17, 24, 39, .45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: fade .12s ease-out;
+}
+@keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+.modal-card {
+  background: #fff;
+  border-radius: 12px;
+  padding: 18px 20px 16px;
+  width: 340px;
+  max-width: 90vw;
+  box-shadow: 0 18px 48px rgba(15, 23, 42, .22);
+}
+.modal-card h3 { margin: 0 0 8px; font-size: 15px; font-weight: 500; color: var(--ink); }
+.modal-card p {
+  margin: 0 0 18px;
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--ink-2);
+  word-break: break-word;
+}
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.modal-actions button { padding: 6px 14px; }
+button.danger {
+  background: var(--bad);
+  border-color: var(--bad);
+  color: #fff;
+  font-weight: 500;
+}
+button.danger:hover:not(:disabled) { background: #b91c1c; border-color: #b91c1c; }
 
 .lightbox {
   position: fixed;
@@ -1515,7 +1834,7 @@ onUnmounted(() => {
 .images {
   margin-top: 14px;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 10px;
   overflow-y: auto;
 }
