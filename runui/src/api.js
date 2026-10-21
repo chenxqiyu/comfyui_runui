@@ -1,0 +1,120 @@
+const PREFIX_KEY = 'comfy-runui.prefix'
+const DEFAULT_PREFIX = '/comfy'
+
+export function getPrefix() {
+  return localStorage.getItem(PREFIX_KEY) || DEFAULT_PREFIX
+}
+
+export function setPrefix(v) {
+  const val = (v || '').trim()
+  if (val) localStorage.setItem(PREFIX_KEY, val.replace(/\/+$/, ''))
+  else localStorage.removeItem(PREFIX_KEY)
+}
+
+function base() {
+  return getPrefix().replace(/\/+$/, '')
+}
+
+async function request(path, options = {}) {
+  const res = await fetch(base() + path, options)
+  if (!res.ok) {
+    let detail = ''
+    try {
+      const data = await res.json()
+      detail = data?.error?.message || data?.error || JSON.stringify(data)
+    } catch {
+      detail = res.statusText
+    }
+    throw new Error(`HTTP ${res.status} · ${String(detail).slice(0, 400)}`)
+  }
+  return res.json()
+}
+
+export const apiGet = (path) => request(path)
+export const apiPost = (path, body) =>
+  request(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+
+/** 图片直链（走同一个前缀，dev 下由 vite 代理） */
+export function viewUrl(img) {
+  const q = new URLSearchParams({
+    filename: img.filename,
+    subfolder: img.subfolder || '',
+    type: img.type || 'output',
+  })
+  return `${base()}/view?${q.toString()}`
+}
+
+/** /queue 的一项 -> { promptId, nodes } */
+export function nodesFromQueueItem(item) {
+  // [number, prompt_id, prompt_tuple, extra_data, outputs]
+  const tuple = Array.isArray(item) ? item[2] : null
+  if (!Array.isArray(tuple) || !tuple[2]) return null
+  return { promptId: item[1] || tuple[1], nodes: tuple[2] }
+}
+
+/** /history/{id} 的 entry -> nodes */
+export function nodesFromHistoryEntry(entry) {
+  const tuple = entry?.prompt
+  if (!Array.isArray(tuple) || !tuple[2]) return null
+  return { promptId: tuple[1], nodes: tuple[2] }
+}
+
+/**
+ * 找「当前工作流」：正在执行的优先，其次排队中的，最后退回到最近一次执行过的。
+ */
+export async function fetchCurrentWorkflow() {
+  const queue = await apiGet('/queue')
+  const running = queue.queue_running || []
+  const pending = queue.queue_pending || []
+
+  for (const [list, label] of [
+    [running, '正在执行'],
+    [pending, '排队中'],
+  ]) {
+    for (const item of list) {
+      const got = nodesFromQueueItem(item)
+      if (got?.nodes) return { ...got, source: label }
+    }
+  }
+
+  const jobs = (await apiGet('/api/jobs?limit=30')).jobs || []
+  for (const job of jobs) {
+    if (!['completed', 'failed', 'success', 'error'].includes(job.status)) continue
+    const history = await apiGet(`/history/${job.id}`)
+    const entry = history[job.id]
+    const got = nodesFromHistoryEntry(entry)
+    if (got?.nodes) return { ...got, source: `最近一次执行 · ${job.status}`, entry }
+  }
+
+  const history = await apiGet('/history?max_items=10')
+  for (const pid of Object.keys(history)) {
+    const got = nodesFromHistoryEntry(history[pid])
+    if (got?.nodes) return { ...got, source: '历史记录', entry: history[pid] }
+  }
+
+  throw new Error('ComfyUI 里还没有任何执行记录，先在 ComfyUI 里跑一次工作流')
+}
+
+export const submitPrompt = (nodes, extra = {}) =>
+  apiPost('/prompt', { prompt: nodes, client_id: `runui-${Date.now()}`, ...extra })
+
+export const fetchHistory = (promptId) => apiGet(`/history/${promptId}`)
+
+/** 从 history entry 的 outputs 里抽出图片 */
+export function collectImages(entry, outNodeId) {
+  const outputs = entry?.outputs || {}
+  const ids = outNodeId ? [String(outNodeId)] : Object.keys(outputs)
+  const images = []
+  for (const id of ids) {
+    const nodeOut = outputs[id]
+    if (!nodeOut) continue
+    for (const img of nodeOut.images || []) images.push({ ...img, nodeId: id })
+  }
+  return images
+}
+
+export const sleep = (ms) => new Promise((r) => setTimeout(r, ms))

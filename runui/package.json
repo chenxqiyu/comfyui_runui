@@ -1,0 +1,20 @@
+{
+  "name": "comfy-runui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "针对 ComfyUI 当前工作流：绑定输入节点改提示词、提交、绑定输出节点收图",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 5187",
+    "serve": "node tools/serve.mjs"
+  },
+  "dependencies": {
+    "vue": "latest"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "latest",
+    "vite": "latest"
+  }
+}
