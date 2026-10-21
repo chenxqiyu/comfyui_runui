@@ -28,7 +28,8 @@ const state = reactive({
   inId: '',
   inField: '',
   outId: '',
-  text: '',
+  // 每个「输入节点 + 字段」各自保存改过的提示词，切换节点后回来还在
+  textDrafts: {},
   randomSeed: true,
   samplerId: '',
   samplerParams: {},
@@ -115,6 +116,30 @@ const nodeList = computed(() =>
 
 const textNodes = computed(() => nodeList.value.filter((n) => n.fields.length))
 const outNodes = computed(() => nodeList.value.filter((n) => n.isSaver || n.imageCount))
+
+/** 当前输出链路上、可写文本的节点：给「输入节点」做快速切换 */
+const wiredTextNodes = computed(() => {
+  const nodes = state.nodes || {}
+  const out = state.outId
+  return textNodes.value
+    .filter((n) => !out || reachesOutput(nodes, n.id, out))
+    .sort((a, b) => {
+      const sa = Math.max(...a.fields.map(scoreField))
+      const sb = Math.max(...b.fields.map(scoreField))
+      if (sb !== sa) return sb - sa
+      return Number(a.id) - Number(b.id)
+    })
+})
+
+/** 换输入节点时尽量保留还存在的字段，否则自动选最像提示词的那个 */
+function chooseInputNode(id) {
+  const fields = id ? stringFields(state.nodes?.[id]) : []
+  state.inId = id
+  if (!fields.includes(state.inField)) {
+    state.inField =
+      [...fields].sort((a, b) => scoreField(b) - scoreField(a))[0] || ''
+  }
+}
 
 /**
  * loras 可能有两种形态：history 里执行过的节点是裸数组，没执行/被缓存的节点
@@ -248,6 +273,17 @@ const inFields = computed(() => (inNode.value ? stringFields(inNode.value) : [])
 const inValue = computed(() =>
   inNode.value && state.inField ? inNode.value.inputs?.[state.inField] : ''
 )
+
+const promptKey = computed(() =>
+  state.inId && state.inField ? `${state.inId}:${state.inField}` : ''
+)
+const promptText = computed({
+  get: () => (promptKey.value ? state.textDrafts[promptKey.value] ?? '' : ''),
+  set: (v) => {
+    if (!promptKey.value) return
+    state.textDrafts = { ...state.textDrafts, [promptKey.value]: v }
+  },
+})
 
 /* ---------------------------------------------------------------- KSampler 参数 */
 // 允许在 UI 上直接改的采样参数（其余如 model / positive 是连线，不碰）
@@ -701,10 +737,11 @@ function applyPicked(picked) {
       }
     : null
 
-  const preferred = pickInputNode(textNodes.value)
-  state.inId = preferred ? preferred.id : ''
   const lastOut = outNodes.value[outNodes.value.length - 1]
   state.outId = lastOut ? lastOut.id : ''
+  const preferred = pickInputNode(wiredTextNodes.value)
+  state.inField = ''
+  chooseInputNode(preferred ? preferred.id : '')
 
   // 自动绑第一个 KSampler，并把它当前的采样参数读出来
   const firstSampler = samplerNodes.value[0]
@@ -730,6 +767,7 @@ function applyPicked(picked) {
     )
   }
   state.clipboardOff = {}
+  state.textDrafts = {}
   state.message = ''
 }
 
@@ -855,7 +893,9 @@ function buildNodes(params, opts = {}) {
   const node = nodes[state.inId]
   if (!node) throw new Error(`节点 ${state.inId} 不存在于当前工作流`)
   // 新提示词留空时沿用当前值，方便只改参数 / 靠剪切板拼接的工作流
-  node.inputs[state.inField] = state.text.trim() ? state.text : String(inValue.value ?? '')
+  node.inputs[state.inField] = promptText.value.trim()
+    ? promptText.value
+    : String(inValue.value ?? '')
 
   const sampler = nodes[state.samplerId]
   if (sampler?.inputs) {
@@ -1400,7 +1440,7 @@ onUnmounted(() => {
                 <span v-else-if="n.isSaver" class="tag">输出</span>
               </span>
               <span class="nact">
-                <button v-if="n.fields.length" @click="state.inId = n.id">入</button>
+                <button v-if="n.fields.length" @click="chooseInputNode(n.id)">入</button>
                 <button v-if="n.isSaver || n.imageCount" @click="state.outId = n.id">出</button>
               </span>
             </div>
@@ -1433,8 +1473,27 @@ onUnmounted(() => {
             <span class="small clip-count mono">{{ clipboardOnCount }}/{{ clipboardNodes.length }} 启用</span>
           </div>
 
-          <label class="label">输入节点 ID</label>
-          <input v-model="state.inId" class="mono" type="text" placeholder="例如 6" />
+          <div class="in-pick">
+            <div class="in-pick-head">
+              <span class="label" style="margin: 0">输入节点</span>
+              <span class="hint" style="margin: 0">已串联 {{ wiredTextNodes.length }} 个</span>
+            </div>
+            <div class="in-chips" v-if="wiredTextNodes.length">
+              <button
+                v-for="n in wiredTextNodes"
+                :key="n.id"
+                type="button"
+                class="in-chip"
+                :class="{ on: n.id === state.inId }"
+                :title="`${n.id} · ${n.title || n.cls} · 可写字段：${n.fields.join(' / ')}`"
+                @click="chooseInputNode(n.id)"
+              >
+                <span class="mono">{{ n.id }}</span>
+                <span class="in-title">{{ n.title || n.cls }}</span>
+              </button>
+            </div>
+            <p v-else class="hint" style="margin: 0">当前输出链路上没有可写文本的节点</p>
+          </div>
 
           <label class="label" style="margin-top: 12px">写入字段</label>
           <select v-model="state.inField" :disabled="!inFields.length">
@@ -1447,7 +1506,7 @@ onUnmounted(() => {
           </p>
 
           <label class="label" style="margin-top: 12px">新提示词</label>
-          <textarea v-model="state.text" placeholder="输入要替换进去的提示词…"></textarea>
+          <textarea v-model="promptText" placeholder="输入要替换进去的提示词…"></textarea>
 
           <div class="send-row">
             <button
@@ -2119,6 +2178,48 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
   font-size: 10px;
 }
 .clip-count { margin-left: auto; color: var(--ink-3); }
+
+.in-pick { margin-bottom: 12px; }
+.in-pick-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.in-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  max-height: 132px;
+  overflow-y: auto;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fafaf9;
+}
+.in-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: #fff;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.in-chip:hover { border-color: var(--brand); }
+.in-chip.on { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
+.in-title {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .outline-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
 .outline-row > input { flex: 1 1 110px; min-width: 0; }
