@@ -75,6 +75,7 @@ const visibleRows = computed(() =>
     })
 )
 const emptyText = computed(() => {
+  if (!items.value.length) return '还没有 LoRA，用上面的输入框粘贴标签添加'
   if (filter.value === 'active') return '没有已勾选的 LoRA'
   if (filter.value === 'inactive') return '没有未勾选的 LoRA'
   return '没有可编辑的 LoRA'
@@ -148,6 +149,52 @@ function onStrengthChange(index, event) {
 function nudgeStrength(index, delta) {
   setStrength(index, readStrength(items.value[index]) + delta)
 }
+
+/** 手动添加：识别 <lora:名称:权重>，一条输入里可以贴多个 */
+const addText = ref('')
+const addError = ref('')
+
+function parseLoraTags(text) {
+  const out = []
+  const re = /<\s*lora\s*:\s*([^:>]+?)\s*(?::\s*(-?\d*\.?\d+)\s*)?>/gi
+  let m
+  while ((m = re.exec(text))) {
+    const name = m[1].trim()
+    if (!name) continue
+    const n = m[2] === undefined ? 1 : Number(m[2])
+    out.push({ name, strength: Number.isFinite(n) ? n : 1 })
+  }
+  return out
+}
+
+function addFromText() {
+  const parsed = parseLoraTags(addText.value)
+  if (!parsed.length) {
+    addError.value = '没识别到 <lora:名称:权重> 格式'
+    return
+  }
+  const list = items.value.map(clone)
+  for (const { name, strength } of parsed) {
+    const weight = Math.round(strength * 100) / 100
+    // 同名已存在就更新强度并勾选，避免重复堆叠
+    const at = list.findIndex(
+      (x) => cleanName(readName(x)).toLowerCase() === cleanName(name).toLowerCase()
+    )
+    if (at >= 0) {
+      const item = list[at]
+      item.active = true
+      if ('on' in item) item.on = true
+      if ('enabled' in item) item.enabled = true
+      item.strength = weight
+    } else {
+      list.push({ name, strength: weight, active: true })
+    }
+  }
+  commit(list)
+  addText.value = ''
+  addError.value = ''
+  filter.value = 'active'
+}
 </script>
 
 <template>
@@ -201,7 +248,7 @@ function nudgeStrength(index, delta) {
         </p>
       </div>
 
-      <div v-if="!items.length" class="lp-empty">
+      <div v-if="!currentNode" class="lp-empty">
         <p>没有可编辑的 LoRA 堆叠项。</p>
         <p class="lp-empty-sub">
           先在 ComfyUI 里跑一次带 LoRA 堆叠器（LoraManager）的工作流，再点右上角「刷新工作流」。
@@ -221,6 +268,21 @@ function nudgeStrength(index, delta) {
             :value="promptText"
             :title="chainOfNode?.chained ? '串联链路上启用中的 LoRA 标签（只读）' : '启用中的 LoRA 标签预览（只读）'"
           ></textarea>
+          <div class="lp-add">
+            <input
+              v-model="addText"
+              class="lp-add-input"
+              type="text"
+              placeholder="粘贴 <lora:f_FLUX:1> 后回车"
+              spellcheck="false"
+              @input="addError = ''"
+              @keydown.enter.prevent="addFromText"
+            />
+            <button type="button" class="lp-add-btn" :disabled="!addText.trim()" @click="addFromText">
+              添加
+            </button>
+          </div>
+          <p v-if="addError" class="lp-add-err">{{ addError }}</p>
         </div>
 
         <div class="lp-list">
@@ -496,6 +558,39 @@ function nudgeStrength(index, delta) {
   scrollbar-color: #555 transparent;
 }
 .lp-prompt:focus { border-color: #5b7fa5; }
+
+/* —— 手动添加 <lora:名称:权重> —— */
+.lp-add { display: flex; gap: 6px; margin-top: 8px; }
+.lp-add-input {
+  flex: 1 1 0;
+  width: auto;
+  min-width: 0;
+  height: 27px;
+  padding: 0 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: #dedede;
+  background: #1e1e1e;
+  border: 1px solid #3f3f3f;
+  border-radius: 6px;
+  outline: none;
+}
+.lp-add-input::placeholder { color: #777; }
+.lp-add-input:focus { border-color: #5b7fa5; box-shadow: none; }
+.lp-add-btn {
+  flex: 0 0 auto;
+  height: 27px;
+  padding: 0 11px;
+  font-size: 11px;
+  color: #cfe6fb;
+  background: #3d5468;
+  border: 1px solid #4d6a85;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.lp-add-btn:hover:not(:disabled) { background: #46617a; border-color: #5b7fa5; }
+.lp-add-btn:disabled { opacity: .45; cursor: not-allowed; }
+.lp-add-err { margin: 5px 0 0; font-size: 10.5px; color: #e08b8b; }
 
 /* —— 列表 —— */
 .lp-list {
