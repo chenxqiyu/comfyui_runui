@@ -49,6 +49,16 @@ const state = reactive({
   stopFlag: false,
   packing: false,
   resultZoom: Number(localStorage.getItem('runui.resultZoom')) || 100,
+  clipboardOff: {},
+  // 禁用时记下原连线，刷新页面/跑过一轮后还能恢复
+  clipboardLinks: (() => {
+    try {
+      const v = JSON.parse(localStorage.getItem('runui.clipboardLinks') || '{}')
+      return v && typeof v === 'object' ? v : {}
+    } catch {
+      return {}
+    }
+  })(),
   lightbox: null, // { items: [{img, tags, ms, promptId}], index }
   // —— 参数收藏 ——
   presets: [],
@@ -542,9 +552,7 @@ const statusText = computed(() => {
   return '待连接'
 })
 
-const canSend = computed(
-  () => !!state.inId && !!state.inField && !!state.text.trim() && !state.submitting
-)
+const canSend = computed(() => !!state.inId && !!state.inField && !state.submitting)
 
 watch(
   () => state.inId,
@@ -721,6 +729,7 @@ function applyPicked(picked) {
       JSON.stringify(loraList(state.nodes[n.id].inputs.loras) || [])
     )
   }
+  state.clipboardOff = {}
   state.message = ''
 }
 
@@ -801,12 +810,52 @@ function applyPrefix() {
   refreshAll()
 }
 
+/**
+ * 把被禁用的「剪切板获取」从输出链路上摘掉：
+ * 文本口置空字符串，图片口换成一模一样的空图节点（仅存在于本次提交的副本里）。
+ */
+function applyClipboardToggles(nodes) {
+  const off = state.clipboardOff || {}
+  const disabled = Object.keys(off).filter((id) => off[id] && nodes[id])
+  if (!disabled.length) return
+
+  let emptyImageId = ''
+  const emptyImage = () => {
+    if (emptyImageId) return emptyImageId
+    let maxId = 0
+    for (const id of Object.keys(nodes)) {
+      const n = Number(id)
+      if (Number.isFinite(n) && n > maxId) maxId = n
+    }
+    let next = maxId + 1
+    while (nodes[String(next)]) next += 1
+    emptyImageId = String(next)
+    nodes[emptyImageId] = {
+      class_type: 'EmptyImage',
+      inputs: { width: 512, height: 512, batch_size: 1, color: 0 },
+      _meta: { title: '空图（剪切板已禁用）' },
+    }
+    return emptyImageId
+  }
+
+  for (const id of disabled) {
+    for (const node of Object.values(nodes)) {
+      for (const [key, v] of Object.entries(node?.inputs || {})) {
+        if (!isLinkValue(v) || String(v[0]) !== id) continue
+        if (v[1] === 0) node.inputs[key] = ''
+        else if (v[1] === 1) node.inputs[key] = [emptyImage(), 0]
+      }
+    }
+  }
+}
+
 /** 组一份可提交的节点图：写提示词 + 这一组采样参数 */
 function buildNodes(params, opts = {}) {
   const nodes = JSON.parse(JSON.stringify(state.nodes))
   const node = nodes[state.inId]
   if (!node) throw new Error(`节点 ${state.inId} 不存在于当前工作流`)
-  node.inputs[state.inField] = state.text
+  // 新提示词留空时沿用当前值，方便只改参数 / 靠剪切板拼接的工作流
+  node.inputs[state.inField] = state.text.trim() ? state.text : String(inValue.value ?? '')
 
   const sampler = nodes[state.samplerId]
   if (sampler?.inputs) {
@@ -816,12 +865,23 @@ function buildNodes(params, opts = {}) {
   }
   // 批量对比时必须固定 seed，否则差异里混着种子噪声，比不出东西
   if (state.randomSeed && !opts.fixedSeed) randomizeSeeds(nodes)
+  applyClipboardToggles(nodes)
   wrapListWidgets(nodes)
   return nodes
 }
 
 async function send() {
-  if (!canSend.value) return
+  if (state.submitting) return
+  if (state.comparing) {
+    state.failed = false
+    state.message = '正在批量对比，先停止或等它跑完再发送'
+    return
+  }
+  if (!state.inId || !state.inField) {
+    state.failed = true
+    state.message = '先选好输入节点和写入字段'
+    return
+  }
   let nodes
   try {
     // 单次只跑第一组参数
@@ -1032,6 +1092,123 @@ watch(
   (v) => localStorage.setItem('runui.resultZoom', String(v))
 )
 
+/* 「剪切板获取」节点：接入输出链路的才列出来，可在此单独启用/禁用 */
+function clipboardFeedsOf(nodes, id) {
+  const feeds = []
+  for (const [cid, consumer] of Object.entries(nodes || {})) {
+    if (cid === id) continue
+    for (const [field, v] of Object.entries(consumer?.inputs || {})) {
+      if (isLinkValue(v) && String(v[0]) === id) {
+        feeds.push({
+          id: cid,
+          field,
+          slot: v[1],
+          label: String(consumer?._meta?.title || consumer?.class_type || cid),
+        })
+      }
+    }
+  }
+  return feeds
+}
+
+const clipboardNodes = computed(() => {
+  const nodes = state.nodes || {}
+  const list = []
+  for (const [id, node] of Object.entries(nodes)) {
+    const cls = String(node?.class_type || '')
+    const title = String(node?._meta?.title || '')
+    if (!/^ClipboardNode$/i.test(cls) && !title.includes('剪切板获取')) continue
+
+    const feeds = clipboardFeedsOf(nodes, id)
+    list.push({
+      id,
+      cls,
+      title,
+      feeds,
+      feedsText: feeds.map((f) => `${f.id} ${f.label}`).join('、'),
+    })
+  }
+  return list
+})
+
+const clipboardOnCount = computed(
+  () =>
+    clipboardNodes.value.filter(
+      (n) => n.feeds.length && !state.clipboardOff[n.id]
+    ).length
+)
+
+function isClipboardOff(id) {
+  if (state.clipboardOff[id]) return true
+  // 上一轮禁用提交会把连线摘掉；刷新后靠「没有下游」识别成禁用
+  return clipboardFeedsOf(state.nodes, id).length === 0
+}
+
+function saveClipboardLinks(id, feeds) {
+  state.clipboardLinks = {
+    ...state.clipboardLinks,
+    [id]: feeds.map((f) => ({ id: f.id, field: f.field, slot: f.slot })),
+  }
+  localStorage.setItem('runui.clipboardLinks', JSON.stringify(state.clipboardLinks))
+}
+
+/** 从最近的作业里找回这个剪切板节点原来的下游连线（用于刷新后重新启用） */
+async function findClipboardLinks(id) {
+  try {
+    const data = await apiGet('/api/jobs?limit=20')
+    for (const job of data.jobs || []) {
+      const history = await apiGet(`/history/${job.id}`)
+      const got = nodesFromHistoryEntry(history[job.id])
+      if (!got?.nodes) continue
+      const feeds = clipboardFeedsOf(got.nodes, id)
+      if (feeds.length) return feeds
+    }
+  } catch {
+    /* 找不到就让用户回 ComfyUI 接 */
+  }
+  return []
+}
+
+function restoreClipboardLinks(id, links) {
+  let restored = 0
+  for (const f of links || []) {
+    const consumer = state.nodes?.[f.id]
+    if (consumer?.inputs && f.field in consumer.inputs) {
+      consumer.inputs[f.field] = [id, f.slot]
+      restored += 1
+    }
+  }
+  return restored
+}
+
+async function toggleClipboard(id) {
+  const feeds = clipboardFeedsOf(state.nodes, id)
+  if (feeds.length && !state.clipboardOff[id]) {
+    saveClipboardLinks(id, feeds)
+    state.clipboardOff = { ...state.clipboardOff, [id]: true }
+    return
+  }
+
+  // 连线可能已被上一轮提交摘掉，用记下的原连线补回来
+  if (!feeds.length) {
+    let restored = restoreClipboardLinks(id, state.clipboardLinks[id])
+    if (!restored) {
+      state.message = '正在找回这个剪切板节点的原始连线…'
+      const saved = await findClipboardLinks(id)
+      if (saved.length) saveClipboardLinks(id, saved)
+      restored = restoreClipboardLinks(id, saved)
+    }
+    if (!restored) {
+      state.failed = true
+      state.message = '这个剪切板节点在当前工作流里没有下游连线，先在 ComfyUI 里接好再刷新'
+      return
+    }
+    state.failed = false
+    state.message = ''
+  }
+  state.clipboardOff = { ...state.clipboardOff, [id]: false }
+}
+
 /** 当前能打包的图片数：对比结果优先，否则单次结果 */
 const downloadCount = computed(() =>
   state.results.length ? resultItems.value.length : state.images.length
@@ -1236,6 +1413,26 @@ onUnmounted(() => {
         <section class="card grow">
           <div class="card-head"><span>② 绑定输入 · 改提示词</span></div>
           <div class="card-body">
+          <!-- 剪切板获取：接入输出链路的才列出来，点击整条启用/禁用 -->
+          <div class="clipbar" v-if="clipboardNodes.length">
+            <span class="pkey">剪切板获取</span>
+            <button
+              v-for="n in clipboardNodes"
+              :key="n.id"
+              type="button"
+              class="clip-chip"
+              :class="{ off: isClipboardOff(n.id) }"
+              :title="`${isClipboardOff(n.id) ? '点击启用' : '点击禁用'} · ${n.id} ${n.title || n.cls} ${n.feeds.length ? '→ ' + n.feedsText : '（无下游连线）'}`"
+              @click="toggleClipboard(n.id)"
+            >
+              <span class="clip-box" aria-hidden="true">{{ isClipboardOff(n.id) ? '' : '✓' }}</span>
+              <span class="clip-id mono">{{ n.id }}</span>
+              <span class="clip-name">{{ n.title || n.cls }}</span>
+              <span class="clip-to mono">{{ n.feeds.length ? `→ ${n.feedsText}` : '未接入' }}</span>
+            </button>
+            <span class="small clip-count mono">{{ clipboardOnCount }}/{{ clipboardNodes.length }} 启用</span>
+          </div>
+
           <label class="label">输入节点 ID</label>
           <input v-model="state.inId" class="mono" type="text" placeholder="例如 6" />
 
@@ -1255,7 +1452,6 @@ onUnmounted(() => {
           <div class="send-row">
             <button
               class="primary"
-              :disabled="!canSend || state.comparing"
               @click="send"
             >
               {{ state.submitting ? '发送中…' : variants.length > 1 ? '发送第一组' : '发送到 ComfyUI' }}
@@ -1862,6 +2058,68 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
 .compare-btn { border-color: var(--brand); color: var(--brand); }
 
 /* —— 对比结果 —— */
+.clipbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fafaf9;
+}
+.clipbar .pkey { padding-top: 0; }
+.clip-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 3px 9px 3px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: #fff;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.clip-chip:hover { border-color: var(--brand); }
+.clip-box {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  border: 1px solid var(--brand);
+  background: var(--brand);
+  color: #fff;
+  font-size: 10px;
+  line-height: 1;
+}
+.clip-chip.off { color: var(--ink-3); background: #fbfbfb; border-style: dashed; }
+.clip-chip.off .clip-box { background: #fff; border-color: var(--line-strong); }
+.clip-chip.off .clip-name { text-decoration: line-through; }
+.clip-id { color: var(--brand); flex: 0 0 auto; }
+.clip-chip.off .clip-id { color: var(--ink-3); }
+.clip-name {
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.clip-to {
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-3);
+  font-size: 10px;
+}
+.clip-count { margin-left: auto; color: var(--ink-3); }
+
 .outline-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
 .outline-row > input { flex: 1 1 110px; min-width: 0; }
 .shot.cell .thumb {
