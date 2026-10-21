@@ -1,5 +1,5 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -57,6 +57,28 @@ function clone(item) {
 
 const activeCount = computed(() => items.value.filter(isActive).length)
 const allActive = computed(() => items.value.length > 0 && activeCount.value === items.value.length)
+
+/** 列表筛选：默认只看已勾选，另有未勾选 / 全部 */
+const filter = ref('active')
+const filters = computed(() => [
+  { key: 'active', label: '已勾选', count: activeCount.value },
+  { key: 'inactive', label: '未勾选', count: items.value.length - activeCount.value },
+  { key: 'all', label: '全部', count: items.value.length },
+])
+const visibleRows = computed(() =>
+  items.value
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => {
+      if (filter.value === 'active') return isActive(item)
+      if (filter.value === 'inactive') return !isActive(item)
+      return true
+    })
+)
+const emptyText = computed(() => {
+  if (filter.value === 'active') return '没有已勾选的 LoRA'
+  if (filter.value === 'inactive') return '没有未勾选的 LoRA'
+  return '没有可编辑的 LoRA'
+})
 
 /** 只列启用中的，生成 <lora:name:0.70> 预览 */
 const promptText = computed(() =>
@@ -207,11 +229,21 @@ function nudgeStrength(index, delta) {
               <input type="checkbox" :checked="allActive" @change="toggleAll" />
               <span>Toggle All</span>
             </label>
-            <span class="lp-strength-title">节点 {{ nodeId }} · 强度 ↔</span>
+            <div class="lp-filter" role="group" aria-label="筛选 LoRA">
+              <button
+                v-for="f in filters"
+                :key="f.key"
+                type="button"
+                :class="{ on: filter === f.key }"
+                @click="filter = f.key"
+              >
+                {{ f.label }}<span class="lp-filter-count">{{ f.count }}</span>
+              </button>
+            </div>
           </div>
           <div class="lp-rows">
             <div
-              v-for="(item, i) in items"
+              v-for="({ item, index: i }) in visibleRows"
               :key="i"
               class="lp-row"
               :class="{ off: !isActive(item) }"
@@ -244,6 +276,7 @@ function nudgeStrength(index, delta) {
                 </button>
               </div>
             </div>
+            <div v-if="!visibleRows.length" class="lp-rows-empty">{{ emptyText }}</div>
           </div>
         </div>
 
@@ -495,7 +528,33 @@ function nudgeStrength(index, delta) {
   cursor: pointer;
 }
 .lp-toggle-all span { font-size: 12px; color: #cfcfcf; }
-.lp-strength-title { font-size: 11.5px; color: #a3a3a3; }
+.lp-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  flex: 0 0 auto;
+  background: #262626;
+  border: 1px solid #424242;
+  border-radius: 7px;
+}
+.lp-filter button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 6px;
+  font-size: 10.5px;
+  color: #9a9a9a;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.lp-filter button:hover { color: #dedede; background: #343434; }
+.lp-filter button.on { color: #d6e9fb; background: #3d5468; }
+.lp-filter-count { font-family: var(--mono); font-size: 9.5px; opacity: .85; }
+.lp-rows-empty { padding: 18px 12px; text-align: center; font-size: 11px; color: #8a8a8a; }
 .lp-rows {
   flex: 1 1 auto;
   min-height: 0;
