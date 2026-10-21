@@ -33,6 +33,10 @@ const state = reactive({
   runPromptId: '',
   elapsed: 0,
   images: [],
+  warnings: [],
+  showWarnings: false,
+  failed: false,
+  extraData: null,
 })
 
 const TEXT_KEYS = ['text', 'prompt', 'string', 'value', 'content', 'positive', 'text_g', 'text_l']
@@ -120,14 +124,130 @@ function randomizeSeeds(nodes) {
   }
 }
 
+/** 合法的节点连接：["58", 0] */
+function isLinkValue(v) {
+  return (
+    Array.isArray(v) && v.length === 2 && typeof v[0] === 'string' && typeof v[1] === 'number'
+  )
+}
+
+/**
+ * 关键：ComfyUI 默认把数组当成节点连接 [node_id, slot_index]，其余数组会被判定为非法 link。
+ * 所以「值是 list 的 widget」（典型：Lora Stacker (LoraManager) 的 loras）必须包一层
+ * {"__value__": [...]} 才能通过校验 —— execution.py 里专门有这个解包逻辑，
+ * 注释写着 "This is used to pass list widget values to execution"。
+ *
+ * history 里保存的是解包之后的裸数组，直接拿来重新提交就会退化成非法连接，
+ * 于是 ComfyUI 报 bad_linked_input，依赖它的输出被 "Output will be ignored" 丢掉。
+ */
+function wrapListWidgets(nodes) {
+  let count = 0
+  for (const node of Object.values(nodes)) {
+    const inputs = node?.inputs || {}
+    for (const key of Object.keys(inputs)) {
+      const v = inputs[key]
+      if (Array.isArray(v) && !isLinkValue(v)) {
+        inputs[key] = { __value__: v }
+        count += 1
+      }
+    }
+  }
+  return count
+}
+
+/**
+ * 从输出节点反向 BFS，看 errorNode 在不在它的依赖链上。
+ * ComfyUI 校验失败会让依赖它的输出整个被丢掉，日志里是
+ * "Failed to validate prompt for output 62 / Output will be ignored"。
+ */
+function reachesOutput(nodes, errorNode, outNode) {
+  if (!outNode) return false
+  const target = String(errorNode)
+  const seen = new Set()
+  const stack = [String(outNode)]
+  while (stack.length) {
+    const cur = stack.pop()
+    if (cur === target) return true
+    if (seen.has(cur)) continue
+    seen.add(cur)
+    for (const v of Object.values(nodes?.[cur]?.inputs || {})) {
+      if (Array.isArray(v) && v.length === 2 && typeof v[0] === 'string') stack.push(String(v[0]))
+    }
+  }
+  return false
+}
+
+/**
+ * ComfyUI 的 node_errors 是节点级校验信息，要分两种看：
+ *   blocking = true  → 该节点在绑定输出的依赖链上，ComfyUI 会把这个输出直接忽略，本次不出图
+ *   blocking = false → 只影响它自己那条支路，绑定的输出照常执行
+ * 典型来源：Lora Stacker (LoraManager) 把 loras 声明成 ("LORAS", {}) 连接类型，
+ * 但前端做成了 widget，提交时进的是 LoRA 对象数组，被核心校验判为非法 link。
+ */
+function parseNodeErrors(nodeErrors, nodes, outId) {
+  const out = []
+  for (const [nid, info] of Object.entries(nodeErrors || {})) {
+    const cls = nodes?.[nid]?.class_type || ''
+    const errs = info?.errors || []
+    for (const e of errs) {
+      out.push({
+        node: nid,
+        cls,
+        field: e?.extra_info?.input_name || e?.details || '',
+        type: e?.type || '',
+        message: e?.message || '',
+        blocking: reachesOutput(nodes, nid, outId),
+      })
+    }
+  }
+  return out
+}
+
+/** 自动挑一个「最像提示词输入」的节点：优先裸文本容器，避开 NSFWPromptSelector 这类多项选择器 */
+function pickInputNode(list) {
+  if (!list.length) return null
+  const plain = list.filter((n) => !/Selector|Random|Preset/i.test(n.cls))
+  const pool = plain.length ? plain : list
+  return (
+    pool.find((n) => /^PrimitiveString/i.test(n.cls)) ||
+    pool.find((n) => /CLIPTextEncode/i.test(n.cls)) ||
+    pool.find((n) => n.fields.length === 1 && ['text', 'prompt', 'value'].includes(n.fields[0])) ||
+    pool[0]
+  )
+}
+
 function applyPicked(picked) {
   state.nodes = picked.nodes || {}
   state.entry = picked.entry || null
   state.source = picked.source || ''
   state.sourcePromptId = picked.promptId || ''
 
-  const preferred =
-    textNodes.value.find((n) => /TextEncode|Text$|Prompt/i.test(n.cls)) || textNodes.value[0]
+  // ComfyUI 前端提交时会带 extra_pnginfo.workflow。lumi-batcher、LoraManager、
+  // 预览/保存节点缺了它会报 "extra_pnginfo[0] is not a dict or missing 'workflow' key"。
+  // 但把原作业的完整 workflow 原样塞回去又会让 lumi-batcher 把这次执行当成批处理子任务
+  // （它 monkey patch 了 PromptQueue.task_done，会按 output_nodes 改写 outputs，
+  // 结果 PreviewImage 的图就丢了），所以这里只放一个最小骨架：够用，且不带批处理配置。
+  const hasExtra = !!picked.entry?.prompt?.[3]?.extra_pnginfo
+  state.extraData = hasExtra
+    ? {
+        extra_pnginfo: {
+          workflow: {
+            id: picked.promptId || '',
+            revision: 0,
+            last_node_id: 0,
+            last_link_id: 0,
+            nodes: [],
+            links: [],
+            groups: [],
+            config: {},
+            extra: {},
+            version: 0.4,
+          },
+        },
+      }
+    : null
+
+  const preferred = pickInputNode(textNodes.value)
   state.inId = preferred ? preferred.id : ''
   const lastOut = outNodes.value[outNodes.value.length - 1]
   state.outId = lastOut ? lastOut.id : ''
@@ -192,24 +312,39 @@ async function send() {
   }
   node.inputs[state.inField] = state.text
   if (state.randomSeed) randomizeSeeds(nodes)
+  wrapListWidgets(nodes)
 
   state.submitting = true
   state.running = false
-  state.images = []
   state.elapsed = 0
+  state.warnings = []
+  state.showWarnings = false
+  state.failed = false
   state.message = '正在提交…'
   try {
-    const resp = await submitPrompt(nodes)
+    const resp = await submitPrompt(nodes, state.extraData ? { extra_data: state.extraData } : {})
     state.runPromptId = resp.prompt_id
-    const nodeErrors = resp.node_errors || {}
-    if (Object.keys(nodeErrors).length) {
-      state.message = `已入队，但节点有错误：${JSON.stringify(nodeErrors).slice(0, 240)}`
+    const warnings = parseNodeErrors(resp.node_errors, nodes, state.outId)
+    state.warnings = warnings
+    const blocking = warnings.filter((w) => w.blocking)
+    if (blocking.length) {
+      state.failed = true
+      state.message =
+        `已入队，但节点 ${blocking.map((w) => w.node).join(' / ')} 挡住了输出 ` +
+        `${state.outId} —— ComfyUI 会把该输出整个忽略，本次不会出图（日志里是 "Output will be ignored"）`
+    } else if (warnings.length) {
+      state.message = `已入队 · ${warnings.length} 条校验警告（不影响绑定输出）`
     } else {
       state.message = '已入队，等待执行…'
     }
     await waitResult(resp.prompt_id)
   } catch (err) {
+    state.failed = true
     state.message = err.message || String(err)
+    if (err.nodeErrors) {
+      state.warnings = parseNodeErrors(err.nodeErrors, nodes, state.outId)
+      state.showWarnings = true
+    }
   } finally {
     state.submitting = false
     state.running = false
@@ -235,9 +370,15 @@ async function waitResult(promptId) {
           return
         }
         if (entry.status?.completed) {
+          const outputs = entry.outputs || {}
+          const withImg = Object.entries(outputs)
+            .filter(([, v]) => (v?.images || []).length)
+            .map(([k]) => k)
           state.message = state.outId
-            ? `执行完成，但节点 ${state.outId} 没有图片输出 —— 换个输出节点试试`
-            : '执行完成，但没有任何图片输出'
+            ? `执行完成，但绑定的节点 ${state.outId} 没有图片输出` +
+              (withImg.length ? `；本次有图的节点：${withImg.join(', ')}` : '；本次没有任何节点出图') +
+              '，右侧保留的是上一次的图'
+            : '执行完成，但没有任何图片输出（右侧保留的是上一次的图）'
           state.entry = entry
           return
         }
@@ -374,7 +515,30 @@ onMounted(refreshAll)
             <span class="hint" v-if="state.running">执行中 · {{ state.elapsed }}s</span>
           </div>
 
-          <p class="msg" v-if="state.message">{{ state.message }}</p>
+          <p class="msg" v-if="state.message" :class="{ bad: state.failed }">{{ state.message }}</p>
+
+          <div v-if="state.warnings.length" class="warnbox">
+            <button class="warnhead" @click="state.showWarnings = !state.showWarnings">
+              {{ state.showWarnings ? '收起' : '展开' }} {{ state.warnings.length }} 条校验警告
+            </button>
+            <ul class="warnlist" v-if="state.showWarnings">
+              <li v-for="(w, i) in state.warnings" :key="i">
+                节点 <b>{{ w.node }}</b> · {{ w.cls || '?' }}
+                <span v-if="w.field"> · <code>{{ w.field }}</code></span>
+                <span class="wtype">{{ w.type }}</span>
+                <span v-if="w.blocking" class="tag bad">挡住输出 {{ state.outId }}，本次不出图</span>
+                <span v-else class="tag ok">不在绑定输出路径上</span>
+              </li>
+            </ul>
+            <p class="hint" v-if="state.showWarnings">
+              典型原因是 Lora Stacker (LoraManager) 把 <code>loras</code> 声明成
+              <code>("LORAS", {})</code> 连接类型，前端却把它做成了 widget，提交时进的是 LoRA
+              对象数组，被 ComfyUI 核心校验判成非法连接。它一旦落在输出节点的依赖链上，那个输出
+              就会被直接忽略（日志：<code>Output will be ignored</code>），于是一张图都不出。
+              解决办法：把该节点的 <code>loras</code> 输入真正连到一个输出 LORAS 的节点，或者把
+              Lora Stacker 换成 Lora Loader (LoraManager)。
+            </p>
+          </div>
         </div>
       </section>
 
@@ -533,6 +697,37 @@ onMounted(refreshAll)
   font-size: 12px;
   word-break: break-word;
 }
+.msg.bad {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #991b1b;
+}
+
+.warnbox {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 8px;
+}
+.warnhead {
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: #92400e;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.warnlist {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.warnlist li { margin-bottom: 4px; }
+.warnlist code { font-family: var(--mono); background: #fef3c7; padding: 1px 4px; border-radius: 4px; }
+.wtype { font-family: var(--mono); color: var(--ink-3); margin-left: 6px; }
 
 .row { display: flex; gap: 8px; }
 

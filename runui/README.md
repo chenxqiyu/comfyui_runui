@@ -33,6 +33,32 @@ set COMFY=http://127.0.0.1:8188 && npm run serve
 
 勾选「同时随机化所有 seed / noise_seed」的话，每次提交都会换随机种子。
 
+## 提交时为什么要包 `__value__`
+
+ComfyUI 里**数组默认代表节点连接**（`[node_id, slot_index]`），所以「值本身是 list 的 widget」提交时必须包一层：
+
+```json
+{"__value__": [{...}, {...}]}
+```
+
+依据在 `execution.py`：
+
+```python
+# Unwraps values wrapped in __value__ key or typed wrapper.
+# This is used to pass list widget values to execution,
+# as by default list value is reserved to represent the
+# connection between nodes.
+if isinstance(val, dict) and "__value__" in val:
+    val = val["__value__"]
+    inputs[x] = val
+```
+
+典型场景是 `Lora Stacker (LoraManager)` 的 `loras`（几十个 LoRA 对象的数组）。
+
+**坑**：`/history` 里保存的是**解包之后**的裸数组（因为服务端执行前把 `inputs[x]` 换成了裸值）。如果直接把 history 里的节点图重新提交，就会退化成非法连接，ComfyUI 报 `bad_linked_input`，依赖它的输出被 `Output will be ignored` 丢掉 —— 表现就是秒完成、一张图都没有，但 ComfyUI 自带界面却“能跑”。
+
+所以 `send()` 提交前会调 `wrapListWidgets(nodes)`：凡是「是数组、但不像合法连接」的输入，自动包成 `{"__value__": ...}`；`["58", 0]` 这种真连接原样保留。
+
 ## 一个坑：403 Forbidden
 
 ComfyUI 有一层来源校验：请求的 `Host` 和 `Origin` 的 `host:port` 必须一致，否则直接返回 403（防别的网页偷偷往你本机队列塞任务）。

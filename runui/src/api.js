@@ -18,14 +18,18 @@ function base() {
 async function request(path, options = {}) {
   const res = await fetch(base() + path, options)
   if (!res.ok) {
-    let detail = ''
+    let data = null
     try {
-      const data = await res.json()
-      detail = data?.error?.message || data?.error || JSON.stringify(data)
+      data = await res.json()
     } catch {
-      detail = res.statusText
+      /* 非 JSON 响应 */
     }
-    throw new Error(`HTTP ${res.status} · ${String(detail).slice(0, 400)}`)
+    const message = data?.error?.message || res.statusText
+    const err = new Error(`HTTP ${res.status} · ${String(message).slice(0, 300)}`)
+    // 把节点级校验详情带出来，由界面决定怎么展示
+    err.status = res.status
+    err.nodeErrors = data?.node_errors || null
+    throw err
   }
   return res.json()
 }
