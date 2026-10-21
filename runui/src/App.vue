@@ -105,21 +105,131 @@ const nodeList = computed(() =>
 const textNodes = computed(() => nodeList.value.filter((n) => n.fields.length))
 const outNodes = computed(() => nodeList.value.filter((n) => n.isSaver || n.imageCount))
 
-/* LoRA 堆叠节点：输入里有 loras 数组（Lora Stacker / LoraManager） */
-const loraNodes = computed(() =>
-  Object.entries(state.nodes || {})
-    .filter(([, node]) => Array.isArray(node?.inputs?.loras))
-    .map(([id, node]) => ({
+/**
+ * loras 可能有两种形态：history 里执行过的节点是裸数组，没执行/被缓存的节点
+ * 仍是 {"__value__": [...]}（提交时的包装）。链接值 ["id", 0] 不是列表，排除。
+ */
+function loraList(v) {
+  if (isLinkValue(v)) return null
+  if (Array.isArray(v)) return v
+  if (Array.isArray(v?.__value__)) return v.__value__
+  return null
+}
+
+function loraActive(item) {
+  if (!item || typeof item !== 'object') return true
+  if ('active' in item) return !!item.active
+  if ('enabled' in item) return !!item.enabled
+  if ('on' in item) return !!item.on
+  return true
+}
+
+/** LoRA 堆叠节点：输入里有 loras 列表（Lora Stacker / LoraManager） */
+const loraNodes = computed(() => {
+  const out = []
+  for (const [id, node] of Object.entries(state.nodes || {})) {
+    const loras = loraList(node?.inputs?.loras)
+    if (!loras) continue
+    out.push({
       id,
       cls: String(node?.class_type || ''),
       title: node?._meta?.title || '',
-      count: (node.inputs.loras || []).length,
-    }))
-)
+      count: loras.length,
+      activeCount: loras.filter(loraActive).length,
+      loras,
+    })
+  }
+  return out
+})
 
 const loraLoras = computed(() => {
-  const list = state.nodes?.[state.loraId]?.inputs?.loras
+  const list = loraList(state.nodes?.[state.loraId]?.inputs?.loras)
   return Array.isArray(list) ? list : []
+})
+
+/**
+ * 按 lora_stack 连线把堆叠节点串成链路：上游在前、下游在后。
+ * 链路最后一个节点的 LORA_STACK 输出（slot 0）若被非堆叠节点消费，
+ * 记为已接入（如 CR Apply LoRA Stack）；否则是未接入的孤立堆叠。
+ */
+const loraChains = computed(() => {
+  const nodes = state.nodes || {}
+  const stackers = loraNodes.value
+  const ids = new Set(stackers.map((n) => n.id))
+  const byId = new Map(stackers.map((n) => [n.id, n]))
+
+  const up = new Map()
+  for (const n of stackers) {
+    const link = nodes[n.id]?.inputs?.lora_stack
+    if (!isLinkValue(link)) continue
+    const src = String(link[0])
+    if (ids.has(src) && src !== n.id) up.set(n.id, src)
+  }
+  const down = new Map()
+  for (const [child, parent] of up) {
+    const list = down.get(parent) || []
+    list.push(child)
+    down.set(parent, list)
+  }
+
+  const seen = new Set()
+  const orderOf = (root) => {
+    const order = []
+    const queue = [root]
+    while (queue.length) {
+      const id = queue.shift()
+      if (seen.has(id)) continue
+      seen.add(id)
+      order.push(id)
+      const kids = (down.get(id) || []).filter((k) => !seen.has(k))
+      if (kids.length > 1) queue.push(...kids.slice(1))
+      if (kids.length) queue.unshift(kids[0])
+    }
+    return order
+  }
+
+  const groups = []
+  for (const n of stackers) {
+    if (!up.has(n.id) && !seen.has(n.id)) groups.push(orderOf(n.id))
+  }
+  for (const n of stackers) {
+    if (!seen.has(n.id)) groups.push(orderOf(n.id))
+  }
+
+  const consumers = (id) => {
+    const out = []
+    for (const [cid, node] of Object.entries(nodes)) {
+      if (cid === id) continue
+      for (const v of Object.values(node?.inputs || {})) {
+        if (isLinkValue(v) && String(v[0]) === id && v[1] === 0) {
+          out.push({
+            id: cid,
+            cls: String(node?.class_type || ''),
+            title: node?._meta?.title || '',
+          })
+        }
+      }
+    }
+    return out
+  }
+
+  return groups
+    .map((idsInChain) => {
+      const members = idsInChain.map((id) => byId.get(id)).filter(Boolean)
+      const memberIds = new Set(idsInChain)
+      const tail = idsInChain[idsInChain.length - 1]
+      const end = consumers(tail).find((c) => !memberIds.has(c.id)) || null
+      return {
+        ids: idsInChain,
+        nodes: members,
+        chained: idsInChain.length > 1,
+        connected: !!end,
+        end,
+        enabled: members.reduce((sum, n) => sum + n.activeCount, 0),
+        total: members.reduce((sum, n) => sum + n.count, 0),
+      }
+    })
+    .sort((a, b) => Number(b.chained) - Number(a.chained) || Number(b.connected) - Number(a.connected))
 })
 
 const inNode = computed(() => state.nodes?.[state.inId] || null)
@@ -606,7 +716,9 @@ function applyPicked(picked) {
   if (!stacks.some((n) => n.id === state.loraId)) state.loraId = stacks[0]?.id || ''
   state.loraBaseline = {}
   for (const n of stacks) {
-    state.loraBaseline[n.id] = JSON.parse(JSON.stringify(state.nodes[n.id].inputs.loras || []))
+    state.loraBaseline[n.id] = JSON.parse(
+      JSON.stringify(loraList(state.nodes[n.id].inputs.loras) || [])
+    )
   }
   state.message = ''
 }
@@ -669,7 +781,11 @@ function selectLoraNode(id) {
 function updateLoras(list) {
   const node = state.nodes?.[state.loraId]
   if (!node?.inputs) return
-  node.inputs.loras = Array.isArray(list) ? list : []
+  const next = Array.isArray(list) ? list : []
+  // 保留原包装形态；即使写成裸数组，提交前 wrapListWidgets 也会再包上
+  const cur = node.inputs.loras
+  node.inputs.loras =
+    cur && !Array.isArray(cur) && Array.isArray(cur.__value__) ? { ...cur, __value__: next } : next
 }
 
 function resetLoras() {
@@ -1426,6 +1542,7 @@ onUnmounted(() => {
     <LoraPanel
       :open="state.showLora"
       :nodes="loraNodes"
+      :chains="loraChains"
       :node-id="state.loraId"
       :loras="loraLoras"
       :baseline="state.loraBaseline[state.loraId] || null"

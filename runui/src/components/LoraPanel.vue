@@ -3,7 +3,8 @@ import { computed } from 'vue'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
-  nodes: { type: Array, default: () => [] }, // [{ id, cls, title, count }]
+  nodes: { type: Array, default: () => [] }, // [{ id, cls, title, count, activeCount, loras }]
+  chains: { type: Array, default: () => [] }, // [{ ids, nodes, chained, connected, end, enabled, total }]
   nodeId: { type: String, default: '' },
   loras: { type: Array, default: () => [] },
   baseline: { type: Array, default: null },
@@ -13,6 +14,23 @@ const emit = defineEmits(['toggle', 'close', 'select-node', 'change', 'reset'])
 
 const items = computed(() => (Array.isArray(props.loras) ? props.loras : []))
 const currentNode = computed(() => props.nodes.find((n) => n.id === props.nodeId) || null)
+const chainOfNode = computed(
+  () => props.chains.find((c) => c.ids.includes(props.nodeId)) || null
+)
+const chainPos = computed(() => {
+  const chain = chainOfNode.value
+  if (!chain?.chained) return ''
+  return `串联 ${chain.ids.indexOf(props.nodeId) + 1}/${chain.ids.length}`
+})
+
+/** 串联时把整条链上启用的 LoRA 按「上游 → 下游」合并展示 */
+const previewItems = computed(() => {
+  const chain = chainOfNode.value
+  if (!chain?.chained) return items.value
+  return chain.nodes.flatMap((n) => (Array.isArray(n.loras) ? n.loras : []))
+})
+const previewEnabled = computed(() => previewItems.value.filter(isActive).length)
+const previewLabel = computed(() => (chainOfNode.value?.chained ? '串联启用预览' : 'lora堆栈'))
 
 function readName(item) {
   if (item && typeof item === 'object') return String(item.name ?? item.lora ?? '')
@@ -42,7 +60,7 @@ const allActive = computed(() => items.value.length > 0 && activeCount.value ===
 
 /** 只列启用中的，生成 <lora:name:0.70> 预览 */
 const promptText = computed(() =>
-  items.value
+  previewItems.value
     .filter((x) => isActive(x) && readName(x))
     .map((x) => `<lora:${cleanName(readName(x))}:${readStrength(x).toFixed(2)}>`)
     .join('')
@@ -119,23 +137,47 @@ function nudgeStrength(index, delta) {
           <div class="lp-title-text">
             <strong>LORA堆叠器</strong>
             <span class="lp-sub">
-              <template v-if="currentNode">{{ currentNode.cls }} · 节点 {{ nodeId }}</template>
+              <template v-if="currentNode">
+                {{ currentNode.cls }} · 节点 {{ nodeId }}<template v-if="chainPos"> · {{ chainPos }}</template>
+              </template>
               <template v-else>当前工作流没有 LoRA 堆叠节点</template>
             </span>
           </div>
         </div>
         <div class="lp-actions">
-          <select
-            v-if="nodes.length > 1"
-            :value="nodeId"
-            title="切换 LoRA 堆叠节点"
-            @change="emit('select-node', $event.target.value)"
-          >
-            <option v-for="n in nodes" :key="n.id" :value="n.id">{{ n.id }} · {{ n.cls }}</option>
-          </select>
           <button type="button" class="lp-close" title="收起面板" @click="emit('close')">×</button>
         </div>
       </header>
+
+      <div v-if="chains.length" class="lp-chains">
+        <div v-for="chain in chains" :key="chain.ids.join('>')" class="lp-chain">
+          <span class="lp-chain-tag" :class="{ live: chain.chained || chain.connected }">
+            {{ chain.chained ? `串联 ${chain.ids.length}` : chain.connected ? '已接入' : '未接入' }}
+          </span>
+          <template v-for="(n, ni) in chain.nodes" :key="n.id">
+            <span v-if="ni" class="lp-chain-arrow">→</span>
+            <button
+              type="button"
+              class="lp-chip"
+              :class="{ on: n.id === nodeId, muted: !n.activeCount }"
+              :title="`${n.cls}${n.title ? ' · ' + n.title : ''}\n启用 ${n.activeCount}/${n.count}，点击编辑`"
+              @click="emit('select-node', n.id)"
+            >
+              <span class="lp-chip-id">{{ n.id }}</span>
+              <span class="lp-chip-count">{{ n.activeCount }}/{{ n.count }}</span>
+            </button>
+          </template>
+          <template v-if="chain.end">
+            <span class="lp-chain-arrow">→</span>
+            <span class="lp-chain-end" :title="`${chain.end.cls} · 节点 ${chain.end.id}`">
+              {{ chain.end.id }} {{ chain.end.title || chain.end.cls }}
+            </span>
+          </template>
+        </div>
+        <p v-if="chains.some((c) => c.chained)" class="lp-chains-hint">
+          上游堆叠会并入下游，预览按串联顺序合并启用项
+        </p>
+      </div>
 
       <div v-if="!items.length" class="lp-empty">
         <p>没有可编辑的 LoRA 堆叠项。</p>
@@ -147,15 +189,15 @@ function nudgeStrength(index, delta) {
       <template v-else>
         <div class="lp-stack">
           <div class="lp-stack-head">
-            <span class="lp-stack-label">lora堆栈</span>
-            <span class="lp-sync"><i></i>{{ activeCount }}/{{ items.length }} 启用</span>
+            <span class="lp-stack-label">{{ previewLabel }}</span>
+            <span class="lp-sync"><i></i>{{ previewEnabled }}/{{ previewItems.length }} 启用</span>
           </div>
           <textarea
             class="lp-prompt"
             readonly
             spellcheck="false"
             :value="promptText"
-            title="启用中的 LoRA 标签预览（只读）"
+            :title="chainOfNode?.chained ? '串联链路上启用中的 LoRA 标签（只读）' : '启用中的 LoRA 标签预览（只读）'"
           ></textarea>
         </div>
 
@@ -165,7 +207,7 @@ function nudgeStrength(index, delta) {
               <input type="checkbox" :checked="allActive" @change="toggleAll" />
               <span>Toggle All</span>
             </label>
-            <span class="lp-strength-title">强度 ↔</span>
+            <span class="lp-strength-title">节点 {{ nodeId }} · 强度 ↔</span>
           </div>
           <div class="lp-rows">
             <div
@@ -173,8 +215,10 @@ function nudgeStrength(index, delta) {
               :key="i"
               class="lp-row"
               :class="{ off: !isActive(item) }"
+              :title="isActive(item) ? '点击停用这条 LoRA' : '点击启用这条 LoRA'"
+              @click="setActive(i, !isActive(item))"
             >
-              <label class="lp-check">
+              <label class="lp-check" @click.stop>
                 <input
                   type="checkbox"
                   :checked="isActive(item)"
@@ -183,7 +227,7 @@ function nudgeStrength(index, delta) {
                 />
               </label>
               <span class="lp-name" :title="readName(item)">{{ readName(item) || '（未命名）' }}</span>
-              <div class="lp-step">
+              <div class="lp-step" @click.stop>
                 <button type="button" class="lp-arrow" title="减少 0.05" @click="nudgeStrength(i, -0.05)">
                   ‹
                 </button>
@@ -245,7 +289,7 @@ function nudgeStrength(index, delta) {
 /* —— 面板：贴合截图里的节点外观 —— */
 .lp {
   width: 380px;
-  max-height: calc(100vh - 120px);
+  height: min(660px, calc(100vh - 120px));
   display: flex;
   flex-direction: column;
   background: #383838;
@@ -290,25 +334,6 @@ function nudgeStrength(index, delta) {
   white-space: nowrap;
 }
 .lp-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
-.lp-actions select {
-  width: auto;
-  max-width: 150px;
-  height: 24px;
-  padding: 2px 20px 2px 7px;
-  font-size: 11px;
-  color: #cfcfcf;
-  background-color: #262626;
-  border: 1px solid #4a4a4a;
-  border-radius: 6px;
-  -webkit-appearance: none;
-  appearance: none;
-  background-image: linear-gradient(45deg, transparent 50%, #b0b0b0 50%),
-    linear-gradient(135deg, #b0b0b0 50%, transparent 50%);
-  background-position: calc(100% - 12px) calc(50% + 1px), calc(100% - 7px) calc(50% + 1px);
-  background-size: 5px 5px, 5px 5px;
-  background-repeat: no-repeat;
-}
-.lp-actions select option { background: #262626; color: #dedede; }
 .lp-close {
   width: 22px;
   height: 22px;
@@ -325,6 +350,75 @@ function nudgeStrength(index, delta) {
   cursor: pointer;
 }
 .lp-close:hover { color: #f0f0f0; background: #3d3d3d; border-color: #4f4f4f; }
+
+/* —— 串联链路 —— */
+.lp-chains {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 12px 0;
+}
+.lp-chain {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.lp-chain-tag {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: #8f8f8f;
+  background: #2c2c2c;
+  border: 1px solid #474747;
+  border-radius: 999px;
+}
+.lp-chain-tag.live { color: #9ccf7f; border-color: #4f6b3f; background: #2b3428; }
+.lp-chain-arrow { color: #6f6f6f; font-size: 11px; line-height: 1; }
+.lp-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 7px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: #cfcfcf;
+  background: #2a2a2a;
+  border: 1px solid #4a4a4a;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.lp-chip:hover { background: #363636; border-color: #5c5c5c; }
+.lp-chip.on {
+  border-color: #5b9bd5;
+  background: #2d3a46;
+  color: #d8ebff;
+  box-shadow: 0 0 0 1px rgba(91, 155, 213, .25);
+}
+.lp-chip.muted .lp-chip-id { color: #8f8f8f; }
+.lp-chip-count {
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #3c3c3c;
+  color: #9f9f9f;
+  font-size: 9.5px;
+  line-height: 14px;
+}
+.lp-chip.on .lp-chip-count { background: #3d5468; color: #cfe6fb; }
+.lp-chip.muted .lp-chip-count { color: #7d7d7d; }
+.lp-chain-end {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: #8f8f8f;
+}
+.lp-chains-hint { margin: 0; font-size: 10px; color: #7f7f7f; line-height: 1.5; }
 
 /* —— lora 堆栈文本预览 —— */
 .lp-stack { flex: 0 0 auto; padding: 10px 12px 0; }
@@ -419,6 +513,7 @@ function nudgeStrength(index, delta) {
   gap: 8px;
   padding: 6px 10px;
   border-bottom: 1px solid #3d3d3d;
+  cursor: pointer;
   transition: background .12s;
 }
 .lp-row:last-child { border-bottom: none; }
@@ -556,7 +651,7 @@ function nudgeStrength(index, delta) {
 
 @media (max-width: 640px) {
   .lora-dock { right: 10px; bottom: 10px; left: 10px; align-items: stretch; }
-  .lp { width: auto; max-height: calc(100vh - 90px); }
+  .lp { width: auto; height: min(660px, calc(100vh - 90px)); }
   .lora-fab { align-self: flex-end; }
 }
 </style>
