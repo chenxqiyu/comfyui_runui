@@ -141,6 +141,14 @@ function chooseInputNode(id) {
   }
 }
 
+/** 这个节点是否有改过（非空草稿），用于标签高亮 */
+function isInputDirty(id) {
+  const prefix = `${id}:`
+  return Object.entries(state.textDrafts).some(
+    ([key, value]) => key.startsWith(prefix) && String(value || '').trim()
+  )
+}
+
 /**
  * loras 可能有两种形态：history 里执行过的节点是裸数组，没执行/被缓存的节点
  * 仍是 {"__value__": [...]}（提交时的包装）。链接值 ["id", 0] 不是列表，排除。
@@ -897,6 +905,18 @@ function buildNodes(params, opts = {}) {
     ? promptText.value
     : String(inValue.value ?? '')
 
+  // 其它节点改过的提示词也一起带上，不只发当前选中的那个
+  for (const [key, raw] of Object.entries(state.textDrafts)) {
+    if (!String(raw || '').trim()) continue
+    const sep = key.lastIndexOf(':')
+    if (sep <= 0) continue
+    const target = nodes[key.slice(0, sep)]
+    const field = key.slice(sep + 1)
+    if (target?.inputs && typeof target.inputs[field] === 'string') {
+      target.inputs[field] = raw
+    }
+  }
+
   const sampler = nodes[state.samplerId]
   if (sampler?.inputs) {
     for (const [key, val] of Object.entries(params || {})) {
@@ -1484,12 +1504,13 @@ onUnmounted(() => {
                 :key="n.id"
                 type="button"
                 class="in-chip"
-                :class="{ on: n.id === state.inId }"
-                :title="`${n.id} · ${n.title || n.cls} · 可写字段：${n.fields.join(' / ')}`"
+                :class="{ on: n.id === state.inId, dirty: isInputDirty(n.id) }"
+                :title="`${n.id} · ${n.title || n.cls} · 可写字段：${n.fields.join(' / ')}${isInputDirty(n.id) ? ' · 已修改（发送时会一并带上）' : ''}`"
                 @click="chooseInputNode(n.id)"
               >
                 <span class="mono">{{ n.id }}</span>
                 <span class="in-title">{{ n.title || n.cls }}</span>
+                <span v-if="isInputDirty(n.id)" class="in-dot" aria-hidden="true"></span>
               </button>
             </div>
             <p v-else class="hint" style="margin: 0">当前输出链路上没有可写文本的节点</p>
@@ -2214,6 +2235,18 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
 }
 .in-chip:hover { border-color: var(--brand); }
 .in-chip.on { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
+.in-chip.dirty:not(.on) {
+  border-color: var(--warn);
+  color: var(--warn);
+  background: #fffbeb;
+}
+.in-dot {
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--warn);
+}
 .in-title {
   max-width: 160px;
   overflow: hidden;
