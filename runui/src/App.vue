@@ -78,7 +78,7 @@ const state = reactive({
       return {}
     }
   })(),
-  lightbox: null, // { items: [{img, tags, ms, promptId}], index }
+  lightbox: null, // { items: [{img, tags, ms, promptId}], index, source: 'results' | 'single' }
   // —— 参数收藏 ——
   presets: [],
   showSavePreset: false,
@@ -1356,9 +1356,13 @@ async function downloadAll() {
   }
 }
 
-function openLightbox(items, index = 0) {
+function openLightbox(items, index = 0, source = '') {
   if (!items.length) return
-  state.lightbox = { items, index: Math.max(0, Math.min(index, items.length - 1)) }
+  state.lightbox = {
+    items,
+    index: Math.max(0, Math.min(index, items.length - 1)),
+    source,
+  }
 }
 
 function closeLightbox() {
@@ -1381,15 +1385,46 @@ function openResult(index) {
     promptId: r.promptId,
   }))
   const at = list.findIndex((r) => r.index === index)
-  openLightbox(items, at < 0 ? 0 : at)
+  openLightbox(items, at < 0 ? 0 : at, 'results')
 }
 
 function openSingle(index) {
   openLightbox(
     state.images.map((img) => ({ img, tags: [], ms: 0, nodeId: img.nodeId })),
-    index
+    index,
+    'single'
   )
 }
+
+/** 对比模式下跑到新图：把它顶掉当前预览的那张 */
+watch(
+  () => resultItems.value.length,
+  () => {
+    const lb = state.lightbox
+    if (!lb || lb.source !== 'results') return
+    const items = resultItems.value.map((r) => ({
+      img: r.images[0],
+      tags: r.changed,
+      ms: r.ms,
+      promptId: r.promptId,
+    }))
+    if (!items.length) return
+    const grew = items.length > lb.items.length
+    lb.items = items
+    lb.index = grew ? items.length - 1 : Math.min(lb.index, items.length - 1)
+  }
+)
+
+/** 单次模式下新的图完成后，预览也跟着换成新图 */
+watch(
+  () => state.images,
+  () => {
+    const lb = state.lightbox
+    if (!lb || lb.source !== 'single' || !state.images.length) return
+    lb.items = state.images.map((img) => ({ img, tags: [], ms: 0, nodeId: img.nodeId }))
+    lb.index = 0
+  }
+)
 
 function onLightboxKey(e) {
   if (state.themeOpen && e.key === 'Escape') {
