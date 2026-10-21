@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, watch } from 'vue'
+import JSZip from 'jszip'
 import {
   apiGet,
   collectImages,
@@ -45,6 +46,7 @@ const state = reactive({
   comparing: false,
   progress: { done: 0, total: 0 },
   stopFlag: false,
+  packing: false,
   lightbox: null, // { items: [{img, tags, ms, promptId}], index }
   // —— 参数收藏 ——
   presets: [],
@@ -846,6 +848,60 @@ function shortId(id) {
 // 只列出真正出过图的组，翻页时不会停在占位格子上
 const resultItems = computed(() => state.results.filter((r) => r.images.length))
 
+/** 当前能打包的图片数：对比结果优先，否则单次结果 */
+const downloadCount = computed(() =>
+  state.results.length ? resultItems.value.length : state.images.length
+)
+
+function safeName(s) {
+  return (
+    String(s)
+      .replace(/[\\/:*?"<>|]+/g, '_')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 70) || 'img'
+  )
+}
+
+/** 把当前结果打包成 zip 一次下载，文件名带上这组的参数，方便回来对号入座 */
+async function downloadAll() {
+  const items = state.results.length
+    ? resultItems.value.map((r) => ({ img: r.images[0], tags: r.changed }))
+    : state.images.map((img) => ({ img, tags: [] }))
+  if (!items.length) return
+
+  state.packing = true
+  state.failed = false
+  state.message = `正在打包 ${items.length} 张…`
+  try {
+    const zip = new JSZip()
+    const folder = zip.folder('comfy-runui')
+    for (let i = 0; i < items.length; i += 1) {
+      const { img, tags } = items[i]
+      const label = (tags || []).map((t) => `${shortKey(t.key)}=${t.value}`).join('_')
+      const name = `${String(i + 1).padStart(2, '0')}${label ? `_${safeName(label)}` : ''}.png`
+      const blob = await fetch(viewUrl(img)).then((r) => r.blob())
+      folder.file(name, blob)
+      state.message = `正在打包 ${i + 1}/${items.length}…`
+    }
+    const out = await zip.generateAsync({ type: 'blob' })
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(out)
+    a.download = `comfy-runui-${stamp}.zip`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000)
+    state.message = `已打包下载 ${items.length} 张`
+  } catch (err) {
+    state.failed = true
+    state.message = `打包失败：${err?.message || err}`
+  } finally {
+    state.packing = false
+  }
+}
+
 function openLightbox(items, index = 0) {
   if (!items.length) return
   state.lightbox = { items, index: Math.max(0, Math.min(index, items.length - 1)) }
@@ -1234,14 +1290,24 @@ onUnmounted(() => {
       <section class="card col">
           <div class="card-head">
             <span>④ 对比结果</span>
-            <span class="small">
-              <span v-if="state.comparing" class="mono">
-                {{ state.progress.done }}/{{ state.progress.total }}
+            <div class="head-actions">
+              <span class="small">
+                <span v-if="state.comparing" class="mono">
+                  {{ state.progress.done }}/{{ state.progress.total }}
+                </span>
+                <span v-else-if="state.results.length" class="tag ok">
+                  {{ state.results.filter((r) => r.images.length).length }} / {{ state.results.length }}
+                </span>
               </span>
-              <span v-else-if="state.results.length" class="tag ok">
-                {{ state.results.filter((r) => r.images.length).length }} / {{ state.results.length }}
-              </span>
-            </span>
+              <button
+                class="mini"
+                :disabled="!downloadCount || state.packing || state.comparing"
+                :title="downloadCount ? '把当前这些图打包成 zip 下载' : '还没有图片'"
+                @click="downloadAll"
+              >
+                {{ state.packing ? '打包中…' : `⬇ 打包 ${downloadCount} 张` }}
+              </button>
+            </div>
           </div>
           <div class="card-body">
             <div class="outline-row">
