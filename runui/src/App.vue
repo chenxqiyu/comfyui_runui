@@ -28,6 +28,9 @@ const state = reactive({
   outId: '',
   text: '',
   randomSeed: true,
+  samplerId: '',
+  samplerParams: {},
+  samplerOptions: {},
   submitting: false,
   running: false,
   runPromptId: '',
@@ -88,6 +91,68 @@ const inFields = computed(() => (inNode.value ? stringFields(inNode.value) : [])
 const inValue = computed(() =>
   inNode.value && state.inField ? inNode.value.inputs?.[state.inField] : ''
 )
+
+/* ---------------------------------------------------------------- KSampler 参数 */
+// 允许在 UI 上直接改的采样参数（其余如 model / positive 是连线，不碰）
+const EDITABLE_SAMPLER = /^(steps|cfg|sampler_name|scheduler|denoise|seed|noise_seed|start_at_step|end_at_step|add_noise|return_with_leftover_noise)$/i
+
+const samplerNodes = computed(() =>
+  nodeList.value.filter((n) => /KSampler|SamplerCustom/i.test(n.cls))
+)
+
+const samplerFields = computed(() => {
+  const node = state.nodes?.[state.samplerId]
+  if (!node) return []
+  const out = []
+  for (const [key, val] of Object.entries(node.inputs || {})) {
+    if (!EDITABLE_SAMPLER.test(key)) continue
+    const t = typeof val
+    if (t !== 'number' && t !== 'string' && t !== 'boolean') continue
+    out.push({ key, type: t, options: state.samplerOptions[key] || null })
+  }
+  return out
+})
+
+function initSamplerParams(id) {
+  const node = state.nodes?.[id]
+  state.samplerParams = {}
+  if (!node) {
+    state.samplerOptions = {}
+    return
+  }
+  for (const [key, val] of Object.entries(node.inputs || {})) {
+    if (!EDITABLE_SAMPLER.test(key)) continue
+    if (['number', 'string', 'boolean'].includes(typeof val)) {
+      state.samplerParams[key] = val
+    }
+  }
+  loadSamplerOptions(node.class_type)
+}
+
+/** sampler_name / scheduler 的候选值从 /object_info 拿 */
+async function loadSamplerOptions(cls) {
+  if (!cls) return
+  try {
+    const info = await apiGet('/object_info/' + encodeURIComponent(cls))
+    const required = info?.[cls]?.input?.required || {}
+    const opts = {}
+    for (const key of ['sampler_name', 'scheduler']) {
+      const def = required[key]
+      if (Array.isArray(def) && Array.isArray(def[0])) opts[key] = def[0]
+    }
+    state.samplerOptions = opts
+  } catch {
+    state.samplerOptions = {}
+  }
+}
+
+function randomizeSamplerSeed() {
+  for (const key of ['seed', 'noise_seed']) {
+    if (typeof state.samplerParams[key] === 'number') {
+      state.samplerParams[key] = Math.floor(Math.random() * 1e15)
+    }
+  }
+}
 
 const statusText = computed(() => {
   if (state.status === 'loading') return '读取中'
@@ -252,6 +317,11 @@ function applyPicked(picked) {
   const lastOut = outNodes.value[outNodes.value.length - 1]
   state.outId = lastOut ? lastOut.id : ''
 
+  // 自动绑第一个 KSampler，并把它当前的采样参数读出来
+  const firstSampler = samplerNodes.value[0]
+  state.samplerId = firstSampler ? firstSampler.id : ''
+  initSamplerParams(state.samplerId)
+
   // 带上这个作业已经出过的图，进来就能看到上次的结果
   const all = picked.entry ? collectImages(picked.entry, '') : []
   const mine = all.filter((img) => img.nodeId === state.outId)
@@ -311,6 +381,17 @@ async function send() {
     return
   }
   node.inputs[state.inField] = state.text
+
+  // KSampler 采样参数
+  if (state.samplerId && Object.keys(state.samplerParams).length) {
+    const sampler = nodes[state.samplerId]
+    if (sampler?.inputs) {
+      for (const [key, val] of Object.entries(state.samplerParams)) {
+        if (key in sampler.inputs) sampler.inputs[key] = val
+      }
+    }
+  }
+
   if (state.randomSeed) randomizeSeeds(nodes)
   wrapListWidgets(nodes)
 
@@ -357,6 +438,7 @@ async function waitResult(promptId) {
   const timer = setInterval(() => {
     state.elapsed = Math.round((Date.now() - started) / 1000)
   }, 1000)
+  let tick = 0
   try {
     while (Date.now() - started < 15 * 60 * 1000) {
       const history = await fetchHistory(promptId)
@@ -383,11 +465,34 @@ async function waitResult(promptId) {
           return
         }
       }
+
+      // 被取消 / 失败的作业不会写进 /history，只能靠 job 状态收尾，
+      // 否则界面会一直停在「执行中」，发送按钮也一直禁用。
+      tick += 1
+      if (tick % 3 === 0) {
+        try {
+          const job = await apiGet('/api/jobs/' + promptId)
+          const st = job?.status
+          if (st === 'cancelled' || st === 'failed') {
+            state.failed = true
+            state.message =
+              st === 'cancelled'
+                ? `任务被取消（ComfyUI 里点了「取消当前任务」），共等待 ${Math.round((Date.now() - started) / 1000)} 秒`
+                : '任务执行失败，去 ComfyUI 控制台看报错'
+            return
+          }
+        } catch {
+          /* job 查不到就继续等 */
+        }
+      }
+
       await sleep(800)
     }
+    state.failed = true
     state.message = '等待超时（15 分钟）'
   } finally {
     clearInterval(timer)
+    state.running = false
   }
 }
 
@@ -484,9 +589,10 @@ onMounted(refreshAll)
         </div>
       </section>
 
-      <section class="card col">
-        <div class="card-head"><span>② 绑定输入 · 改提示词</span></div>
-        <div class="card-body">
+      <div class="col stack">
+        <section class="card grow">
+          <div class="card-head"><span>② 绑定输入 · 改提示词</span></div>
+          <div class="card-body">
           <label class="label">输入节点 ID</label>
           <input v-model="state.inId" class="mono" type="text" placeholder="例如 6" />
 
@@ -503,15 +609,14 @@ onMounted(refreshAll)
           <label class="label" style="margin-top: 12px">新提示词</label>
           <textarea v-model="state.text" placeholder="输入要替换进去的提示词…"></textarea>
 
-          <label class="check">
-            <input v-model="state.randomSeed" type="checkbox" />
-            <span>同时随机化所有 seed / noise_seed</span>
-          </label>
-
           <div class="send-row">
             <button class="primary" :disabled="!canSend" @click="send">
               {{ state.submitting ? '发送中…' : '发送到 ComfyUI' }}
             </button>
+            <label class="check" style="margin: 0">
+              <input v-model="state.randomSeed" type="checkbox" />
+              <span>随机 seed</span>
+            </label>
             <span class="hint" v-if="state.running">执行中 · {{ state.elapsed }}s</span>
           </div>
 
@@ -531,20 +636,72 @@ onMounted(refreshAll)
               </li>
             </ul>
             <p class="hint" v-if="state.showWarnings">
-              典型原因是 Lora Stacker (LoraManager) 把 <code>loras</code> 声明成
-              <code>("LORAS", {})</code> 连接类型，前端却把它做成了 widget，提交时进的是 LoRA
-              对象数组，被 ComfyUI 核心校验判成非法连接。它一旦落在输出节点的依赖链上，那个输出
-              就会被直接忽略（日志：<code>Output will be ignored</code>），于是一张图都不出。
-              解决办法：把该节点的 <code>loras</code> 输入真正连到一个输出 LORAS 的节点，或者把
-              Lora Stacker 换成 Lora Loader (LoraManager)。
+              多数情况是「list 型 widget 没包 <code>__value__</code>」造成的：ComfyUI 把数组当成节点连接，
+              裸数组就会被判成非法 link，依赖它的输出会被直接忽略（日志：<code>Output will be ignored</code>）。
+              本界面提交时会自动包装，出现这条说明有特殊情况，可以展开看看是哪个字段。
             </p>
           </div>
         </div>
-      </section>
+        </section>
+
+        <section class="card sampler-card">
+          <div class="card-head">
+            <span>③ 采样参数 · KSampler</span>
+            <span class="tag" v-if="samplerFields.length">{{ samplerFields.length }} 项</span>
+          </div>
+          <div class="card-body">
+            <div class="node-pick">
+              <span class="pkey mono">节点</span>
+              <input v-model="state.samplerId" class="mono" type="text" placeholder="节点 id，例如 61" />
+              <select
+                v-if="samplerNodes.length"
+                :value="state.samplerId"
+                @change="state.samplerId = $event.target.value"
+              >
+                <option v-for="n in samplerNodes" :key="n.id" :value="n.id">
+                  {{ n.id }} · {{ n.cls }}
+                </option>
+              </select>
+            </div>
+
+            <div class="params" v-if="samplerFields.length">
+              <div class="prow" v-for="f in samplerFields" :key="f.key">
+                <label class="pkey mono">{{ f.key }}</label>
+                <select v-if="f.options" v-model="state.samplerParams[f.key]">
+                  <option v-for="o in f.options" :key="o" :value="o">{{ o }}</option>
+                </select>
+                <input
+                  v-else-if="f.type === 'number'"
+                  v-model.number="state.samplerParams[f.key]"
+                  type="number"
+                  step="any"
+                />
+                <input
+                  v-else-if="f.type === 'boolean'"
+                  v-model="state.samplerParams[f.key]"
+                  type="checkbox"
+                  class="cbox"
+                />
+                <input v-else v-model="state.samplerParams[f.key]" type="text" />
+              </div>
+            </div>
+            <p v-else class="hint">
+              {{ state.samplerId ? '该节点没有可编辑的采样参数' : '当前工作流里没有 KSampler 节点' }}
+            </p>
+
+            <div class="send-row" style="margin-top: 6px">
+              <button @click="randomizeSamplerSeed" :disabled="!samplerFields.some((f) => f.key === 'seed' || f.key === 'noise_seed')">
+                随机 seed
+              </button>
+              <span class="hint">提交时写回这些值，不影响连线</span>
+            </div>
+          </div>
+        </section>
+      </div>
 
       <section class="card col">
         <div class="card-head">
-          <span>③ 绑定输出 · 收图</span>
+          <span>④ 绑定输出 · 收图</span>
           <span class="mono small" v-if="state.runPromptId">{{ shortId(state.runPromptId) }}</span>
         </div>
         <div class="card-body">
@@ -628,6 +785,64 @@ onMounted(refreshAll)
 
 .col { display: flex; flex-direction: column; min-height: 0; }
 .card-body.tight { padding: 12px; }
+
+.stack { gap: 12px; }
+.stack > .card.grow { flex: 0 0 auto; }
+/* ③ 采样参数：卡片本身做成 flex 列，head 固定、body 占剩余并真正可滚动 */
+.sampler-card {
+  flex: 1 1 0;
+  min-height: 150px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.sampler-card > .card-head { flex: 0 0 auto; }
+.sampler-card > .card-body {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.card-body.scroll { overflow-y: auto; min-height: 0; }
+
+.params {
+  margin-top: 8px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px 14px;
+}
+@media (min-width: 1700px) {
+  .params { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+.sampler-card input[type="text"] { padding: 4px 9px; }
+.sampler-card input[type="number"] {
+  padding: 4px 17px 4px 9px;
+  font-family: var(--mono);
+}
+.sampler-card select { padding: 4px 26px 4px 9px; }
+.sampler-card > .card-body { padding: 9px 12px; }
+.sampler-card > .card-body::-webkit-scrollbar { width: 8px; }
+.sampler-card > .card-body::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 4px;
+}
+.sampler-card > .card-body::-webkit-scrollbar-track { background: transparent; }
+.prow { display: grid; grid-template-columns: 84px minmax(0, 1fr); align-items: center; gap: 6px; }
+
+.node-pick {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+.pkey {
+  font-size: 12px;
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cbox { width: 16px; height: 16px; justify-self: start; }
 
 .meta {
   display: flex;

@@ -2,3 +2,4 @@ uitest/node_modules
 uitest/.cache/
 *.pyc
 runui/node_modules
+runui/dist

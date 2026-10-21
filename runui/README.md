@@ -28,10 +28,11 @@ set COMFY=http://127.0.0.1:8188 && npm run serve
 
 1. **① 当前工作流** — 打开就自动读 ComfyUI 里正在跑 / 最近一次跑过的那个工作流（拿的是提交时那份 API 格式节点图，改完能直接回灌）。顶部下拉可以切到别的历史作业。
 2. **② 绑定输入** — 点节点列表右侧的「入」，或直接填节点 ID。字段会自动选 `text`；不是文本节点的字段会被过滤掉（`sampler_name`、`ckpt_name` 这类不算）。输入新提示词。
-3. **③ 绑定输出** — 填输出节点 ID（`SaveImage` / `PreviewImage` 之类），点「用首选」自动挑一个。
-4. 点 **发送到 ComfyUI**，轮询执行结果，图会显示在右侧。
+3. **③ 采样参数 · KSampler** — 自动认出工作流里的 KSampler（也支持 `SamplerCustom`），把 `steps / cfg / sampler_name / scheduler / denoise / seed / noise_seed / start_at_step ...` 这些可编辑参数列出来直接改，`sampler_name` 和 `scheduler` 的候选值从 `/object_info` 拉。改完提交时写回对应节点，**不碰任何连线**。旁边有「随机 seed」按钮。
+4. **④ 绑定输出** — 填输出节点 ID（`SaveImage` / `PreviewImage` 之类），点「用首选」自动挑一个。
+5. 点 **发送到 ComfyUI**，轮询执行结果，图会显示在右侧。
 
-勾选「同时随机化所有 seed / noise_seed」的话，每次提交都会换随机种子。
+勾选「同时随机化所有 seed / noise_seed」的话，每次提交都会换随机种子（会覆盖 ③ 里手动填的 seed）。
 
 ## 提交时为什么要包 `__value__`
 
