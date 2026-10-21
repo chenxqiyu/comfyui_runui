@@ -130,3 +130,10 @@ input.mono { font-family: var(--mono); }
 .tag.brand { color: var(--brand); background: var(--brand-soft); border-color: #dbeafe; }
 .tag.ok { color: var(--ok); background: #ecfdf5; border-color: #d1fae5; }
 .tag.bad { color: var(--bad); background: #fef2f2; border-color: #fee2e2; }
+
+/* 统一细滚动条（节点列表 / 参数区 / 图片区共用） */
+* { scrollbar-width: thin; scrollbar-color: #d1d5db transparent; }
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 5px; }
+::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+::-webkit-scrollbar-track { background: transparent; }

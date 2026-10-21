@@ -786,6 +786,19 @@ onMounted(refreshAll)
 .col { display: flex; flex-direction: column; min-height: 0; }
 .card-body.tight { padding: 12px; }
 
+/* ① / ④ 这类「head + body + 内部滚动区」的卡片：body 必须自己撑成 flex 列，
+   否则里面的 .list / .images 的 flex:1 无效，内容只会被 card 的 overflow:hidden 裁掉 */
+.card.col > .card-body {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.card.col > .card-body > * { flex: 0 0 auto; }
+.card.col > .card-body > .list,
+.card.col > .card-body > .images { flex: 1 1 0; min-height: 0; }
+
 .stack { gap: 12px; }
 .stack > .card.grow { flex: 0 0 auto; }
 /* ③ 采样参数：卡片本身做成 flex 列，head 固定、body 占剩余并真正可滚动 */
