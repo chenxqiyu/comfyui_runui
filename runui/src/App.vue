@@ -48,6 +48,10 @@ const state = reactive({
   outId: '',
   // 每个「输入节点 + 字段」各自保存改过的提示词，切换节点后回来还在
   textDrafts: {},
+  // 数字 / 开关 / 下拉字段的草稿，key 同样是 `${节点}:${字段}`
+  fieldDrafts: {},
+  // /object_info 缓存：{ class_type: { 字段: [候选值] } }
+  nodeOptions: {},
   randomSeed: true,
   samplerId: '',
   samplerParams: {},
@@ -132,6 +136,36 @@ function scoreField(key) {
   return 10
 }
 
+// 候选值太多的下拉（模型/文件列表）不列出来，当普通文本框处理
+const MAX_OPTIONS = 600
+
+/** 该节点所有可写字段（排除连线值），带类型和候选值，控件的样式由 type 决定 */
+function writableFields(node) {
+  if (!node) return []
+  const options = state.nodeOptions[node.class_type] || {}
+  const out = []
+  for (const [key, val] of Object.entries(node.inputs || {})) {
+    if (isLinkValue(val)) continue
+    const t = typeof val
+    if (t === 'number') {
+      out.push({ key, type: 'number', value: val, options: null })
+    } else if (t === 'boolean') {
+      out.push({ key, type: 'bool', value: val, options: null })
+    } else if (t === 'string') {
+      const list = options[key]
+      const opts = Array.isArray(list) && list.length && list.length <= MAX_OPTIONS ? list : null
+      out.push({ key, type: opts ? 'enum' : 'text', value: val, options: opts })
+    }
+  }
+  return out.sort((a, b) => scoreField(b.key) - scoreField(a.key) || a.key.localeCompare(b.key))
+}
+
+/** 默认写哪个字段：有提示词字段就选提示词，否则退回第一个可写字段 */
+function defaultField(node) {
+  const fields = writableFields(node)
+  return (fields.find((f) => f.type === 'text') || fields[0])?.key || ''
+}
+
 const nodeList = computed(() =>
   Object.entries(state.nodes || {}).map(([id, node]) => {
     const cls = String(node?.class_type || '')
@@ -141,6 +175,7 @@ const nodeList = computed(() =>
       cls,
       title: node?._meta?.title || '',
       fields,
+      allFields: writableFields(node).map((f) => f.key),
       isSaver: /SaveImage|PreviewImage|SaveAnimatedWEBP|SaveVideo/i.test(cls),
       imageCount: (state.entry?.outputs?.[id]?.images || []).length,
     }
@@ -166,20 +201,30 @@ const wiredTextNodes = computed(() => {
 
 /** 换输入节点时尽量保留还存在的字段，否则自动选最像提示词的那个 */
 function chooseInputNode(id) {
-  const fields = id ? stringFields(state.nodes?.[id]) : []
+  const node = id ? state.nodes?.[id] : null
   state.inId = id
-  if (!fields.includes(state.inField)) {
-    state.inField =
-      [...fields].sort((a, b) => scoreField(b) - scoreField(a))[0] || ''
+  if (!node) {
+    state.inField = ''
+    return
   }
+  loadNodeOptions(node.class_type)
+  const keys = writableFields(node).map((f) => f.key)
+  if (!keys.includes(state.inField)) state.inField = defaultField(node)
 }
 
 /** 这个节点是否有改过（非空草稿），用于标签高亮 */
 function isInputDirty(id) {
   const prefix = `${id}:`
-  return Object.entries(state.textDrafts).some(
-    ([key, value]) => key.startsWith(prefix) && String(value || '').trim()
+  return Object.keys({ ...state.textDrafts, ...state.fieldDrafts }).some(
+    (key) => key.startsWith(prefix) && draftDirty(key)
   )
+}
+
+/** 某个字段的草稿是否算「改过」：文本要去空白，其它类型只要不是空串就算 */
+function draftDirty(key) {
+  if (String(state.textDrafts[key] ?? '').trim()) return true
+  const v = state.fieldDrafts[key]
+  return v !== undefined && v !== null && v !== ''
 }
 
 /**
@@ -310,7 +355,8 @@ const loraChains = computed(() => {
 })
 
 const inNode = computed(() => state.nodes?.[state.inId] || null)
-const inFields = computed(() => (inNode.value ? stringFields(inNode.value) : []))
+const inFieldsAll = computed(() => writableFields(inNode.value))
+const inFieldMeta = computed(() => inFieldsAll.value.find((f) => f.key === state.inField) || null)
 const inValue = computed(() =>
   inNode.value && state.inField ? inNode.value.inputs?.[state.inField] : ''
 )
@@ -325,6 +371,52 @@ const promptText = computed({
     state.textDrafts = { ...state.textDrafts, [promptKey.value]: v }
   },
 })
+
+/** 当前字段的编辑值：文本用提示词草稿，数字/开关/下拉用 fieldDrafts */
+const fieldDraft = computed({
+  get: () => {
+    const f = inFieldMeta.value
+    if (!f || !promptKey.value) return ''
+    if (f.type === 'text') return state.textDrafts[promptKey.value] ?? ''
+    const d = state.fieldDrafts[promptKey.value]
+    return d === undefined ? f.value : d
+  },
+  set: (v) => {
+    const f = inFieldMeta.value
+    if (!f || !promptKey.value) return
+    if (f.type === 'text') {
+      promptText.value = v
+      return
+    }
+    state.fieldDrafts = { ...state.fieldDrafts, [promptKey.value]: v }
+  },
+})
+
+const TYPE_LABEL = { text: '文本', number: '数字', bool: '开关', enum: '下拉' }
+
+function typeLabel(type) {
+  return TYPE_LABEL[type] || type
+}
+
+function fieldLabel(f) {
+  if (f.type === 'text') return '新提示词'
+  if (f.type === 'number') return `数值 · ${f.key}`
+  if (f.type === 'bool') return `开关 · ${f.key}`
+  return `取值 · ${f.key}`
+}
+
+function fieldHint(f) {
+  if (f.type === 'text') return '留空则沿用当前值'
+  if (f.type === 'number') return '留空则沿用当前值，发送时按数字写入'
+  if (f.type === 'bool') return '切换开关，发送时按 true / false 写入'
+  return '从候选里挑一个，发送时按原类型写入'
+}
+
+/** 数字框：清空当「不改」，其它按数字存 */
+function setFieldNumber(event) {
+  const raw = event.target.value
+  fieldDraft.value = raw === '' ? '' : Number(raw)
+}
 
 /* ---------------------------------------------------------------- KSampler 参数 */
 // 允许在 UI 上直接改的采样参数（其余如 model / positive 是连线，不碰）
@@ -377,6 +469,26 @@ async function loadSamplerOptions(cls) {
     state.samplerOptions = opts
   } catch {
     state.samplerOptions = {}
+  }
+}
+
+/** 输入节点各字段的候选值（下拉）也从 /object_info 拿，按 class_type 缓存 */
+async function loadNodeOptions(cls) {
+  if (!cls || state.nodeOptions[cls]) return
+  try {
+    const info = await apiGet('/object_info/' + encodeURIComponent(cls))
+    const def = info?.[cls]?.input || {}
+    const opts = {}
+    for (const group of ['required', 'optional']) {
+      for (const [key, spec] of Object.entries(def[group] || {})) {
+        // 老格式 ["a","b"]，新格式 ["COMBO", { options: [...] }]
+        if (Array.isArray(spec) && Array.isArray(spec[0])) opts[key] = spec[0]
+        else if (Array.isArray(spec) && Array.isArray(spec[1]?.options)) opts[key] = spec[1].options
+      }
+    }
+    state.nodeOptions = { ...state.nodeOptions, [cls]: opts }
+  } catch {
+    /* 拿不到候选就当普通文本框，不影响写入 */
   }
 }
 
@@ -639,8 +751,9 @@ watch(
       state.inField = ''
       return
     }
-    const fields = [...stringFields(node)].sort((a, b) => scoreField(b) - scoreField(a))
-    state.inField = fields[0] || ''
+    loadNodeOptions(node.class_type)
+    const keys = writableFields(node).map((f) => f.key)
+    if (!keys.includes(state.inField)) state.inField = defaultField(node)
   }
 )
 
@@ -809,6 +922,7 @@ function applyPicked(picked) {
   }
   state.clipboardOff = {}
   state.textDrafts = {}
+  state.fieldDrafts = {}
   state.message = ''
 }
 
@@ -933,22 +1047,8 @@ function buildNodes(params, opts = {}) {
   const nodes = JSON.parse(JSON.stringify(state.nodes))
   const node = nodes[state.inId]
   if (!node) throw new Error(`节点 ${state.inId} 不存在于当前工作流`)
-  // 新提示词留空时沿用当前值，方便只改参数 / 靠剪切板拼接的工作流
-  node.inputs[state.inField] = promptText.value.trim()
-    ? promptText.value
-    : String(inValue.value ?? '')
-
-  // 其它节点改过的提示词也一起带上，不只发当前选中的那个
-  for (const [key, raw] of Object.entries(state.textDrafts)) {
-    if (!String(raw || '').trim()) continue
-    const sep = key.lastIndexOf(':')
-    if (sep <= 0) continue
-    const target = nodes[key.slice(0, sep)]
-    const field = key.slice(sep + 1)
-    if (target?.inputs && typeof target.inputs[field] === 'string') {
-      target.inputs[field] = raw
-    }
-  }
+  // 留空的字段沿用当前值，所以只写「动过」的那些
+  applyDrafts(nodes)
 
   const sampler = nodes[state.samplerId]
   if (sampler?.inputs) {
@@ -961,6 +1061,28 @@ function buildNodes(params, opts = {}) {
   applyClipboardToggles(nodes)
   wrapListWidgets(nodes)
   return nodes
+}
+
+/** 把草稿写回节点图：文本按字符串、数字/开关/下拉按原类型，空值跳过 */
+function applyDrafts(nodes) {
+  for (const [key, raw] of Object.entries(state.textDrafts)) {
+    if (!String(raw || '').trim()) continue
+    const [target, field] = draftTarget(nodes, key)
+    if (target?.inputs && typeof target.inputs[field] === 'string') {
+      target.inputs[field] = raw
+    }
+  }
+  for (const [key, val] of Object.entries(state.fieldDrafts)) {
+    if (val === undefined || val === null || val === '') continue
+    const [target, field] = draftTarget(nodes, key)
+    if (target?.inputs && field in target.inputs) target.inputs[field] = val
+  }
+}
+
+function draftTarget(nodes, key) {
+  const sep = key.lastIndexOf(':')
+  if (sep <= 0) return [null, '']
+  return [nodes[key.slice(0, sep)], key.slice(sep + 1)]
 }
 
 async function send() {
@@ -1572,7 +1694,7 @@ onUnmounted(() => {
                 <span v-else-if="n.isSaver" class="tag">输出</span>
               </span>
               <span class="nact">
-                <button v-if="n.fields.length" @click="chooseInputNode(n.id)">入</button>
+                <button v-if="n.allFields.length" @click="chooseInputNode(n.id)">入</button>
                 <button v-if="n.isSaver || n.imageCount" @click="state.outId = n.id">出</button>
               </span>
             </div>
@@ -1617,7 +1739,7 @@ onUnmounted(() => {
                 type="button"
                 class="in-chip"
                 :class="{ on: n.id === state.inId, dirty: isInputDirty(n.id) }"
-                :title="`${n.id} · ${n.title || n.cls} · 可写字段：${n.fields.join(' / ')}${isInputDirty(n.id) ? ' · 已修改（发送时会一并带上）' : ''}`"
+                :title="`${n.id} · ${n.title || n.cls} · 可写字段：${n.allFields.join(' / ')}${isInputDirty(n.id) ? ' · 已修改（发送时会一并带上）' : ''}`"
                 @click="chooseInputNode(n.id)"
               >
                 <span class="mono">{{ n.id }}</span>
@@ -1629,17 +1751,48 @@ onUnmounted(() => {
           </div>
 
           <label class="label" style="margin-top: 12px">写入字段</label>
-          <select v-model="state.inField" :disabled="!inFields.length">
-            <option v-if="!inFields.length" value="">该节点没有文本字段</option>
-            <option v-for="f in inFields" :key="f" :value="f">{{ f }}</option>
+          <select v-model="state.inField" :disabled="!inFieldsAll.length">
+            <option v-if="!inFieldsAll.length" value="">该节点没有可写字段</option>
+            <option v-for="f in inFieldsAll" :key="f.key" :value="f.key">
+              {{ f.key }}（{{ typeLabel(f.type) }}）{{ draftDirty(`${state.inId}:${f.key}`) ? ' · 已改' : '' }}
+            </option>
           </select>
 
-          <p class="hint current" v-if="inValue">
+          <p class="hint current" v-if="inValue !== '' && inValue !== null && inValue !== undefined">
             当前值：<span>{{ String(inValue).slice(0, 160) }}</span>
           </p>
 
-          <label class="label" style="margin-top: 12px">新提示词</label>
-          <textarea v-model="promptText" placeholder="输入要替换进去的提示词…"></textarea>
+          <template v-if="inFieldMeta">
+            <label class="label" style="margin-top: 12px">{{ fieldLabel(inFieldMeta) }}</label>
+            <!-- 按字段类型换控件：文本 / 下拉 / 数字 / 开关 -->
+            <textarea
+              v-if="inFieldMeta.type === 'text'"
+              v-model="promptText"
+              placeholder="输入要替换进去的提示词…"
+            ></textarea>
+            <select v-else-if="inFieldMeta.type === 'enum'" v-model="fieldDraft">
+              <option
+                v-if="fieldDraft && !inFieldMeta.options.includes(fieldDraft)"
+                :value="fieldDraft"
+              >
+                {{ fieldDraft }}（当前值，不在候选里）
+              </option>
+              <option v-for="o in inFieldMeta.options" :key="o" :value="o">{{ o }}</option>
+            </select>
+            <input
+              v-else-if="inFieldMeta.type === 'number'"
+              type="number"
+              step="any"
+              :value="fieldDraft"
+              placeholder="留空则不改"
+              @input="setFieldNumber"
+            />
+            <label v-else class="check field-check">
+              <input type="checkbox" v-model="fieldDraft" />
+              <span>{{ fieldDraft ? '开' : '关' }}</span>
+            </label>
+            <p class="hint" style="margin: 6px 0 0">{{ fieldHint(inFieldMeta) }}</p>
+          </template>
 
           <div class="send-row">
             <button
@@ -2651,6 +2804,16 @@ button.danger:hover:not(:disabled) { background: var(--bad-hover); border-color:
   color: var(--ink-2);
   font-size: 12px;
 }
+
+/* 开关字段：贴成一行输入框的样子 */
+.field-check {
+  margin: 0;
+  padding: 7px 10px;
+  background: var(--input);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+}
+.field-check span { color: var(--ink); }
 
 .send-row { display: flex; align-items: center; gap: 10px; }
 button.primary.sending {
