@@ -48,6 +48,7 @@ const state = reactive({
   progress: { done: 0, total: 0 },
   stopFlag: false,
   packing: false,
+  resultZoom: Number(localStorage.getItem('runui.resultZoom')) || 100,
   lightbox: null, // { items: [{img, tags, ms, promptId}], index }
   // —— 参数收藏 ——
   presets: [],
@@ -1023,6 +1024,13 @@ function shortId(id) {
 /* ------------------------------ 大图预览 ------------------------------ */
 // 只列出真正出过图的组，翻页时不会停在占位格子上
 const resultItems = computed(() => state.results.filter((r) => r.images.length))
+/** 对比图网格的最小列宽：缩放百分比越大，单张图越大 */
+const shotMin = computed(() => `${Math.round(240 * (state.resultZoom / 100))}px`)
+
+watch(
+  () => state.resultZoom,
+  (v) => localStorage.setItem('runui.resultZoom', String(v))
+)
 
 /** 当前能打包的图片数：对比结果优先，否则单次结果 */
 const downloadCount = computed(() =>
@@ -1475,6 +1483,17 @@ onUnmounted(() => {
                   {{ state.results.filter((r) => r.images.length).length }} / {{ state.results.length }}
                 </span>
               </span>
+              <label class="zoom-ctl" title="缩放对比图大小（点击图片仍可看大图）">
+                <input
+                  v-model.number="state.resultZoom"
+                  type="range"
+                  min="60"
+                  max="180"
+                  step="10"
+                  aria-label="缩放对比图"
+                />
+                <span class="mono zoom-val">{{ state.resultZoom }}%</span>
+              </label>
               <button
                 class="mini"
                 :disabled="!downloadCount || state.packing || state.comparing"
@@ -1485,7 +1504,7 @@ onUnmounted(() => {
               </button>
             </div>
           </div>
-          <div class="card-body">
+          <div class="card-body" :style="{ '--shot-min': shotMin }">
             <div class="outline-row">
               <span class="pkey mono">输出节点</span>
               <input v-model="state.outId" class="mono" type="text" placeholder="例如 9" />
@@ -1703,7 +1722,24 @@ onUnmounted(() => {
 }
 .card-body.scroll { overflow-y: auto; min-height: 0; }
 
-.head-actions { display: flex; align-items: center; gap: 6px; }
+.head-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
+.zoom-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  cursor: pointer;
+}
+.zoom-ctl input[type="range"] {
+  width: 72px;
+  height: 14px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  accent-color: var(--brand);
+  cursor: pointer;
+}
+.zoom-val { width: 32px; text-align: right; font-size: 10.5px; color: var(--ink-2); }
 button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
 
 /* 参数收藏 */
@@ -2091,7 +2127,7 @@ button.danger:hover:not(:disabled) { background: #b91c1c; border-color: #b91c1c;
 .images {
   margin-top: 14px;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(var(--shot-min, 240px), 1fr));
   gap: 10px;
   overflow-y: auto;
 }
