@@ -15,9 +15,27 @@ import {
   viewUrl,
 } from './api'
 
+const THEMES = [
+  { id: 'day', label: '日间', mode: 'light', bg: '#f6f7f9', accent: '#2563eb' },
+  { id: 'sand', label: '暖砂', mode: 'light', bg: '#f5efe3', accent: '#b45309' },
+  { id: 'mint', label: '薄荷', mode: 'light', bg: '#eef6f2', accent: '#0d9488' },
+  { id: 'midnight', label: '午夜', mode: 'dark', bg: '#0c1120', accent: '#60a5fa' },
+  { id: 'graphite', label: '石墨', mode: 'dark', bg: '#111111', accent: '#d4d4d4' },
+  { id: 'forest', label: '深林', mode: 'dark', bg: '#0b1411', accent: '#34d399' },
+]
+const THEME_GROUPS = [
+  { name: '明亮', items: THEMES.filter((t) => t.mode === 'light') },
+  { name: '暗黑', items: THEMES.filter((t) => t.mode === 'dark') },
+]
+const themeIdOf = (id) => (THEMES.some((t) => t.id === id) ? id : 'day')
+const initialTheme = themeIdOf(localStorage.getItem('runui.theme'))
+document.documentElement.dataset.theme = initialTheme
+
 const state = reactive({
   prefix: getPrefix(),
   showSettings: false,
+  theme: initialTheme,
+  themeOpen: false,
   status: 'idle',
   message: '',
   nodes: {},
@@ -72,6 +90,21 @@ const state = reactive({
   loraId: localStorage.getItem('runui.loraNode') || '',
   loraBaseline: {},
 })
+
+const currentTheme = computed(() => THEMES.find((t) => t.id === state.theme) || THEMES[0])
+
+function setTheme(id) {
+  state.theme = themeIdOf(id)
+  state.themeOpen = false
+}
+
+watch(
+  () => state.theme,
+  (id) => {
+    document.documentElement.dataset.theme = id
+    localStorage.setItem('runui.theme', id)
+  }
+)
 
 const TEXT_KEYS = ['text', 'prompt', 'string', 'value', 'content', 'positive', 'text_g', 'text_l']
 
@@ -1359,6 +1392,11 @@ function openSingle(index) {
 }
 
 function onLightboxKey(e) {
+  if (state.themeOpen && e.key === 'Escape') {
+    e.preventDefault()
+    state.themeOpen = false
+    return
+  }
   // 弹窗打开时优先处理弹窗的键
   if (state.dialog) {
     if (e.key === 'Escape') {
@@ -1397,10 +1435,49 @@ onUnmounted(() => {
 <template>
   <div class="app">
     <header class="topbar">
-      <div class="brand">
-        <span class="dot" :class="state.status"></span>
-        <strong>ComfyUI RunUI</strong>
-        <span class="hint">绑定节点 · 改提示词 · 收图</span>
+      <div class="top-left">
+        <div class="theme-pick">
+          <button
+            type="button"
+            class="theme-btn"
+            :title="`切换主题（当前：${currentTheme.label}）`"
+            @click="state.themeOpen = !state.themeOpen"
+          >
+            <span class="theme-dot" :style="{ background: currentTheme.bg }">
+              <i :style="{ background: currentTheme.accent }"></i>
+            </span>
+            <span class="theme-label">{{ currentTheme.label }}</span>
+            <span class="theme-caret">▾</span>
+          </button>
+          <template v-if="state.themeOpen">
+            <div class="theme-backdrop" @click="state.themeOpen = false"></div>
+            <div class="theme-pop">
+              <template v-for="group in THEME_GROUPS" :key="group.name">
+                <p class="theme-group">{{ group.name }}</p>
+                <button
+                  v-for="t in group.items"
+                  :key="t.id"
+                  type="button"
+                  class="theme-opt"
+                  :class="{ on: state.theme === t.id }"
+                  @click="setTheme(t.id)"
+                >
+                  <span class="theme-swatch">
+                    <i :style="{ background: t.bg }"></i>
+                    <i :style="{ background: t.accent }"></i>
+                  </span>
+                  <span class="theme-opt-name">{{ t.label }}</span>
+                  <span v-if="state.theme === t.id" class="theme-check">✓</span>
+                </button>
+              </template>
+            </div>
+          </template>
+        </div>
+        <div class="brand">
+          <span class="dot" :class="state.status"></span>
+          <strong>ComfyUI RunUI</strong>
+          <span class="hint">绑定节点 · 改提示词 · 收图</span>
+        </div>
       </div>
       <div class="top-right">
         <span class="tag" :class="{ ok: state.status === 'ready', bad: state.status === 'error' }">
@@ -1932,12 +2009,92 @@ onUnmounted(() => {
   justify-content: space-between;
   gap: 12px;
   padding: 10px 16px;
-  background: #fff;
+  background: var(--card);
   border-bottom: 1px solid var(--line);
 }
 
+.top-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+
 .brand { display: flex; align-items: center; gap: 8px; }
 .brand strong { font-weight: 500; font-size: 14px; }
+
+/* —— 左上角主题切换 —— */
+.theme-pick { position: relative; flex: 0 0 auto; }
+.theme-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px 4px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--input);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+.theme-btn:hover:not(:disabled) { background: var(--panel); border-color: var(--ink-3); }
+.theme-dot {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+}
+.theme-dot i { width: 7px; height: 7px; border-radius: 50%; display: block; }
+.theme-label { line-height: 1; }
+.theme-caret { font-size: 9px; color: var(--ink-3); line-height: 1; }
+.theme-backdrop { position: fixed; inset: 0; z-index: 41; }
+.theme-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 42;
+  width: 188px;
+  padding: 6px;
+  background: var(--card);
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+}
+.theme-group {
+  margin: 6px 7px 4px;
+  font-size: 10.5px;
+  color: var(--ink-3);
+  letter-spacing: .06em;
+}
+.theme-opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 5px 7px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 12px;
+  text-align: left;
+}
+.theme-opt:hover:not(:disabled) { background: var(--panel); border-color: transparent; }
+.theme-opt.on {
+  color: var(--brand);
+  background: var(--brand-soft);
+  border-color: var(--brand-line);
+}
+.theme-swatch {
+  flex: 0 0 auto;
+  display: inline-flex;
+  width: 24px;
+  height: 15px;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+}
+.theme-swatch i { flex: 1; }
+.theme-swatch i + i { flex: 0 0 9px; }
+.theme-opt-name { flex: 1; }
+.theme-check { font-size: 11px; color: var(--brand); }
 
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); }
 .dot.ready { background: var(--ok); }
@@ -1948,11 +2105,11 @@ onUnmounted(() => {
 
 .settings {
   padding: 12px 16px;
-  background: #fff;
+  background: var(--card);
   border-bottom: 1px solid var(--line);
 }
 .settings .row { display: flex; gap: 8px; }
-.settings code { font-family: var(--mono); background: #f3f4f6; padding: 1px 4px; border-radius: 4px; }
+.settings code { font-family: var(--mono); background: var(--panel-2); padding: 1px 4px; border-radius: 4px; }
 
 .grid {
   flex: 1;
@@ -2031,7 +2188,7 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
   font-size: 11px;
   border: 1px solid var(--line-strong);
   border-radius: 6px;
-  background: #fff;
+  background: var(--input);
   color: var(--ink-2);
   max-width: 100%;
 }
@@ -2093,7 +2250,7 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
 .vals .x,
 .vals .add {
   border: 1px solid var(--line-strong);
-  background: #fff;
+  background: var(--input);
   color: var(--ink-2);
   border-radius: 5px;
   height: 20px;
@@ -2116,7 +2273,7 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
   font-size: 11px;
   flex: 0 0 auto;
 }
-.add-sel:disabled { color: var(--ink-3); background: #f9fafb; cursor: not-allowed; }
+.add-sel:disabled { color: var(--ink-3); background: var(--panel); cursor: not-allowed; }
 .clear-all {
   flex: 0 0 auto;
   height: 22px;
@@ -2124,11 +2281,11 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
   font-size: 11px;
   border-radius: 6px;
   border: 1px solid var(--line-strong);
-  background: #fff;
+  background: var(--input);
   color: var(--ink-3);
   cursor: pointer;
 }
-.clear-all:hover { color: var(--bad); border-color: #fecaca; background: #fef2f2; }
+.clear-all:hover { color: var(--bad); border-color: var(--bad-line); background: var(--bad-soft); }
 .vals { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
 .vals .val { display: flex; align-items: center; gap: 2px; flex: 1 1 96px; min-width: 0; }
 .vals .val input { padding: 3px 2px 3px 7px; }
@@ -2148,7 +2305,7 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
   padding: 7px 9px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: #fafaf9;
+  background: var(--panel-3);
 }
 .clipbar .pkey { padding-top: 0; }
 .clip-chip {
@@ -2160,7 +2317,7 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
   padding: 3px 9px 3px 6px;
   border-radius: 999px;
   border: 1px solid var(--line-strong);
-  background: #fff;
+  background: var(--input);
   color: var(--ink-2);
   font: inherit;
   font-size: 11px;
@@ -2176,12 +2333,12 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
   border-radius: 4px;
   border: 1px solid var(--brand);
   background: var(--brand);
-  color: #fff;
+  color: var(--on-brand);
   font-size: 10px;
   line-height: 1;
 }
-.clip-chip.off { color: var(--ink-3); background: #fbfbfb; border-style: dashed; }
-.clip-chip.off .clip-box { background: #fff; border-color: var(--line-strong); }
+.clip-chip.off { color: var(--ink-3); background: var(--panel-3); border-style: dashed; }
+.clip-chip.off .clip-box { background: var(--input); border-color: var(--line-strong); }
 .clip-chip.off .clip-name { text-decoration: line-through; }
 .clip-id { color: var(--brand); flex: 0 0 auto; }
 .clip-chip.off .clip-id { color: var(--ink-3); }
@@ -2218,7 +2375,7 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
   padding: 6px;
   border: 1px solid var(--line);
   border-radius: 10px;
-  background: #fafaf9;
+  background: var(--panel-3);
 }
 .in-chip {
   display: inline-flex;
@@ -2228,7 +2385,7 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
   padding: 3px 9px;
   border-radius: 999px;
   border: 1px solid var(--line-strong);
-  background: #fff;
+  background: var(--input);
   color: var(--ink-2);
   font: inherit;
   font-size: 11px;
@@ -2239,7 +2396,7 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
 .in-chip.dirty:not(.on) {
   border-color: var(--warn);
   color: var(--warn);
-  background: #fffbeb;
+  background: var(--warn-soft);
 }
 .in-dot {
   flex: 0 0 auto;
@@ -2259,16 +2416,16 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
 .outline-row > input { flex: 1 1 110px; min-width: 0; }
 .shot.cell .thumb {
   position: relative;
-  background: #f3f4f6;
+  background: var(--panel-2);
   min-height: 110px;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 .shot.cell .thumb img { width: 100%; height: auto; display: block; cursor: zoom-in; }
-.shot.cell.running .thumb { background: #eff6ff; }
+.shot.cell.running .thumb { background: var(--brand-soft); }
 .shot.cell.running .ph { color: var(--brand); }
-.shot.cell.error .thumb { background: #fef2f2; }
+.shot.cell.error .thumb { background: var(--bad-soft); }
 .shot.cell.error .ph { color: var(--bad); }
 .ph { color: var(--ink-3); font-size: 12px; padding: 26px 0; }
 .shot.cell figcaption { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
@@ -2278,7 +2435,7 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
   padding: 1px 5px;
   border-radius: 5px;
   background: var(--brand-soft);
-  border: 1px solid #dbeafe;
+  border: 1px solid var(--brand-line);
   color: var(--ink);
 }
 .kv em { font-style: normal; color: var(--ink-3); margin-right: 3px; }
@@ -2290,7 +2447,7 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
   position: fixed;
   inset: 0;
   z-index: 80;
-  background: rgba(17, 24, 39, .45);
+  background: var(--overlay);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2298,12 +2455,12 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
 }
 @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
 .modal-card {
-  background: #fff;
+  background: var(--card);
   border-radius: 12px;
   padding: 18px 20px 16px;
   width: 340px;
   max-width: 90vw;
-  box-shadow: 0 18px 48px rgba(15, 23, 42, .22);
+  box-shadow: var(--shadow);
 }
 .modal-card h3 { margin: 0 0 8px; font-size: 15px; font-weight: 500; color: var(--ink); }
 .modal-card p {
@@ -2321,7 +2478,7 @@ button.danger {
   color: #fff;
   font-weight: 500;
 }
-button.danger:hover:not(:disabled) { background: #b91c1c; border-color: #b91c1c; }
+button.danger:hover:not(:disabled) { background: var(--bad-hover); border-color: var(--bad-hover); }
 
 .lightbox {
   position: fixed;
@@ -2409,7 +2566,7 @@ button.danger:hover:not(:disabled) { background: #b91c1c; border-color: #b91c1c;
   flex-direction: column;
   gap: 2px;
   padding: 8px 10px;
-  background: #f9fafb;
+  background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
 }
@@ -2429,7 +2586,7 @@ button.danger:hover:not(:disabled) { background: #b91c1c; border-color: #b91c1c;
   align-items: center;
   gap: 8px;
   padding: 6px 8px;
-  border-bottom: 1px solid #f3f4f6;
+  border-bottom: 1px solid var(--line-soft);
   font-size: 12px;
 }
 .node-row:last-child { border-bottom: none; }
@@ -2475,7 +2632,7 @@ button.primary.sending {
 .msg {
   margin: 12px 0 0;
   padding: 8px 10px;
-  background: #f9fafb;
+  background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
   color: var(--ink-2);
@@ -2483,23 +2640,23 @@ button.primary.sending {
   word-break: break-word;
 }
 .msg.bad {
-  background: #fef2f2;
-  border-color: #fecaca;
-  color: #991b1b;
+  background: var(--bad-soft);
+  border-color: var(--bad-line);
+  color: var(--bad-ink);
 }
 
 .warnbox {
   margin-top: 10px;
   padding: 8px 10px;
-  background: #fffbeb;
-  border: 1px solid #fde68a;
+  background: var(--warn-soft);
+  border: 1px solid var(--warn-line);
   border-radius: 8px;
 }
 .warnhead {
   border: none;
   background: transparent;
   padding: 0;
-  color: #92400e;
+  color: var(--warn-ink);
   font-size: 12px;
   text-align: left;
   cursor: pointer;
@@ -2511,7 +2668,7 @@ button.primary.sending {
   font-size: 12px;
 }
 .warnlist li { margin-bottom: 4px; }
-.warnlist code { font-family: var(--mono); background: #fef3c7; padding: 1px 4px; border-radius: 4px; }
+.warnlist code { font-family: var(--mono); background: var(--warn-code); padding: 1px 4px; border-radius: 4px; }
 .wtype { font-family: var(--mono); color: var(--ink-3); margin-left: 6px; }
 
 .row { display: flex; gap: 8px; }
@@ -2522,7 +2679,7 @@ button.primary.sending {
   font-size: 11px;
   border-radius: 999px;
   border: 1px solid var(--line-strong);
-  background: #fff;
+  background: var(--input);
   color: var(--ink-2);
 }
 .chip.on { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
@@ -2536,7 +2693,7 @@ button.primary.sending {
 }
 .empty { grid-column: 1 / -1; }
 
-.shot { margin: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: #fff; }
+.shot { margin: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--card); }
 .shot img { display: block; width: 100%; cursor: zoom-in; }
 .shot figcaption { padding: 6px 8px; color: var(--ink-3); border-top: 1px solid var(--line); }
 </style>
