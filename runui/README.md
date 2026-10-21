@@ -28,11 +28,13 @@ set COMFY=http://127.0.0.1:8188 && npm run serve
 
 1. **① 当前工作流** — 打开就自动读 ComfyUI 里正在跑 / 最近一次跑过的那个工作流（拿的是提交时那份 API 格式节点图，改完能直接回灌）。顶部下拉可以切到别的历史作业。
 2. **② 绑定输入** — 点节点列表右侧的「入」，或直接填节点 ID。字段会自动选 `text`；不是文本节点的字段会被过滤掉（`sampler_name`、`ckpt_name` 这类不算）。输入新提示词。
-3. **③ 采样参数 · KSampler** — 自动认出工作流里的 KSampler（也支持 `SamplerCustom`），把 `steps / cfg / sampler_name / scheduler / denoise / seed / noise_seed / start_at_step ...` 这些可编辑参数列出来直接改，`sampler_name` 和 `scheduler` 的候选值从 `/object_info` 拉。改完提交时写回对应节点，**不碰任何连线**。旁边有「随机 seed」按钮。
-4. **④ 绑定输出** — 填输出节点 ID（`SaveImage` / `PreviewImage` 之类），点「用首选」自动挑一个。
-5. 点 **发送到 ComfyUI**，轮询执行结果，图会显示在右侧。
+3. **③ 采样参数 · KSampler** — 自动认出工作流里的 KSampler（也支持 `SamplerCustom`），把 `steps / cfg / sampler_name / scheduler / denoise / seed / noise_seed / start_at_step ...` 这些可编辑参数列出来直接改。**每个参数都能填多个值**：数字框右侧 `+` 再加一个，枚举用下拉追加、已选项变成可删除的 chip。界面实时算出笛卡尔积并显示「组合 N 组」。
+4. **④ 对比结果** — 填输出节点 ID（`SaveImage` / `PreviewImage` 之类）。
+5. **发送第一组** 只跑第一组；参数有多个值时会出现 **对比 N 组**，按组合顺序**串行**执行，结果横排成网格，每格标注这一组在变的维度（`sampler euler`、`sched beta`）和耗时。点任意一张进大图预览：底部显示该组的参数、文件名、耗时和序号，**← →** 翻页、**Esc** 或点图片关闭，两侧也各有一块可点击的翻页区。过程中可以「停止」。
 
-勾选「同时随机化所有 seed / noise_seed」的话，每次提交都会换随机种子（会覆盖 ③ 里手动填的 seed）。
+**批量对比为什么要固定 seed**：如果每组都换随机种子，图之间的差异就混进了种子噪声，比不出 cfg / sampler 的真实区别。所以批量模式下忽略「随机 seed」，所有组共用同一个 seed，只变你加多值的那些维度。
+
+单次提交时勾选「随机 seed」会换一个随机种子（会覆盖 ③ 里手动填的 seed）。
 
 ## 提交时为什么要包 `__value__`
 

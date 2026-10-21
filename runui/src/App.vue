@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, reactive, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, watch } from 'vue'
 import {
   apiGet,
   collectImages,
@@ -40,6 +40,12 @@ const state = reactive({
   showWarnings: false,
   failed: false,
   extraData: null,
+  // —— 批量对比 ——
+  results: [],
+  comparing: false,
+  progress: { done: 0, total: 0 },
+  stopFlag: false,
+  lightbox: null, // { items: [{img, tags, ms, promptId}], index }
 })
 
 const TEXT_KEYS = ['text', 'prompt', 'string', 'value', 'content', 'positive', 'text_g', 'text_l']
@@ -122,9 +128,9 @@ function initSamplerParams(id) {
   }
   for (const [key, val] of Object.entries(node.inputs || {})) {
     if (!EDITABLE_SAMPLER.test(key)) continue
-    if (['number', 'string', 'boolean'].includes(typeof val)) {
-      state.samplerParams[key] = val
-    }
+    // 统一成「值的数组」：长度 1 就是单值，多个就是参与批量对比
+    if (typeof val === 'boolean') state.samplerParams[key] = val
+    else if (['number', 'string'].includes(typeof val)) state.samplerParams[key] = [val]
   }
   loadSamplerOptions(node.class_type)
 }
@@ -146,13 +152,117 @@ async function loadSamplerOptions(cls) {
   }
 }
 
+/* ------------------------------- 多值编辑 ------------------------------- */
+function valuesOf(key) {
+  const v = state.samplerParams[key]
+  if (Array.isArray(v)) return v
+  return v === undefined || v === null ? [] : [v]
+}
+
+function addValue(field) {
+  const list = valuesOf(field.key)
+  if (field.type === 'string' && field.options?.length) {
+    // 下拉类加一个还没选中的候选
+    const next = field.options.find((o) => !list.includes(o))
+    if (next === undefined) return
+    state.samplerParams[field.key] = [...list, next]
+  } else {
+    const last = list[list.length - 1]
+    state.samplerParams[field.key] = [...list, field.type === 'number' ? Number(last) || 0 : last ?? '']
+  }
+}
+
+function removeValue(field, index) {
+  const list = valuesOf(field.key)
+  if (list.length <= 1) return
+  state.samplerParams[field.key] = list.filter((_, i) => i !== index)
+}
+
+function setValueAt(field, index, value) {
+  const list = [...valuesOf(field.key)]
+  list[index] = value
+  state.samplerParams[field.key] = list
+}
+
+/** 从下拉里挑一个候选，追加到多值列表 */
+function addOptionValue(field, value) {
+  if (!value) return
+  const list = valuesOf(field.key)
+  if (list.includes(value)) return
+  state.samplerParams[field.key] = [...list, value]
+}
+
+function shortKey(key) {
+  return String(key)
+    .replace('sampler_name', 'sampler')
+    .replace('scheduler', 'sched')
+    .replace('noise_seed', 'seed')
+}
+
+function statusLabel(status) {
+  return {
+    pending: '等待',
+    running: '生成中…',
+    empty: '无图',
+    error: '失败',
+    done: '',
+  }[status] || ''
+}
+
 function randomizeSamplerSeed() {
   for (const key of ['seed', 'noise_seed']) {
-    if (typeof state.samplerParams[key] === 'number') {
-      state.samplerParams[key] = Math.floor(Math.random() * 1e15)
+    if (Array.isArray(state.samplerParams[key])) {
+      state.samplerParams[key] = [Math.floor(Math.random() * 1e15)]
     }
   }
 }
+
+/* ------------------------------- 组合与变体 ------------------------------- */
+/** 多值参数 + 单值参数 → 笛卡尔积，每一组就是一次要跑的任务 */
+const variants = computed(() => {
+  const fields = samplerFields.value
+  if (!fields.length) return []
+  const multi = []
+  const base = {}
+  for (const f of fields) {
+    if (f.type === 'boolean') {
+      base[f.key] = !!state.samplerParams[f.key]
+      continue
+    }
+    const vals = valuesOf(f.key).filter((v) => v !== '' && v !== null && v !== undefined)
+    if (!vals.length) continue
+    if (vals.length > 1) multi.push({ key: f.key, values: vals })
+    else base[f.key] = vals[0]
+  }
+
+  let combos = [{ ...base }]
+  for (const m of multi) {
+    const next = []
+    for (const c of combos) {
+      for (const v of m.values) next.push({ ...c, [m.key]: v })
+    }
+    combos = next
+  }
+
+  return combos.map((params, index) => ({
+    index,
+    params,
+    // 只列出「这一维在变」的参数，用来在对图上做标注
+    changed: multi.map((m) => ({ key: m.key, value: params[m.key] })),
+  }))
+})
+
+const multiDims = computed(() => {
+  const out = []
+  for (const f of samplerFields.value) {
+    if (f.type === 'boolean') continue
+    const n = valuesOf(f.key).filter((v) => v !== '').length
+    if (n > 1) out.push({ key: f.key, n })
+  }
+  return out
+})
+
+const canBatch = computed(() => canSend.value && variants.value.length > 1)
 
 const statusText = computed(() => {
   if (state.status === 'loading') return '读取中'
@@ -372,28 +482,35 @@ function applyPrefix() {
   refreshAll()
 }
 
-async function send() {
-  if (!canSend.value) return
+/** 组一份可提交的节点图：写提示词 + 这一组采样参数 */
+function buildNodes(params, opts = {}) {
   const nodes = JSON.parse(JSON.stringify(state.nodes))
   const node = nodes[state.inId]
-  if (!node) {
-    state.message = `节点 ${state.inId} 不存在于当前工作流`
-    return
-  }
+  if (!node) throw new Error(`节点 ${state.inId} 不存在于当前工作流`)
   node.inputs[state.inField] = state.text
 
-  // KSampler 采样参数
-  if (state.samplerId && Object.keys(state.samplerParams).length) {
-    const sampler = nodes[state.samplerId]
-    if (sampler?.inputs) {
-      for (const [key, val] of Object.entries(state.samplerParams)) {
-        if (key in sampler.inputs) sampler.inputs[key] = val
-      }
+  const sampler = nodes[state.samplerId]
+  if (sampler?.inputs) {
+    for (const [key, val] of Object.entries(params || {})) {
+      if (key in sampler.inputs) sampler.inputs[key] = val
     }
   }
-
-  if (state.randomSeed) randomizeSeeds(nodes)
+  // 批量对比时必须固定 seed，否则差异里混着种子噪声，比不出东西
+  if (state.randomSeed && !opts.fixedSeed) randomizeSeeds(nodes)
   wrapListWidgets(nodes)
+  return nodes
+}
+
+async function send() {
+  if (!canSend.value) return
+  let nodes
+  try {
+    // 单次只跑第一组参数
+    nodes = buildNodes(variants.value[0]?.params || {})
+  } catch (err) {
+    state.message = err.message
+    return
+  }
 
   state.submitting = true
   state.running = false
@@ -401,6 +518,7 @@ async function send() {
   state.warnings = []
   state.showWarnings = false
   state.failed = false
+  state.results = []
   state.message = '正在提交…'
   try {
     const resp = await submitPrompt(nodes, state.extraData ? { extra_data: state.extraData } : {})
@@ -430,6 +548,83 @@ async function send() {
     state.submitting = false
     state.running = false
   }
+}
+
+/** 等一个 prompt 出图；返回 { images, entry }。被取消 / 失败 / 超时都抛错。 */
+async function waitImages(promptId, timeoutMs = 15 * 60 * 1000) {
+  const started = Date.now()
+  let tick = 0
+  while (Date.now() - started < timeoutMs) {
+    const history = await fetchHistory(promptId)
+    const entry = history[promptId]
+    if (entry?.status?.completed) {
+      return { images: collectImages(entry, state.outId), entry }
+    }
+    tick += 1
+    if (tick % 3 === 0) {
+      const job = await apiGet('/api/jobs/' + promptId).catch(() => null)
+      if (job?.status === 'cancelled') throw new Error('被取消')
+      if (job?.status === 'failed') throw new Error('执行失败')
+    }
+    await sleep(800)
+  }
+  throw new Error('等待超时')
+}
+
+/** 批量对比：按笛卡尔积逐组串行提交，跑完一组再跑下一组，seed 固定 */
+async function sendBatch() {
+  const list = variants.value
+  if (!list.length || !canSend.value) return
+
+  state.results = list.map((v) => ({
+    index: v.index,
+    params: v.params,
+    changed: v.changed,
+    status: 'pending',
+    images: [],
+    error: '',
+    promptId: '',
+    ms: 0,
+  }))
+  state.comparing = true
+  state.stopFlag = false
+  state.failed = false
+  state.progress = { done: 0, total: list.length }
+  state.message = `开始对比：${list.length} 组（seed 固定，只变你勾的维度）`
+
+  try {
+    for (let i = 0; i < list.length; i += 1) {
+      if (state.stopFlag) {
+        state.message = `已停止 · 完成 ${i}/${list.length}`
+        break
+      }
+      const r = state.results[i]
+      r.status = 'running'
+      const started = Date.now()
+      try {
+        const nodes = buildNodes(r.params, { fixedSeed: true })
+        const resp = await submitPrompt(nodes, state.extraData ? { extra_data: state.extraData } : {})
+        r.promptId = resp.prompt_id
+        const { images } = await waitImages(resp.prompt_id)
+        r.images = images
+        r.status = images.length ? 'done' : 'empty'
+      } catch (err) {
+        r.status = 'error'
+        r.error = err.message || String(err)
+      }
+      r.ms = Date.now() - started
+      state.progress.done = i + 1
+      state.message = `对比中 ${i + 1}/${list.length}`
+    }
+    const ok = state.results.filter((x) => x.images.length).length
+    if (!state.stopFlag) state.message = `对比完成 · ${ok}/${list.length} 张`
+  } finally {
+    state.comparing = false
+  }
+}
+
+function stopBatch() {
+  state.stopFlag = true
 }
 
 async function waitResult(promptId) {
@@ -507,11 +702,67 @@ function shortId(id) {
   return id ? String(id).slice(0, 8) : ''
 }
 
-function openImage(img) {
-  window.open(viewUrl(img), '_blank')
+/* ------------------------------ 大图预览 ------------------------------ */
+// 只列出真正出过图的组，翻页时不会停在占位格子上
+const resultItems = computed(() => state.results.filter((r) => r.images.length))
+
+function openLightbox(items, index = 0) {
+  if (!items.length) return
+  state.lightbox = { items, index: Math.max(0, Math.min(index, items.length - 1)) }
 }
 
-onMounted(refreshAll)
+function closeLightbox() {
+  state.lightbox = null
+}
+
+function stepLightbox(delta) {
+  const lb = state.lightbox
+  if (!lb || lb.items.length < 2) return
+  lb.index = (lb.index + delta + lb.items.length) % lb.items.length
+}
+
+/** 点某一张对比图：把它所在的那一批全部装进预览，方便左右翻 */
+function openResult(index) {
+  const list = resultItems.value
+  const items = list.map((r) => ({
+    img: r.images[0],
+    tags: r.changed,
+    ms: r.ms,
+    promptId: r.promptId,
+  }))
+  const at = list.findIndex((r) => r.index === index)
+  openLightbox(items, at < 0 ? 0 : at)
+}
+
+function openSingle(index) {
+  openLightbox(
+    state.images.map((img) => ({ img, tags: [], ms: 0, nodeId: img.nodeId })),
+    index
+  )
+}
+
+function onLightboxKey(e) {
+  if (!state.lightbox) return
+  if (e.key === 'ArrowLeft') {
+    e.preventDefault()
+    stepLightbox(-1)
+  } else if (e.key === 'ArrowRight') {
+    e.preventDefault()
+    stepLightbox(1)
+  } else if (e.key === 'Escape') {
+    e.preventDefault()
+    closeLightbox()
+  }
+}
+
+onMounted(() => {
+  refreshAll()
+  window.addEventListener('keydown', onLightboxKey)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', onLightboxKey)
+})
 </script>
 
 <template>
@@ -610,14 +861,27 @@ onMounted(refreshAll)
           <textarea v-model="state.text" placeholder="输入要替换进去的提示词…"></textarea>
 
           <div class="send-row">
-            <button class="primary" :disabled="!canSend" @click="send">
-              {{ state.submitting ? '发送中…' : '发送到 ComfyUI' }}
+            <button
+              class="primary"
+              :disabled="!canSend || state.comparing"
+              @click="send"
+            >
+              {{ state.submitting ? '发送中…' : variants.length > 1 ? '发送第一组' : '发送到 ComfyUI' }}
             </button>
+            <button
+              v-if="variants.length > 1"
+              class="compare-btn"
+              :disabled="!canBatch || state.comparing"
+              @click="sendBatch"
+            >
+              {{ state.comparing ? `对比中 ${state.progress.done}/${state.progress.total}` : `对比 ${variants.length} 组` }}
+            </button>
+            <button v-if="state.comparing" @click="stopBatch">停止</button>
             <label class="check" style="margin: 0">
               <input v-model="state.randomSeed" type="checkbox" />
               <span>随机 seed</span>
             </label>
-            <span class="hint" v-if="state.running">执行中 · {{ state.elapsed }}s</span>
+            <span class="hint" v-if="state.running && !state.comparing">执行中 · {{ state.elapsed }}s</span>
           </div>
 
           <p class="msg" v-if="state.message" :class="{ bad: state.failed }">{{ state.message }}</p>
@@ -666,27 +930,80 @@ onMounted(refreshAll)
 
             <div class="params" v-if="samplerFields.length">
               <div class="prow" v-for="f in samplerFields" :key="f.key">
-                <label class="pkey mono">{{ f.key }}</label>
-                <select v-if="f.options" v-model="state.samplerParams[f.key]">
-                  <option v-for="o in f.options" :key="o" :value="o">{{ o }}</option>
-                </select>
+                <label class="pkey mono">
+                  {{ shortKey(f.key) }}
+                  <span v-if="f.type !== 'boolean' && valuesOf(f.key).length > 1" class="cnt">
+                    ×{{ valuesOf(f.key).length }}
+                  </span>
+                </label>
+
+                <!-- 布尔：只能单值 -->
                 <input
-                  v-else-if="f.type === 'number'"
-                  v-model.number="state.samplerParams[f.key]"
-                  type="number"
-                  step="any"
-                />
-                <input
-                  v-else-if="f.type === 'boolean'"
+                  v-if="f.type === 'boolean'"
                   v-model="state.samplerParams[f.key]"
                   type="checkbox"
                   class="cbox"
                 />
-                <input v-else v-model="state.samplerParams[f.key]" type="text" />
+
+                <!-- 枚举：已选项做成 chip，下拉只负责追加 -->
+                <div v-else-if="f.options" class="chips-edit">
+                  <span
+                    v-for="(v, vi) in valuesOf(f.key)"
+                    :key="vi"
+                    class="chip on"
+                    :class="{ multi: valuesOf(f.key).length > 1 }"
+                  >
+                    {{ v }}
+                    <button
+                      v-if="valuesOf(f.key).length > 1"
+                      class="x"
+                      title="移除"
+                      @click="removeValue(f, vi)"
+                    >
+                      ×
+                    </button>
+                  </span>
+                  <select
+                    class="add-sel"
+                    @change="addOptionValue(f, $event.target.value); $event.target.value = ''"
+                  >
+                    <option value="">+</option>
+                    <option v-for="o in f.options" :key="o" :value="o">{{ o }}</option>
+                  </select>
+                </div>
+
+                <!-- 数字 / 文本：多个值并排 -->
+                <div v-else class="vals">
+                  <div class="val" v-for="(v, vi) in valuesOf(f.key)" :key="vi">
+                    <input
+                      v-if="f.type === 'number'"
+                      :value="v"
+                      type="number"
+                      step="any"
+                      @input="setValueAt(f, vi, $event.target.value === '' ? '' : Number($event.target.value))"
+                    />
+                    <input v-else :value="v" type="text" @input="setValueAt(f, vi, $event.target.value)" />
+                    <button
+                      v-if="valuesOf(f.key).length > 1"
+                      class="x"
+                      title="移除"
+                      @click="removeValue(f, vi)"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <button class="add" title="再加一个值" @click="addValue(f)">+</button>
+                </div>
               </div>
             </div>
             <p v-else class="hint">
               {{ state.samplerId ? '该节点没有可编辑的采样参数' : '当前工作流里没有 KSampler 节点' }}
+            </p>
+
+            <p class="hint combo-line" v-if="multiDims.length">
+              组合 <b>{{ variants.length }}</b> 组：
+              <span v-for="d in multiDims" :key="d.key" class="dim">{{ shortKey(d.key) }} ×{{ d.n }}</span>
+              <br />批量对比时 seed 固定，只有你加多值的维度在变
             </p>
 
             <div class="send-row" style="margin-top: 6px">
@@ -700,42 +1017,123 @@ onMounted(refreshAll)
       </div>
 
       <section class="card col">
-        <div class="card-head">
-          <span>④ 绑定输出 · 收图</span>
-          <span class="mono small" v-if="state.runPromptId">{{ shortId(state.runPromptId) }}</span>
-        </div>
-        <div class="card-body">
-          <label class="label">输出节点 ID</label>
-          <div class="row">
-            <input v-model="state.outId" class="mono" type="text" placeholder="例如 9" />
-            <button v-if="outNodes.length" @click="state.outId = outNodes[0].id">用首选</button>
+          <div class="card-head">
+            <span>④ 对比结果</span>
+            <span class="small">
+              <span v-if="state.comparing" class="mono">
+                {{ state.progress.done }}/{{ state.progress.total }}
+              </span>
+              <span v-else-if="state.results.length" class="tag ok">
+                {{ state.results.filter((r) => r.images.length).length }} / {{ state.results.length }}
+              </span>
+            </span>
           </div>
-          <div class="chips" v-if="outNodes.length">
-            <button
-              v-for="n in outNodes.slice(0, 8)"
-              :key="n.id"
-              class="chip"
-              :class="{ on: n.id === state.outId }"
-              @click="state.outId = n.id"
-            >
-              {{ n.id }} · {{ n.cls }}
-            </button>
-          </div>
+          <div class="card-body">
+            <div class="outline-row">
+              <span class="pkey mono">输出节点</span>
+              <input v-model="state.outId" class="mono" type="text" placeholder="例如 9" />
+              <div class="chips" v-if="outNodes.length">
+                <button
+                  v-for="n in outNodes.slice(0, 6)"
+                  :key="n.id"
+                  class="chip"
+                  :class="{ on: n.id === state.outId }"
+                  @click="state.outId = n.id"
+                >
+                  {{ n.id }} · {{ n.cls }}
+                </button>
+              </div>
+            </div>
 
-          <div class="images">
-            <figure v-for="(img, i) in state.images" :key="i" class="shot">
-              <img :src="viewUrl(img)" :alt="img.filename" @click="openImage(img)" />
-              <figcaption class="mono small">
-                {{ img.nodeId }} · {{ img.filename }}
-              </figcaption>
-            </figure>
-            <p v-if="!state.images.length" class="hint empty">
-              还没有图片。提交后会显示绑定节点输出的图。
-            </p>
+            <!-- 批量对比结果 -->
+            <div class="images" v-if="state.results.length">
+              <figure
+                v-for="r in state.results"
+                :key="r.index"
+                class="shot cell"
+                :class="r.status"
+              >
+                <div class="thumb" @click="r.images[0] && openResult(r.index)">
+                  <img v-if="r.images[0]" :src="viewUrl(r.images[0])" :alt="String(r.index)" />
+                  <div v-else class="ph">{{ statusLabel(r.status) }}</div>
+                </div>
+                <figcaption>
+                  <span v-for="c in r.changed" :key="c.key" class="kv">
+                    <em>{{ shortKey(c.key) }}</em>{{ c.value }}
+                  </span>
+                  <span v-if="r.ms" class="ms">{{ (r.ms / 1000).toFixed(1) }}s</span>
+                  <span v-if="r.error" class="err">{{ r.error }}</span>
+                </figcaption>
+              </figure>
+            </div>
+
+            <!-- 单次结果 / 历史图 -->
+            <div class="images" v-else>
+              <figure v-for="(img, i) in state.images" :key="i" class="shot">
+                <img :src="viewUrl(img)" :alt="img.filename" @click="openSingle(i)" />
+                <figcaption class="mono small">{{ img.nodeId }} · {{ img.filename }}</figcaption>
+              </figure>
+              <p v-if="!state.images.length" class="hint empty">
+                还没有图片。提交后会显示绑定节点输出的图；给采样参数填多个值就能横向对比。
+              </p>
+            </div>
           </div>
-        </div>
       </section>
     </main>
+
+    <div v-if="state.lightbox" class="lightbox" @click.self="closeLightbox">
+      <div
+        v-if="state.lightbox.items.length > 1"
+        class="lb-nav left"
+        title="上一张（←）"
+        @click.stop="stepLightbox(-1)"
+      >
+        ‹
+      </div>
+      <div
+        v-if="state.lightbox.items.length > 1"
+        class="lb-nav right"
+        title="下一张（→）"
+        @click.stop="stepLightbox(1)"
+      >
+        ›
+      </div>
+
+      <figure class="lb-figure">
+        <img
+          :src="viewUrl(state.lightbox.items[state.lightbox.index].img)"
+          :alt="state.lightbox.items[state.lightbox.index].img.filename"
+          @click="closeLightbox"
+        />
+        <figcaption>
+          <div class="lb-tags">
+            <span
+              v-for="t in state.lightbox.items[state.lightbox.index].tags || []"
+              :key="t.key"
+              class="kv"
+            >
+              <em>{{ shortKey(t.key) }}</em>{{ t.value }}
+            </span>
+            <span
+              v-if="!state.lightbox.items[state.lightbox.index].tags?.length"
+              class="lb-note"
+            >
+              单张结果
+            </span>
+          </div>
+          <div class="lb-meta">
+            <span class="mono">{{ state.lightbox.items[state.lightbox.index].img.filename }}</span>
+            <span v-if="state.lightbox.items[state.lightbox.index].ms">
+              {{ (state.lightbox.items[state.lightbox.index].ms / 1000).toFixed(1) }}s
+            </span>
+            <span class="lb-counter">
+              {{ state.lightbox.index + 1 }} / {{ state.lightbox.items.length }}
+            </span>
+          </div>
+        </figcaption>
+        <p class="lb-hint">← → 切换 · Esc 或点图片关闭</p>
+      </figure>
+    </div>
   </div>
 </template>
 
@@ -778,7 +1176,7 @@ onMounted(refreshAll)
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 320px minmax(300px, 1fr) minmax(340px, 1.15fr);
+  grid-template-columns: 296px minmax(360px, 400px) minmax(0, 1fr);
   gap: 12px;
   padding: 12px;
 }
@@ -815,17 +1213,15 @@ onMounted(refreshAll)
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+  overflow-x: hidden;
 }
 .card-body.scroll { overflow-y: auto; min-height: 0; }
 
 .params {
   margin-top: 8px;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 3px 14px;
-}
-@media (min-width: 1700px) {
-  .params { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 .sampler-card input[type="text"] { padding: 4px 9px; }
 .sampler-card input[type="number"] {
@@ -841,6 +1237,152 @@ onMounted(refreshAll)
 }
 .sampler-card > .card-body::-webkit-scrollbar-track { background: transparent; }
 .prow { display: grid; grid-template-columns: 84px minmax(0, 1fr); align-items: center; gap: 6px; }
+
+/* —— 多值编辑 —— */
+.chips-edit { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
+.chips-edit .chip {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 6px;
+  font-size: 11px;
+  border-radius: 6px;
+}
+.chips-edit .chip .x,
+.vals .x,
+.vals .add {
+  border: 1px solid var(--line-strong);
+  background: #fff;
+  color: var(--ink-2);
+  border-radius: 5px;
+  height: 20px;
+  min-width: 18px;
+  padding: 0;
+  line-height: 1;
+  font-size: 12px;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.chips-edit .chip .x { border: none; background: transparent; height: 14px; min-width: 12px; }
+.chips-edit .chip .x:hover,
+.vals .x:hover,
+.vals .add:hover { color: var(--ink); border-color: var(--ink-3); }
+.add-sel {
+  width: auto;
+  min-width: 44px;
+  height: 24px;
+  padding: 2px 20px 2px 8px;
+  font-size: 11px;
+}
+.vals { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
+.vals .val { display: flex; align-items: center; gap: 2px; flex: 1 1 96px; min-width: 0; }
+.vals .val input { padding: 3px 2px 3px 7px; }
+.cnt { color: var(--brand); font-size: 10px; margin-left: 2px; }
+.combo-line { margin-top: 8px; line-height: 1.5; }
+.combo-line b { color: var(--brand); font-size: 13px; }
+.combo-line .dim { display: inline-block; margin-right: 8px; color: var(--ink-2); }
+.compare-btn { border-color: var(--brand); color: var(--brand); }
+
+/* —— 对比结果 —— */
+.outline-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.outline-row > input { flex: 1 1 110px; min-width: 0; }
+.shot.cell .thumb {
+  position: relative;
+  background: #f3f4f6;
+  min-height: 110px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.shot.cell .thumb img { width: 100%; height: auto; display: block; cursor: zoom-in; }
+.shot.cell.running .thumb { background: #eff6ff; }
+.shot.cell.running .ph { color: var(--brand); }
+.shot.cell.error .thumb { background: #fef2f2; }
+.shot.cell.error .ph { color: var(--bad); }
+.ph { color: var(--ink-3); font-size: 12px; padding: 26px 0; }
+.shot.cell figcaption { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.kv {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--brand-soft);
+  border: 1px solid #dbeafe;
+  color: var(--ink);
+}
+.kv em { font-style: normal; color: var(--ink-3); margin-right: 3px; }
+.ms { font-size: 11px; color: var(--ink-3); margin-left: auto; }
+.err { font-size: 11px; color: var(--bad); }
+
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(17, 24, 39, .9);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.lb-figure {
+  margin: 0;
+  max-width: 94vw;
+  max-height: 94vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.lb-figure > img {
+  max-width: 94vw;
+  max-height: 80vh;
+  object-fit: contain;
+  border-radius: 8px;
+  cursor: zoom-out;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, .5);
+}
+.lb-figure figcaption {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: #e5e7eb;
+}
+.lb-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+.lb-meta {
+  margin-left: auto;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  font-size: 12px;
+  color: #9ca3af;
+}
+.lb-counter { color: #f9fafb; font-weight: 500; font-size: 13px; }
+.lb-note { font-size: 12px; color: #9ca3af; }
+.lb-hint { margin: 0; font-size: 11px; color: #6b7280; }
+
+.lb-nav {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 16%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 44px;
+  line-height: 1;
+  color: rgba(255, 255, 255, .35);
+  cursor: pointer;
+  user-select: none;
+  transition: background .15s, color .15s;
+}
+.lb-nav:hover { background: rgba(255, 255, 255, .07); color: #fff; }
+.lb-nav.left { left: 0; }
+.lb-nav.right { right: 0; }
 
 .node-pick {
   display: grid;
