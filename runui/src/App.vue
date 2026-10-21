@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, watch } from 'vue'
 import JSZip from 'jszip'
+import LoraPanel from './components/LoraPanel.vue'
 import {
   apiGet,
   collectImages,
@@ -54,6 +55,10 @@ const state = reactive({
   presetName: '',
   samplerBaseline: null,
   dialog: null, // 通用确认弹窗 { title, text, confirmText, danger, onConfirm }
+  // —— LoRA 堆叠浮层（固定右下角，可动态开关）——
+  showLora: localStorage.getItem('runui.loraOpen') === '1',
+  loraId: localStorage.getItem('runui.loraNode') || '',
+  loraBaseline: {},
 })
 
 const TEXT_KEYS = ['text', 'prompt', 'string', 'value', 'content', 'positive', 'text_g', 'text_l']
@@ -99,6 +104,23 @@ const nodeList = computed(() =>
 
 const textNodes = computed(() => nodeList.value.filter((n) => n.fields.length))
 const outNodes = computed(() => nodeList.value.filter((n) => n.isSaver || n.imageCount))
+
+/* LoRA 堆叠节点：输入里有 loras 数组（Lora Stacker / LoraManager） */
+const loraNodes = computed(() =>
+  Object.entries(state.nodes || {})
+    .filter(([, node]) => Array.isArray(node?.inputs?.loras))
+    .map(([id, node]) => ({
+      id,
+      cls: String(node?.class_type || ''),
+      title: node?._meta?.title || '',
+      count: (node.inputs.loras || []).length,
+    }))
+)
+
+const loraLoras = computed(() => {
+  const list = state.nodes?.[state.loraId]?.inputs?.loras
+  return Array.isArray(list) ? list : []
+})
 
 const inNode = computed(() => state.nodes?.[state.inId] || null)
 const inFields = computed(() => (inNode.value ? stringFields(inNode.value) : []))
@@ -578,6 +600,14 @@ function applyPicked(picked) {
   const all = picked.entry ? collectImages(picked.entry, '') : []
   const mine = all.filter((img) => img.nodeId === state.outId)
   state.images = mine.length ? mine : all
+
+  // LoRA 堆叠浮层：重新绑定节点，并记一份原值给「恢复原值」
+  const stacks = loraNodes.value
+  if (!stacks.some((n) => n.id === state.loraId)) state.loraId = stacks[0]?.id || ''
+  state.loraBaseline = {}
+  for (const n of stacks) {
+    state.loraBaseline[n.id] = JSON.parse(JSON.stringify(state.nodes[n.id].inputs.loras || []))
+  }
   state.message = ''
 }
 
@@ -616,6 +646,36 @@ async function loadWorkflow(promptId) {
 async function refreshAll() {
   await loadWorkflow()
   await loadJobs()
+}
+
+/* ------------------------------------------------------------ LoRA 堆叠浮层 */
+// 面板固定在视口右下角，开关状态与选中的节点跨会话记住
+function toggleLora() {
+  state.showLora = !state.showLora
+  localStorage.setItem('runui.loraOpen', state.showLora ? '1' : '0')
+}
+
+function closeLora() {
+  state.showLora = false
+  localStorage.setItem('runui.loraOpen', '0')
+}
+
+function selectLoraNode(id) {
+  state.loraId = id
+  if (id) localStorage.setItem('runui.loraNode', id)
+}
+
+/** 写回当前作业的节点图：下一次「发送」由 buildNodes() 带出去 */
+function updateLoras(list) {
+  const node = state.nodes?.[state.loraId]
+  if (!node?.inputs) return
+  node.inputs.loras = Array.isArray(list) ? list : []
+}
+
+function resetLoras() {
+  const base = state.loraBaseline?.[state.loraId]
+  if (!Array.isArray(base)) return
+  updateLoras(JSON.parse(JSON.stringify(base)))
 }
 
 function applyPrefix() {
@@ -1361,6 +1421,20 @@ onUnmounted(() => {
           </div>
       </section>
     </main>
+
+    <!-- 固定右下角的 LoRA 堆叠浮层：可动态开关，改动写回当前工作流 -->
+    <LoraPanel
+      :open="state.showLora"
+      :nodes="loraNodes"
+      :node-id="state.loraId"
+      :loras="loraLoras"
+      :baseline="state.loraBaseline[state.loraId] || null"
+      @toggle="toggleLora"
+      @close="closeLora"
+      @select-node="selectLoraNode"
+      @change="updateLoras"
+      @reset="resetLoras"
+    />
 
     <!-- 通用确认弹窗 -->
     <div v-if="state.dialog" class="modal" @click.self="closeDialog">
