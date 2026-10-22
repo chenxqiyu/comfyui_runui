@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import JSZip from 'jszip'
 import LoraPanel from './components/LoraPanel.vue'
+import { XY_AXIS_LABEL, buildXyPrompt, canXySampler } from './xy'
 import {
   apiGet,
   collectImages,
@@ -73,6 +74,9 @@ const state = reactive({
   comparing: false,
   progress: { done: 0, total: 0 },
   stopFlag: false,
+  // —— 极速对比（XY 单请求）——
+  xyMode: localStorage.getItem('runui.xyMode') === '1',
+  xyAxis: localStorage.getItem('runui.xyAxis') || '',
   packing: false,
   resultZoom: Number(localStorage.getItem('runui.resultZoom')) || 100,
   showResultImages: true,
@@ -738,6 +742,49 @@ const multiDims = computed(() => {
 
 const canBatch = computed(() => canSend.value && variants.value.length > 1)
 
+/* ------------------ 极速对比：一次请求连续出 N 张（Efficiency XY） ------------------ */
+const xyCheck = computed(() => canXySampler(state.nodes, state.samplerId))
+
+/** 能扫的参数：Efficiency 的 XY Input: Manual XY Entry 支持的类型 */
+const xyAxes = computed(() => multiDims.value.filter((d) => XY_AXIS_LABEL[d.key]))
+
+const xyAxisKey = computed(() => {
+  const axes = xyAxes.value
+  if (!axes.length) return ''
+  return axes.some((a) => a.key === state.xyAxis) ? state.xyAxis : axes[0].key
+})
+
+const xyValues = computed(() => {
+  if (!xyAxisKey.value) return []
+  return valuesOf(xyAxisKey.value).filter((v) => v !== '' && v !== null && v !== undefined)
+})
+
+const xyUsable = computed(() => state.xyMode && xyCheck.value.ok && xyValues.value.length > 1)
+
+/** 除扫描轴之外还有多值的参数：XY 只扫一个维度，其它取第一个值 */
+const xyIgnored = computed(() => xyAxes.value.filter((a) => a.key !== xyAxisKey.value))
+
+const xyTip = computed(() => {
+  if (!xyCheck.value.ok) return xyCheck.value.reason
+  if (!state.xyMode) {
+    return '打开后：提交时临时把采样节点换成 KSampler (Efficient) + XY Plot，一次请求连续画出 N 张（模型只加载一次）'
+  }
+  if (!xyAxes.value.length) {
+    return `当前没有可扫描的参数 · 支持 ${Object.keys(XY_AXIS_LABEL).join(' / ')} 填多值`
+  }
+  return `一次请求扫 ${xyAxisKey.value} 的 ${xyValues.value.length} 个值`
+})
+
+watch(
+  () => state.xyMode,
+  (v) => localStorage.setItem('runui.xyMode', v ? '1' : '0')
+)
+watch(
+  () => state.xyAxis,
+  (v) => localStorage.setItem('runui.xyAxis', v || '')
+)
+
+
 const statusText = computed(() => {
   if (state.status === 'loading') return '读取中'
   if (state.status === 'error') return '未连接'
@@ -1197,6 +1244,19 @@ async function sendBatch() {
   const list = variants.value
   if (!list.length || !canSend.value) return
 
+  // 极速对比：能走 XY 就只发一次请求，失败再回退串行
+  if (xyUsable.value) {
+    try {
+      await runXy()
+      return
+    } catch (err) {
+      state.results = []
+      state.comparing = false
+      state.failed = true
+      state.message = `XY 单请求失败（${err?.message || err}），已回退到串行对比`
+    }
+  }
+
   state.results = list.map((v) => ({
     index: v.index,
     params: v.params,
@@ -1243,6 +1303,68 @@ async function sendBatch() {
     state.message = state.stopFlag
       ? `已停止 · 完成 ${ok}/${list.length} 张`
       : `对比完成 · ${ok}/${list.length} 张`
+  } finally {
+    state.comparing = false
+  }
+}
+
+/**
+ * 极速对比：改一份工作流副本（采样节点换成 KSampler (Efficient) + XY Plot），
+ * 只提交一次，拿回来的 N 张图按扫描值顺序贴到 results 上。
+ */
+async function runXy() {
+  const axis = xyAxisKey.value
+  const values = xyValues.value
+  if (!axis || values.length < 2) throw new Error('没有可扫描的参数')
+  const baseParams = variants.value[0]?.params || {}
+
+  state.results = values.map((v, i) => ({
+    index: i,
+    params: { ...baseParams, [axis]: v },
+    changed: [{ key: axis, value: v }],
+    status: 'pending',
+    images: [],
+    error: '',
+    promptId: '',
+    ms: 0,
+  }))
+  state.comparing = true
+  state.stopFlag = false
+  state.failed = false
+  state.progress = { done: 0, total: values.length }
+  state.message = `⚡ 单请求：${axis} 扫 ${values.length} 档，等待出图…`
+
+  const started = Date.now()
+  try {
+    // 先把提示词草稿 / 非扫描轴的单值写回节点图，再改造成 XY 版本
+    const nodes = buildNodes(baseParams)
+    const { prompt } = buildXyPrompt(nodes, {
+      samplerId: state.samplerId,
+      axis,
+      values,
+    })
+    const resp = await submitPrompt(prompt, state.extraData ? { extra_data: state.extraData } : {})
+    state.runPromptId = resp.prompt_id
+    if (state.stopFlag) await stopRun()
+
+    const { images } = await waitImages(resp.prompt_id)
+    const ms = Date.now() - started
+    images.forEach((img, i) => {
+      const r = state.results[i]
+      if (!r) return
+      r.images = [img]
+      r.status = 'done'
+      r.ms = ms
+      r.promptId = resp.prompt_id
+    })
+    state.results.forEach((r) => {
+      if (r.status === 'pending') r.status = 'empty'
+    })
+    state.progress.done = images.length
+    state.message =
+      images.length === values.length
+        ? `⚡ 一次请求完成 · ${images.length} 张 · ${(ms / 1000).toFixed(1)}s`
+        : `⚡ 一次请求完成 · 只拿到 ${images.length}/${values.length} 张 · ${(ms / 1000).toFixed(1)}s`
   } finally {
     state.comparing = false
   }
@@ -1926,7 +2048,7 @@ onUnmounted(() => {
               :disabled="!canBatch || state.comparing"
               @click="sendBatch"
             >
-              {{ state.comparing ? `对比中 ${state.progress.done}/${state.progress.total}` : `对比 ${variants.length} 组` }}
+              {{ state.comparing ? `对比中 ${state.progress.done}/${state.progress.total}` : xyUsable ? `⚡ 一次出 ${xyValues.length} 张` : `对比 ${variants.length} 组` }}
             </button>
             <button v-if="state.comparing || state.submitting" class="stop-btn" @click="stopRun">停止</button>
             <label class="check" style="margin: 0">
@@ -1964,6 +2086,14 @@ onUnmounted(() => {
           <div class="card-head">
             <span>③ 采样参数 · KSampler</span>
             <div class="head-actions">
+              <label
+                class="xy-switch"
+                :class="{ on: state.xyMode, off: !xyCheck.ok }"
+                :title="xyTip"
+              >
+                <input v-model="state.xyMode" type="checkbox" :disabled="!xyCheck.ok" />
+                <span>⚡ 一次出多张</span>
+              </label>
               <span class="tag" v-if="samplerFields.length">{{ samplerFields.length }} 项</span>
               <button class="mini" @click="state.showSavePreset = !state.showSavePreset">
                 ★ 收藏
@@ -1971,6 +2101,31 @@ onUnmounted(() => {
             </div>
           </div>
           <div class="card-body">
+            <!-- 极速对比：选一个扫描轴，一次请求连画 N 张 -->
+            <div class="xy-bar" v-if="state.xyMode && xyCheck.ok">
+              <span class="pkey mono">扫描轴</span>
+              <div class="chips" v-if="xyAxes.length">
+                <button
+                  v-for="a in xyAxes"
+                  :key="a.key"
+                  class="chip"
+                  :class="{ on: a.key === xyAxisKey }"
+                  :title="`扫 ${a.key} 的 ${a.n} 个值`"
+                  @click="state.xyAxis = a.key"
+                >
+                  {{ a.key }} · {{ a.n }}
+                </button>
+              </div>
+              <span v-else class="hint">
+                还没有多值参数 —— 给
+                {{ Object.keys(XY_AXIS_LABEL).join(' / ') }}
+                里某一项点 + 加几个值
+              </span>
+              <span v-if="xyUsable" class="xy-count">一次请求出 {{ xyValues.length }} 张 · {{ (xyValues || []).join(' / ') }}</span>
+            </div>
+            <p v-if="xyUsable && xyIgnored.length" class="hint xy-warn">
+              其它多值参数（{{ xyIgnored.map((a) => a.key).join(' / ') }}）在 XY 模式下只会取第一个值
+            </p>
             <!-- 收藏列表：★ 设默认 / 点名字应用 / × 删除 -->
             <div class="preset-row" v-if="state.presets.length">
               <span class="pkey mono">收藏</span>
@@ -2460,6 +2615,42 @@ onUnmounted(() => {
   overflow: hidden;
 }
 .sampler-card > .card-head { flex: 0 0 auto; }
+
+/* —— 极速对比（XY 单请求）开关与扫描轴 —— */
+.xy-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: var(--ink-3);
+  background: var(--input);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.xy-switch input { margin: 0; accent-color: #d97706; }
+.xy-switch.on {
+  color: #a15c07;
+  border-color: #e2b15c;
+  background: #fdf4e3;
+}
+.xy-switch.off { opacity: .5; cursor: not-allowed; }
+.xy-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  background: #fdf8ee;
+  border: 1px solid #f0dcb4;
+  border-radius: 7px;
+}
+.xy-count { font-size: 10.5px; color: #a15c07; font-family: var(--mono); }
+.xy-warn { color: #a15c07; margin: 0 0 8px; }
+
 .sampler-card > .card-body {
   flex: 1 1 0;
   min-height: 0;

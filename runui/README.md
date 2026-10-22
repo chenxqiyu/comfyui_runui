@@ -91,6 +91,48 @@ ComfyUI 请求的路径没变（还是 `I:\loras\...`），真正读的却是快
 - **改完 `tools/lora-speed.mjs` 也要重启 dev**：它是服务端代码，vite 的 HMR 只热更前端，不会重载它。
 - LoRA 名字一般只是文件名，所以第一次搬之前要扫一遍 `LORA_ROOTS` 建索引（跟软链目录走，慢盘上约 5 秒，浮层里会显示「正在扫描 LoRA 目录…」）。索引缓存 5 分钟。
 
+## 极速对比：一次请求出 N 张（Efficiency XY）
+
+默认的「对比 N 组」是**串行**：一组一提交，跑完再跑下一组。装了 Efficiency Nodes 之后，
+可以改成**一次请求连画 N 张** —— 引擎内部循环参数，模型只加载一次。
+
+③ 采样参数卡片头右侧有个 **⚡ 一次出多张** 开关：
+
+- 打开后卡片顶部出现「扫描轴」，列出当前填了多值的参数（**cfg / steps / denoise**）。
+  点一下切换扫哪个；如果同时有好几个参数填了多值，其它几个在 XY 模式下只取第一个值（会有黄色提示）。
+- 发送区的按钮从 `对比 N 组` 变成 **`⚡ 一次出 N 张`**，点它只发**一次** `/prompt`。
+- 结果区和串行一样横排，每张标着对应的取值。
+
+### 怎么适配「任意工作流」
+
+不用手工加节点 —— 提交前在副本上自动改造（`src/xy.js`）：
+
+1. 目标采样节点 `KSampler` / `KSamplerAdvanced` **原地换成** `KSampler (Efficient)`
+   （保留同名输入；丢掉 `add_noise` / `start_at_step` 这些 Efficient 没有的）；
+2. 把下游 `VAEDecode` 的 `vae` 连接复制一份到 `optional_vae`
+   —— **不传的话 Efficiency 在 XY 模式下会 fallback 成单张**，而且拼图那步算出的字号是 0，
+   直接报 `font size must be greater than 0`；
+3. `KSampler` 的 LATENT 在 slot 0，Efficient 在 slot 3 —— 把所有引用 `[id,0]` 的地方改写成 `[id,3]`，
+   下游 `VAEDecode` 一行都不用改；
+4. 注入 `XY Input: Manual XY Entry` + `XY Plot`，接到 `script`。
+
+`vae_decode` 必须设 `'true'`（设 `false` 时 XY 分支产不出图，同样崩在拼图那步）。
+
+### 兼容边界
+
+| 采样节点 | 能不能用 |
+|---|---|
+| `KSampler` / `KSamplerAdvanced` | ✅ 自动改造 |
+| `KSampler (Efficient)` | ✅ 直接用（只补 XY 节点） |
+| `SamplerCustom` / `KSampler //Inspire` / pipe 类 | ❌ 开关禁用并提示原因（它们没有 `script` 插槽） |
+
+改造只发生在提交副本上，不动工作流本身；失败了会自动**回退串行**并在提示里说明。
+
+### 实测
+
+chilloutmix fp32 · 512² · steps 6 · cfg 7/3/1：一次请求 **6.5 秒出 3 张**；
+串行同样 3 组要 3 次排队，且每次都等上一次完全跑完。
+
 ## 提交时为什么要包 `__value__`
 
 ComfyUI 里**数组默认代表节点连接**（`[node_id, slot_index]`），所以「值本身是 list 的 widget」提交时必须包一层：
@@ -135,6 +177,7 @@ ComfyUI 有一层来源校验：请求的 `Host` 和 `Origin` 的 `host:port` �
 ```
 index.html
 vite.config.js        /comfy -> http://127.0.0.1:8189 代理；/api/fastlora 中间件
+src/xy.js             极速对比：把任意 KSampler 改造成 KSampler (Efficient) + XY Plot
 src/api.js            读当前工作流 / 提交 / 轮询 / 收图；极速模式的接口封装
 src/App.vue           三栏界面
 src/components/LoraPanel.vue   LoRA 堆叠浮层（含极速模式开关 / ⚡ 标记）
