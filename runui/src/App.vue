@@ -56,7 +56,7 @@ const state = reactive({
   // /object_info 缓存：{ class_type: { 字段: [候选值] } }
   nodeOptions: {},
   randomSeed: true,
-  // 一组提示词：等全部画完再一起出图；默认关（画一张显示一张）
+  // 全部画完：每组独立发送，全部生成完再统一收图；默认关（画一张显示一张）
   waitAll: localStorage.getItem('runui.waitAll') === '1',
   sendCount: 1,
   samplerId: '',
@@ -647,6 +647,7 @@ function statusLabel(status) {
   return {
     pending: '等待',
     running: '生成中…',
+    held: '已生成',
     empty: '无图',
     error: '失败',
     done: '',
@@ -826,8 +827,11 @@ const multiDims = computed(() => {
 /** 对比按钮文案：文本多值时是「几组 × 每组几张」 */
 const batchBtnLabel = computed(() => {
   if (state.comparing) return `对比中 ${state.progress.done}/${state.progress.total}`
-  if (!xyUsable.value) return `对比 ${variants.value.length} 组`
-  return `⚡ 一次出 ${xyCount.value} 张`
+  if (useXy.value) return `⚡ 一次出 ${xyCount.value} 张`
+  if (xyPerPrompt.value) {
+    return `⚡ ${xyPromptTexts.value.length} 次请求出 ${xyPromptTexts.value.length * xyValues.value.length} 张`
+  }
+  return `对比 ${variants.value.length} 组`
 })
 
 /** 主按钮：有多个组合时直接全跑，只有一个时就是普通发送 */
@@ -874,7 +878,20 @@ const xyReady = computed(() => {
   if (xyPromptTexts.value.length > 1 && !xyPromptCheck.value.ok) return false
   return xyHasParams.value || xyPromptTexts.value.length > 1
 })
-const xyUsable = computed(() => state.xyMode && xyReady.value)
+/** 实际合并成一次请求：⚡ 开着，或「全部画完」要求合并（提示词组也一起扫） */
+const useXy = computed(() => xyReady.value && (state.xyMode || state.waitAll))
+/**
+ * 全部画完 + 提示词扫不了（如 UNETLoader 分离加载）：每组提示词各发一次 XY 请求，
+ * 组内 cfg / steps / denoise 合并扫描，最后统一收图。
+ */
+const xyPerPrompt = computed(
+  () =>
+    state.waitAll &&
+    xyCheck.value.ok &&
+    xyPromptTexts.value.length > 1 &&
+    !xyPromptCheck.value.ok &&
+    xyHasParams.value
+)
 /** 一次请求总共出几张 */
 const xyCount = computed(
   () =>
@@ -884,7 +901,7 @@ const xyCount = computed(
 
 const xyTip = computed(() => {
   if (!xyCheck.value.ok) return xyCheck.value.reason
-  if (!state.xyMode) {
+  if (!state.xyMode && !state.waitAll) {
     return '打开后：提交时临时改造工作流（KSampler → KSampler (Efficient) + XY Plot），一次请求连续画出多张'
   }
   if (xyPromptTexts.value.length > 1 && !xyPromptCheck.value.ok) return xyPromptCheck.value.reason
@@ -894,7 +911,8 @@ const xyTip = computed(() => {
   const parts = []
   if (xyPromptTexts.value.length > 1) parts.push(`提示词 ×${xyPromptTexts.value.length}`)
   if (xyHasParams.value) parts.push(`${xyAxisKey.value} ×${xyValues.value.length}`)
-  return `一次请求出 ${xyCount.value} 张 · ${parts.join(' · ')}`
+  const tail = state.waitAll ? '，全部画完再统一出图' : ''
+  return `一次请求出 ${xyCount.value} 张 · ${parts.join(' · ')}${tail}`
 })
 
 
@@ -1304,6 +1322,8 @@ async function send() {
   }
   // 发送数量：同一套设置连着跑几遍（开随机 seed 时每遍都不一样）
   const times = Math.max(1, Math.min(50, Math.round(Number(state.sendCount) || 1)))
+  // 全部画完：连跑多遍时也先攒着，最后统一出图
+  const holdAll = state.waitAll && times > 1
 
   state.submitting = true
   state.running = false
@@ -1348,16 +1368,23 @@ async function send() {
         const ms = Date.now() - t0
         const at = Date.now()
         collected.push(...res.images.map((img) => ({ ...img, ms, at })))
-        state.images = [...collected]
+        if (!holdAll) state.images = [...collected]
       }
       if (res.stopped) {
         state.message = `已停止 · 共 ${collected.length} 张图`
         break
       }
       if (res.failed) break
-      if (times > 1 && res.images.length) {
-        state.message = `第 ${done}/${times} 次完成 · 累计 ${collected.length} 张图`
+      if (times > 1 && !holdAll) {
+        state.message = res.images.length
+          ? `第 ${done}/${times} 次完成 · 累计 ${collected.length} 张图`
+          : `第 ${done}/${times} 次完成`
       }
+    }
+    if (holdAll && collected.length) {
+      state.message = state.stopFlag ? '已停止 · 正在统一收图…' : '全部生成完毕 · 正在统一收图…'
+      await nextTick()
+      state.images = [...collected]
     }
     if (times > 1 && !state.failed && !state.stopFlag) {
       state.message = `已发送 ${done} 次 · 共 ${collected.length} 张图`
@@ -1375,17 +1402,18 @@ async function send() {
   }
 }
 
-/** 等一个 prompt 出图；返回 { images, entry, failed }（被取消 / 失败 / 超时返回 failed: true） */
-async function waitImages(promptId, timeoutMs = 15 * 60 * 1000) {
+/**
+ * 等一个 prompt 跑完，但先不取图。
+ * 「全部画完」用：先把所有组生成完，最后再统一 collectImages 收图（最后才出图）。
+ */
+async function waitFinished(promptId, timeoutMs = 15 * 60 * 1000) {
   const started = Date.now()
   let tick = 0
   while (Date.now() - started < timeoutMs) {
     if (state.stopFlag) throw new Error('已停止')
     const history = await fetchHistory(promptId)
     const entry = history[promptId]
-    if (entry?.status?.completed) {
-      return { images: collectImages(entry, state.outId), entry }
-    }
+    if (entry?.status?.completed) return { entry }
     tick += 1
     if (tick % 3 === 0) {
       const job = await apiGet('/api/jobs/' + promptId).catch(() => null)
@@ -1397,13 +1425,24 @@ async function waitImages(promptId, timeoutMs = 15 * 60 * 1000) {
   throw new Error('等待超时')
 }
 
-/** 批量对比：按笛卡尔积逐组串行提交，跑完一组再跑下一组，seed 固定 */
+/** 等一个 prompt 出图；返回 { images, entry }（被取消 / 失败 / 超时会抛错） */
+async function waitImages(promptId, timeoutMs) {
+  const { entry } = await waitFinished(promptId, timeoutMs)
+  return { images: collectImages(entry, state.outId), entry }
+}
+
+/**
+ * 批量对比：能合并时一次 XY 请求出完整网格（含提示词组 × 参数）；
+ * 合不了才按笛卡尔积逐组提交。
+ * 「全部画完」开着时一定走合并；只有合并不了（比如分离加载的模型扫不了提示词）才逐组发送，
+ * 并且生成期间不取图，等所有组跑完最后统一收图。
+ */
 async function sendBatch() {
   const list = variants.value
   if (!list.length || !canSend.value) return
 
-  // 极速对比：数值轴要多扫时才用 XY；只有提示词多值时走串行，逐张出图
-  if (xyUsable.value) {
+  // 全部画完 / ⚡：合并成一次请求（提示词组也当轴扫）
+  if (useXy.value) {
     try {
       await runXy(list)
       return
@@ -1411,7 +1450,19 @@ async function sendBatch() {
       state.results = []
       state.comparing = false
       state.failed = true
-      state.message = `XY 单请求失败（${err?.message || err}），已回退到串行对比`
+      state.message = `XY 单请求失败（${err?.message || err}），已回退到逐组对比`
+    }
+  }
+  // 提示词扫不了但数值参数能扫：每组提示词各合并一次请求
+  if (xyPerPrompt.value) {
+    try {
+      await runXyPerPrompt()
+      return
+    } catch (err) {
+      state.results = []
+      state.comparing = false
+      state.failed = true
+      state.message = `XY 请求失败（${err?.message || err}），已回退到逐组对比`
     }
   }
 
@@ -1429,13 +1480,15 @@ async function sendBatch() {
   state.stopFlag = false
   state.failed = false
   state.progress = { done: 0, total: list.length }
-  state.message = `开始对比：${list.length} 组（批内 seed 相同，只变你勾的维度）`
 
   // 一批只抽一次种子：批内可比，点一次换一批
   const seedUsed = batchSeed()
-  // 「全部画完」开着时先把图攒着，跑完再一起贴出来；关掉就画一张贴一张
   const waitAll = state.waitAll
-  const held = []
+  // 全部画完但合并不了：先只记「这组跑完了」，图留到最后一次性收
+  const finished = []
+  state.message = waitAll
+    ? `全部画完 · 合并不了，${list.length} 组逐组发送（最后统一出图）`
+    : `开始对比：${list.length} 组（批内 seed 相同，只变你勾的维度）`
   try {
     // 第一步：把整批一次性推进 ComfyUI 队列。
     // 队列是接着往下执行的，中间不会像「跑一组→轮询等完→再提交下一组」那样空一拍
@@ -1460,42 +1513,75 @@ async function sendBatch() {
     }
     if (state.stopFlag) await stopRun()
 
-    // 第二步：按提交顺序收图，收到一张就贴一张（「全部画完」开着就先攒着）
-    for (let i = 0; i < submitted.length; i += 1) {
-      if (state.stopFlag) {
-        state.message = `已停止 · 完成 ${i}/${list.length}`
-        break
+    if (waitAll) {
+      // 第二步：只等每组跑完，不 collectImages —— 全部生成完再最后收图
+      for (let i = 0; i < submitted.length; i += 1) {
+        if (state.stopFlag) {
+          state.message = `已停止 · 生成 ${i}/${submitted.length} 组`
+          break
+        }
+        const { r, id } = submitted[i]
+        const started = Date.now()
+        try {
+          finished.push({ r, ...(await waitFinished(id)) })
+          // 先标记「已生成」，图留到全部跑完再统一收
+          r.status = 'held'
+        } catch (err) {
+          r.status = 'error'
+          r.error = err.message || String(err)
+        }
+        r.ms = Date.now() - started
+        state.progress.done = i + 1
+        state.message = `全部画完 · 已生成 ${i + 1}/${submitted.length} 组，最后统一出图…`
       }
-      const { r, id } = submitted[i]
-      const started = Date.now()
-      try {
-        const { images } = await waitImages(id)
-        if (waitAll) held.push({ r, images })
-        else {
+      // 第三步：全部生成完，最后一次性收图 / 贴出来
+      if (finished.length) {
+        state.message = state.stopFlag ? '已停止 · 正在收已完成的图…' : '全部生成完毕 · 正在统一收图…'
+        await nextTick()
+        for (const { r, entry } of finished) {
+          const images = collectImages(entry, state.outId)
           r.images = images
           r.status = images.length ? 'done' : 'empty'
         }
-      } catch (err) {
-        r.status = 'error'
-        r.error = err.message || String(err)
       }
-      r.ms = Date.now() - started
-      state.progress.done = i + 1
-      state.message = waitAll
-        ? `画第 ${i + 1}/${list.length} 组…（全部画完再一起出图）`
-        : `对比中 ${i + 1}/${list.length}`
+    } else {
+      // 第二步：按提交顺序收图，收到一张就贴一张
+      for (let i = 0; i < submitted.length; i += 1) {
+        if (state.stopFlag) {
+          state.message = `已停止 · 完成 ${i}/${list.length}`
+          break
+        }
+        const { r, id } = submitted[i]
+        const started = Date.now()
+        try {
+          const { images } = await waitImages(id)
+          r.images = images
+          r.status = images.length ? 'done' : 'empty'
+        } catch (err) {
+          r.status = 'error'
+          r.error = err.message || String(err)
+        }
+        r.ms = Date.now() - started
+        state.progress.done = i + 1
+        state.message = `对比中 ${i + 1}/${list.length}`
+      }
+    }
+
+    // 停止时还没轮到的组别一直停在「生成中」
+    for (const r of state.results) {
+      if (r.status === 'running' || r.status === 'pending') {
+        r.status = 'error'
+        r.error = state.stopFlag ? '已停止' : r.error || '未完成'
+      }
     }
   } finally {
     state.queuedIds = []
-    // 攒着的图一次性贴出来（中途停止也把已经画好的贴上，别白跑）
-    for (const { r, images } of held) {
-      r.images = images
-      r.status = images.length ? 'done' : 'empty'
-    }
     const ok = state.results.filter((x) => x.images.length).length
     state.message = state.stopFlag
       ? `已停止 · 完成 ${ok}/${list.length} 张`
-      : `对比完成 · ${ok}/${list.length} 张`
+      : waitAll
+        ? `全部画完 · ${ok}/${list.length} 张`
+        : `对比完成 · ${ok}/${list.length} 张`
     state.comparing = false
   }
 }
@@ -1542,7 +1628,9 @@ async function runXy(list) {
   state.stopFlag = false
   state.failed = false
   state.progress = { done: 0, total: order.length }
-  state.message = `⚡ 一次请求：${order.length} 张，等待出图…`
+  state.message = state.waitAll
+    ? `全部画完 · 一次请求出 ${order.length} 张，等全部画完再统一出图…`
+    : `⚡ 一次请求：${order.length} 张，等待出图…`
 
   // 整批共用同一个种子；勾了「随机 seed」时每次点发送换一个（否则第二次点击会出一样的图）
   const seedUsed = batchSeed()
@@ -1584,6 +1672,119 @@ async function runXy(list) {
         ? `⚡ 一次请求完成 · ${images.length} 张 · ${(ms / 1000).toFixed(1)}s`
         : `⚡ 一次请求完成 · 只拿到 ${images.length}/${order.length} 张 · ${(ms / 1000).toFixed(1)}s`
   } finally {
+    state.comparing = false
+  }
+}
+
+/**
+ * 全部画完 + 提示词扫不了：每组提示词各发**一次** XY 请求，
+ * 组内 cfg / steps / denoise 合并扫描；生成期间不收图，全部跑完最后统一出图。
+ */
+async function runXyPerPrompt() {
+  const prompts = xyPromptTexts.value
+  const axis = xyAxisKey.value
+  const vals = xyValues.value
+  if (prompts.length < 2 || !vals.length) throw new Error('没有可扫描的参数')
+
+  // 结果顺序 = 每组提示词 × 每个数值（组内就是这次 XY 请求的出图顺序）
+  state.results = []
+  prompts.forEach((p, pi) => {
+    vals.forEach((v) => {
+      state.results.push({
+        index: state.results.length,
+        params: { prompt: p, [axis]: v },
+        changed: [
+          { key: 'prompt', value: `#${pi + 1}` },
+          { key: axis, value: v },
+        ],
+        status: 'pending',
+        images: [],
+        error: '',
+        promptId: '',
+        ms: 0,
+      })
+    })
+  })
+  state.comparing = true
+  state.stopFlag = false
+  state.failed = false
+  state.queuedIds = []
+  state.progress = { done: 0, total: state.results.length }
+  state.message = `全部画完 · ${prompts.length} 组提示词各合并一次请求（每次 ${vals.length} 档 ${axis}），最后统一出图…`
+
+  const seedUsed = batchSeed()
+  const finished = []
+  try {
+    for (let pi = 0; pi < prompts.length; pi += 1) {
+      if (state.stopFlag) break
+      const rows = state.results.slice(pi * vals.length, (pi + 1) * vals.length)
+      try {
+        // 这一组提示词自己的其它参数（除扫描轴外，其余多值参数取第一个值）
+        const first = variants.value.find((v) => v.params.prompt === prompts[pi])
+        const baseParams = { ...(first?.params || {}) }
+        delete baseParams[axis]
+        delete baseParams.prompt
+        const nodes = buildNodes({ ...baseParams, prompt: prompts[pi] }, { seed: seedUsed })
+        const { prompt } = buildXyPrompt(nodes, {
+          samplerId: state.samplerId,
+          axis,
+          values: vals,
+          promptNodeId: state.inId,
+          promptTexts: [],
+        })
+        const resp = await submitPrompt(prompt, state.extraData ? { extra_data: state.extraData } : {})
+        state.runPromptId = resp.prompt_id
+        state.queuedIds.push(resp.prompt_id)
+        if (state.stopFlag) await stopRun()
+        rows.forEach((r) => {
+          r.status = 'running'
+          r.promptId = resp.prompt_id
+        })
+        const started = Date.now()
+        const { entry } = await waitFinished(resp.prompt_id)
+        finished.push({ pi, entry, promptId: resp.prompt_id, ms: Date.now() - started })
+        state.message = `全部画完 · 已生成 ${pi + 1}/${prompts.length} 组提示词（每组 ${vals.length} 档 ${axis}），最后统一出图…`
+      } catch (err) {
+        rows.forEach((r) => {
+          r.status = 'error'
+          r.error = err?.message || String(err)
+        })
+        if (state.stopFlag) break
+      }
+      state.progress.done = Math.min((pi + 1) * vals.length, state.results.length)
+    }
+
+    // 全部请求跑完，最后统一收图 / 贴出来
+    if (finished.length) {
+      state.message = state.stopFlag ? '已停止 · 正在收已完成的图…' : '全部生成完毕 · 正在统一收图…'
+      await nextTick()
+      for (const { pi, entry, promptId, ms } of finished) {
+        const images = collectImages(entry, state.outId)
+        images.forEach((img, vi) => {
+          const r = state.results[pi * vals.length + vi]
+          if (!r) return
+          r.images = [img]
+          r.status = 'done'
+          r.ms = ms
+          r.promptId = promptId
+        })
+      }
+      for (const r of state.results) {
+        if (r.status === 'running') r.status = r.images.length ? 'done' : 'empty'
+      }
+    }
+  } finally {
+    state.queuedIds = []
+    for (const r of state.results) {
+      if (r.status === 'pending' || r.status === 'running') {
+        r.status = 'error'
+        r.error = state.stopFlag ? '已停止' : r.error || '未完成'
+      }
+    }
+    const ok = state.results.filter((r) => r.images.length).length
+    state.message = state.stopFlag
+      ? `已停止 · 完成 ${ok}/${state.results.length} 张`
+      : `全部画完 · ${ok}/${state.results.length} 张`
     state.comparing = false
   }
 }
@@ -2338,15 +2539,17 @@ onUnmounted(() => {
               <input v-model="state.randomSeed" type="checkbox" />
               <span>随机 seed</span>
             </label>
-            <!-- 一组提示词：全部画完再一起出图；关掉就画一张显示一张 -->
+            <!-- 全部画完：合并成一次请求，全部生成完再统一收图 -->
             <label
               class="check"
               style="margin: 0"
-              title="开：这一批全部画完再一起出图（配合「⚡ 一次出多张」会合并成一次请求）；关：每画完一张就立刻显示"
+              title="开：能扫的组合合并成一次 XY 请求（提示词组也一起扫；提示词扫不了时每组提示词各合并一次），全部生成完再统一收图显示；关：按当前 ⚡/串行方式，画一张显示一张"
             >
-              <input v-model="state.waitAll" type="checkbox" :disabled="xyUsable" />
+              <input v-model="state.waitAll" type="checkbox" />
               <span>全部画完</span>
-              <span v-if="xyUsable" class="hint" style="margin: 0">（⚡ 模式必然是全部画完）</span>
+              <span v-if="state.waitAll && (useXy || xyPerPrompt)" class="hint" style="margin: 0">
+                （合并请求，最后统一出图）
+              </span>
             </label>
             <span class="hint" v-if="state.running && !state.comparing">执行中 · {{ state.elapsed }}s</span>
           </div>
@@ -2395,7 +2598,7 @@ onUnmounted(() => {
           </div>
           <div class="card-body">
             <!-- 极速对比：X=提示词（可选）× Y=数值参数（可选），一次请求出整张网格 -->
-            <div class="xy-bar" v-if="state.xyMode && xyCheck.ok">
+            <div class="xy-bar" v-if="(state.xyMode || state.waitAll) && xyCheck.ok">
               <span class="pkey mono">扫描轴</span>
               <span v-if="xyPromptTexts.length > 1" class="xy-axis-tag on">
                 提示词 ×{{ xyPromptTexts.length }}
@@ -2418,15 +2621,25 @@ onUnmounted(() => {
                 {{ Object.keys(XY_AXIS_LABEL).join(' / ') }}
                 里某一项点 + 加几个值，或在左边再加几个提示词
               </span>
-              <span v-if="xyUsable" class="xy-count">一次请求出 {{ xyCount }} 张</span>
+              <span v-if="useXy && state.waitAll" class="xy-count">
+                一次请求出 {{ xyCount }} 张 · 最后统一出图
+              </span>
+              <span v-else-if="useXy" class="xy-count">一次请求出 {{ xyCount }} 张</span>
+              <span v-else-if="xyPerPrompt" class="xy-count">
+                每组提示词一次请求 · 共 {{ xyPromptTexts.length * xyValues.length }} 张 · 最后统一出图
+              </span>
             </div>
+            <p v-if="xyPerPrompt" class="hint xy-warn">
+              提示词扫不了（{{ xyPromptCheck.reason }}）：改为每组提示词各发一次请求，
+              组内 {{ xyAxisKey }} 的 {{ xyValues.length }} 档合并，全部跑完再统一出图。
+            </p>
             <p
-              v-if="state.xyMode && xyPromptTexts.length > 1 && !xyPromptCheck.ok"
+              v-else-if="state.xyMode && xyPromptTexts.length > 1 && !xyPromptCheck.ok"
               class="hint xy-warn"
             >
               提示词多值走不了单请求：{{ xyPromptCheck.reason }}
             </p>
-            <p v-if="xyUsable && xyIgnored.length" class="hint xy-warn">
+            <p v-if="(useXy || xyPerPrompt) && xyIgnored.length" class="hint xy-warn">
               其它多值参数（{{ xyIgnored.map((a) => a.key).join(' / ') }}）在 XY 模式下只会取第一个值
             </p>
             <!-- 收藏列表：★ 设默认 / 点名字应用 / × 删除 -->
