@@ -5,9 +5,11 @@ import LoraPanel from './components/LoraPanel.vue'
 import {
   apiGet,
   collectImages,
+  deleteQueued,
   fetchCurrentWorkflow,
   fetchHistory,
   getPrefix,
+  interruptRun,
   nodesFromHistoryEntry,
   setPrefix,
   sleep,
@@ -1103,6 +1105,7 @@ async function send() {
 
   state.submitting = true
   state.running = false
+  state.stopFlag = false
   state.elapsed = 0
   state.warnings = []
   state.showWarnings = false
@@ -1118,6 +1121,8 @@ async function send() {
       nodes = buildNodes(variants.value[0]?.params || {})
       const resp = await submitPrompt(nodes, state.extraData ? { extra_data: state.extraData } : {})
       state.runPromptId = resp.prompt_id
+      // 提交途中按了停止：把刚提交的这个也掐掉，别留在 ComfyUI 里跑
+      if (state.stopFlag) await stopRun()
       const warnings = parseNodeErrors(resp.node_errors, nodes, state.outId)
       if (!i) state.warnings = warnings
       const blocking = warnings.filter((w) => w.blocking)
@@ -1139,12 +1144,16 @@ async function send() {
         collected.push(...res.images)
         state.images = [...collected]
       }
+      if (res.stopped) {
+        state.message = `已停止 · 共 ${collected.length} 张图`
+        break
+      }
       if (res.failed) break
       if (times > 1 && res.images.length) {
         state.message = `第 ${done}/${times} 次完成 · 累计 ${collected.length} 张图`
       }
     }
-    if (times > 1 && !state.failed) {
+    if (times > 1 && !state.failed && !state.stopFlag) {
       state.message = `已发送 ${done} 次 · 共 ${collected.length} 张图`
     }
   } catch (err) {
@@ -1165,6 +1174,7 @@ async function waitImages(promptId, timeoutMs = 15 * 60 * 1000) {
   const started = Date.now()
   let tick = 0
   while (Date.now() - started < timeoutMs) {
+    if (state.stopFlag) throw new Error('已停止')
     const history = await fetchHistory(promptId)
     const entry = history[promptId]
     if (entry?.status?.completed) {
@@ -1215,6 +1225,8 @@ async function sendBatch() {
         const nodes = buildNodes(r.params, { fixedSeed: true })
         const resp = await submitPrompt(nodes, state.extraData ? { extra_data: state.extraData } : {})
         r.promptId = resp.prompt_id
+        state.runPromptId = resp.prompt_id
+        if (state.stopFlag) await stopRun()
         const { images } = await waitImages(resp.prompt_id)
         r.images = images
         r.status = images.length ? 'done' : 'empty'
@@ -1227,14 +1239,30 @@ async function sendBatch() {
       state.message = `对比中 ${i + 1}/${list.length}`
     }
     const ok = state.results.filter((x) => x.images.length).length
-    if (!state.stopFlag) state.message = `对比完成 · ${ok}/${list.length} 张`
+    state.message = state.stopFlag
+      ? `已停止 · 完成 ${ok}/${list.length} 张`
+      : `对比完成 · ${ok}/${list.length} 张`
   } finally {
     state.comparing = false
   }
 }
 
-function stopBatch() {
+/** 停止：先掐掉 ComfyUI 里正在跑/还没跑的那个任务，再让本地轮询立刻退出 */
+async function stopRun() {
   state.stopFlag = true
+  state.message = '正在停止…'
+  try {
+    await interruptRun()
+  } catch {
+    /* 中断失败就只靠 stopFlag 收尾 */
+  }
+  if (state.runPromptId) {
+    try {
+      await deleteQueued([state.runPromptId])
+    } catch {
+      /* 已经在跑的任务删不掉，正常 */
+    }
+  }
 }
 
 async function waitResult(promptId) {
@@ -1246,6 +1274,10 @@ async function waitResult(promptId) {
   let tick = 0
   try {
     while (Date.now() - started < 15 * 60 * 1000) {
+      if (state.stopFlag) {
+        state.message = '已停止'
+        return { images: [], entry: null, stopped: true }
+      }
       const history = await fetchHistory(promptId)
       const entry = history[promptId]
       if (entry) {
@@ -1844,7 +1876,7 @@ onUnmounted(() => {
             >
               {{ state.comparing ? `对比中 ${state.progress.done}/${state.progress.total}` : `对比 ${variants.length} 组` }}
             </button>
-            <button v-if="state.comparing" @click="stopBatch">停止</button>
+            <button v-if="state.comparing || state.submitting" class="stop-btn" @click="stopRun">停止</button>
             <label class="check" style="margin: 0">
               <input v-model="state.randomSeed" type="checkbox" />
               <span>随机 seed</span>
@@ -2864,6 +2896,18 @@ button.danger:hover:not(:disabled) { background: var(--bad-hover); border-color:
   width: 58px;
   padding: 6px 4px 6px 8px;
   text-align: center;
+}
+
+/* 停止：跟发送按钮做出区分 */
+.stop-btn {
+  color: var(--bad);
+  background: var(--bad-soft);
+  border-color: var(--bad-line);
+}
+.stop-btn:hover:not(:disabled) {
+  color: #fff;
+  background: var(--bad);
+  border-color: var(--bad);
 }
 button.primary.sending {
   background: var(--warn);

@@ -42,6 +42,22 @@ export const apiPost = (path, body) =>
     body: JSON.stringify(body),
   })
 
+// 这类接口成功时返回空 body，不能按 JSON 解析
+async function postSilent(path, body = {}) {
+  const res = await fetch(base() + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+}
+
+/** 中断当前正在执行的任务 */
+export const interruptRun = () => postSilent('/interrupt')
+
+/** 从队列里删掉还没开始的任务 */
+export const deleteQueued = (ids) => postSilent('/queue', { delete: ids })
+
 /** 图片直链（走同一个前缀，dev 下由 vite 代理） */
 export function viewUrl(img) {
   const q = new URLSearchParams({
