@@ -91,6 +91,20 @@ try {
   })()`)
   await sleep(600)
 
+  // 可选：关掉「全部画完」
+  if (process.env.WAITALL === '0') {
+    const r = await evaluate(`(() => {
+      const lb = [...document.querySelectorAll('.send-row label.check')].find(l => l.textContent.includes('全部画完'))
+      if (!lb) return 'no checkbox'
+      const cb = lb.querySelector('input')
+      const before = cb.checked
+      if (before) cb.click()
+      return { before, after: cb.checked }
+    })()`)
+    console.log('全部画完开关:', JSON.stringify(r))
+    await sleep(400)
+  }
+
   // 可选：打开 ⚡ 一次出多张
   if (XY) {
     await evaluate(`(() => {
@@ -126,20 +140,27 @@ try {
   // 等结果
   let msg = ''
   const t0 = Date.now()
+  const timeline = []
+  let last = -1
   for (;;) {
-    await sleep(900)
+    await sleep(400)
     const snap = await evaluate(`({
       imgs: document.querySelectorAll('.images .shot img').length,
       msg: document.querySelector('.msg')?.innerText || '',
-      comparing: !!document.querySelector('.btn.sending'),
     })`)
     msg = snap.msg
-    if (snap.imgs >= 3 || /失败|停止|回退|完成/.test(msg)) break
+    if (snap.imgs !== last) {
+      timeline.push(`${((Date.now() - t0) / 1000).toFixed(1)}s -> ${snap.imgs} 张`)
+      last = snap.imgs
+    }
+    if (snap.imgs >= 3 && /完成/.test(msg)) break
+    if (/失败|停止|回退/.test(msg)) break
     if (Date.now() - t0 > 150000) {
       msg = '（超时）' + msg
       break
     }
   }
+  console.log('出图时间线:', timeline.join(' | '))
   console.log('结果:', JSON.stringify(await evaluate(`({
     imgs: document.querySelectorAll('.images .shot img').length,
     caps: [...document.querySelectorAll('.images figcaption')].map(x => x.textContent.replace(/\\s+/g,' ').trim()).slice(0, 6),

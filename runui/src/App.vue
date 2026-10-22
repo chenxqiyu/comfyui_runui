@@ -56,6 +56,8 @@ const state = reactive({
   // /object_info 缓存：{ class_type: { 字段: [候选值] } }
   nodeOptions: {},
   randomSeed: true,
+  // 一组提示词：等全部画完再一起出图（关掉则画一张显示一张）
+  waitAll: localStorage.getItem('runui.waitAll') !== '0',
   sendCount: 1,
   samplerId: '',
   samplerParams: {},
@@ -822,7 +824,7 @@ const multiDims = computed(() => {
 /** 对比按钮文案：文本多值时是「几组 × 每组几张」 */
 const batchBtnLabel = computed(() => {
   if (state.comparing) return `对比中 ${state.progress.done}/${state.progress.total}`
-  if (!xyUsable.value) return `对比 ${variants.value.length} 组`
+  if (!xyActive.value) return `对比 ${variants.value.length} 组`
   return `⚡ 一次出 ${xyCount.value} 张`
 })
 
@@ -871,6 +873,14 @@ const xyReady = computed(() => {
   return xyHasParams.value || xyPromptTexts.value.length > 1
 })
 const xyUsable = computed(() => state.xyMode && xyReady.value)
+/**
+ * 值得用 XY 的情况：有数值轴要多扫（组内 N 档）。
+ * 只有提示词多值时 XY 没有意义——ComfyUI 要等整轮跑完才一次性交出所有图，
+ * 反而看不到「画完一张显示一张」，所以那种情况直接走串行，逐张出。
+ */
+const xyWorth = computed(() => xyUsable.value && xyHasParams.value)
+/** 真的走一次请求：有数值轴要扫，且「全部画完」开着（关掉就逐张出） */
+const xyActive = computed(() => xyWorth.value && state.waitAll)
 /** 一次请求总共出几张 */
 const xyCount = computed(
   () =>
@@ -901,6 +911,10 @@ watch(
 watch(
   () => state.xyAxis,
   (v) => localStorage.setItem('runui.xyAxis', v || '')
+)
+watch(
+  () => state.waitAll,
+  (v) => localStorage.setItem('runui.waitAll', v ? '1' : '0')
 )
 
 
@@ -1390,8 +1404,8 @@ async function sendBatch() {
   const list = variants.value
   if (!list.length || !canSend.value) return
 
-  // 极速对比：能走 XY 就只发一次请求（文本多值按组串行），失败再回退串行
-  if (xyUsable.value) {
+  // 极速对比：数值轴要多扫时才用 XY；只有提示词多值时走串行，逐张出图
+  if (xyActive.value) {
     try {
       await runXy(list)
       return
@@ -1421,6 +1435,9 @@ async function sendBatch() {
 
   // 一批只抽一次种子：批内可比，点一次换一批
   const seedUsed = batchSeed()
+  // 「全部画完」开着时先把图攒着，跑完再一起贴出来；关掉就画一张贴一张
+  const waitAll = state.waitAll
+  const held = []
   try {
     for (let i = 0; i < list.length; i += 1) {
       if (state.stopFlag) {
@@ -1437,21 +1454,31 @@ async function sendBatch() {
         state.runPromptId = resp.prompt_id
         if (state.stopFlag) await stopRun()
         const { images } = await waitImages(resp.prompt_id)
-        r.images = images
-        r.status = images.length ? 'done' : 'empty'
+        if (waitAll) held.push({ r, images })
+        else {
+          r.images = images
+          r.status = images.length ? 'done' : 'empty'
+        }
       } catch (err) {
         r.status = 'error'
         r.error = err.message || String(err)
       }
       r.ms = Date.now() - started
       state.progress.done = i + 1
-      state.message = `对比中 ${i + 1}/${list.length}`
+      state.message = waitAll
+        ? `画第 ${i + 1}/${list.length} 组…（全部画完再一起出图）`
+        : `对比中 ${i + 1}/${list.length}`
+    }
+  } finally {
+    // 攒着的图一次性贴出来（中途停止也把已经画好的贴上，别白跑）
+    for (const { r, images } of held) {
+      r.images = images
+      r.status = images.length ? 'done' : 'empty'
     }
     const ok = state.results.filter((x) => x.images.length).length
     state.message = state.stopFlag
       ? `已停止 · 完成 ${ok}/${list.length} 张`
       : `对比完成 · ${ok}/${list.length} 张`
-  } finally {
     state.comparing = false
   }
 }
@@ -2287,6 +2314,15 @@ onUnmounted(() => {
               <input v-model="state.randomSeed" type="checkbox" />
               <span>随机 seed</span>
             </label>
+            <!-- 一组提示词：默认等全部画完再一起出图；关掉就画一张显示一张 -->
+            <label
+              class="check"
+              style="margin: 0"
+              title="开：这一批全部画完再一起出图；关：每画完一张就立刻显示"
+            >
+              <input v-model="state.waitAll" type="checkbox" />
+              <span>全部画完</span>
+            </label>
             <span class="hint" v-if="state.running && !state.comparing">执行中 · {{ state.elapsed }}s</span>
           </div>
 
@@ -2357,7 +2393,13 @@ onUnmounted(() => {
                 {{ Object.keys(XY_AXIS_LABEL).join(' / ') }}
                 里某一项点 + 加几个值，或在左边再加几个提示词
               </span>
-              <span v-if="xyUsable" class="xy-count">一次请求出 {{ xyCount }} 张</span>
+              <span v-if="xyActive" class="xy-count">一次请求出 {{ xyCount }} 张</span>
+              <span v-else-if="xyWorth" class="xy-count">
+                「全部画完」关着 · 一组一组画，逐张出图
+              </span>
+              <span v-else-if="xyUsable" class="xy-count">
+                没有数值轴要多扫 · 按提示词逐张出图
+              </span>
             </div>
             <p
               v-if="state.xyMode && xyPromptTexts.length > 1 && !xyPromptCheck.ok"
