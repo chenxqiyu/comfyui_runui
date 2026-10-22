@@ -56,8 +56,8 @@ const state = reactive({
   // /object_info 缓存：{ class_type: { 字段: [候选值] } }
   nodeOptions: {},
   randomSeed: true,
-  // 一组提示词：等全部画完再一起出图（关掉则画一张显示一张）
-  waitAll: localStorage.getItem('runui.waitAll') !== '0',
+  // 一组提示词：等全部画完再一起出图；默认关（画一张显示一张）
+  waitAll: localStorage.getItem('runui.waitAll') === '1',
   sendCount: 1,
   samplerId: '',
   samplerParams: {},
