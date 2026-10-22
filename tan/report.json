@@ -1,0 +1,80 @@
+{
+  "at": "2026-10-22T19:07:27.950Z",
+  "ckpt": "sd15\\chilloutmix_NiPrunedFp32Fix.safetensors",
+  "cfg": "1; 3; 7",
+  "steps": 6,
+  "results": [
+    {
+      "key": "efficiency-linear",
+      "label": "Efficiency · XY Input: CFG Scale（first→last 线性）",
+      "ok": true,
+      "requests": 1,
+      "ms": 2180,
+      "files": 3,
+      "singles": 3,
+      "grids": 0,
+      "historyImages": 4,
+      "detail": [
+        "tan_eff_linear_00001_.png (512x512)",
+        "tan_eff_linear_00002_.png (512x512)",
+        "tan_eff_linear_00003_.png (512x512)"
+      ]
+    },
+    {
+      "key": "efficiency-manual",
+      "label": "Efficiency · Manual XY Entry（任意值 1; 3; 7）",
+      "ok": true,
+      "requests": 1,
+      "ms": 4596,
+      "files": 3,
+      "singles": 3,
+      "grids": 0,
+      "historyImages": 4,
+      "detail": [
+        "tan_eff_manual_00001_.png (512x512)",
+        "tan_eff_manual_00002_.png (512x512)",
+        "tan_eff_manual_00003_.png (512x512)"
+      ]
+    },
+    {
+      "key": "easyuse",
+      "label": "Easy-Use · easy XYPlot（x_axis=preSampling: cfg）",
+      "ok": true,
+      "requests": 1,
+      "ms": 7032,
+      "files": 3,
+      "singles": 3,
+      "grids": 0,
+      "historyImages": 3,
+      "detail": [
+        "tan_easy_00001_.png (512x512)",
+        "tan_easy_00002_.png (512x512)",
+        "tan_easy_00003_.png (512x512)"
+      ]
+    },
+    {
+      "key": "ttn",
+      "label": "ttN · advanced xyPlot（x_plot 文本）",
+      "ok": true,
+      "requests": 1,
+      "ms": 40582,
+      "files": 4,
+      "singles": 3,
+      "grids": 1,
+      "historyImages": 1,
+      "detail": [
+        "tan_ttn_00001.png (512x512)",
+        "tan_ttn_00002.png (512x512)",
+        "tan_ttn_00003.png (512x512)",
+        "tan_ttn_00004.png (1536x608)"
+      ]
+    },
+    {
+      "key": "comfyroll",
+      "label": "ComfyRoll · CR XY List",
+      "ok": false,
+      "skipped": true,
+      "note": "CR XY 系列（CR XY List / CR XY Index / CR XY Save Grid Image）只负责「生成参数文本 + 拼网格」，没有自循环执行节点：CR XY List 按 index 取一组值，需要外部把 index 从 0 递增并重复提交才能出多张。所以它做不到「一次请求连续画」。"
+    }
+  ]
+}
