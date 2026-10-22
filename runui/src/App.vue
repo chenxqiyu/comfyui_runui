@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import JSZip from 'jszip'
 import LoraPanel from './components/LoraPanel.vue'
-import { XY_AXIS_LABEL, buildXyPrompt, canXySampler } from './xy'
+import { XY_AXIS_LABEL, buildXyPrompt, canXyPrompt, canXySampler } from './xy'
 import {
   apiGet,
   collectImages,
@@ -77,6 +77,8 @@ const state = reactive({
   // —— 极速对比（XY 单请求）——
   xyMode: localStorage.getItem('runui.xyMode') === '1',
   xyAxis: localStorage.getItem('runui.xyAxis') || '',
+  // 输入字段（提示词）的额外取值：第一个值用 textDrafts，这里存第 2 个起
+  promptExtra: [],
   packing: false,
   resultZoom: Number(localStorage.getItem('runui.resultZoom')) || 100,
   showResultImages: true,
@@ -372,6 +374,29 @@ const inValue = computed(() =>
 const promptKey = computed(() =>
   state.inId && state.inField ? `${state.inId}:${state.inField}` : ''
 )
+
+/** 提示词多值：第一个值就是主输入框，后面几个是「对比用」的额外值 */
+const textValues = computed(() => {
+  const all = [promptText.value.trim(), ...state.promptExtra.map((s) => String(s || '').trim())]
+  const used = all.filter(Boolean)
+  return used.length > 1 ? all.filter((v, i) => v || i === 0) : []
+})
+
+function addPromptExtra() {
+  // 主输入框空着就先把它填成当前节点原文，避免第一个值是空的
+  if (!promptText.value.trim() && inValue.value) promptText.value = String(inValue.value)
+  state.promptExtra = [...state.promptExtra, '']
+}
+
+function removePromptExtra(i) {
+  state.promptExtra = state.promptExtra.filter((_, idx) => idx !== i)
+}
+
+// 换节点 / 换字段：额外值清空，免得带到别的字段上去
+watch(promptKey, () => {
+  state.promptExtra = []
+})
+
 const promptText = computed({
   get: () => (promptKey.value ? state.textDrafts[promptKey.value] ?? '' : ''),
   set: (v) => {
@@ -565,6 +590,7 @@ function shortKey(key) {
     .replace('sampler_name', 'sampler')
     .replace('scheduler', 'sched')
     .replace('noise_seed', 'seed')
+    .replace('prompt', '提示词')
 }
 
 function statusLabel(status) {
@@ -714,6 +740,10 @@ const variants = computed(() => {
   }
 
   let combos = [{ ...base }]
+  // 输入字段（提示词）多值：文本维度只能串行——XY 的轴改不了文本。
+  // 用 unshift 把它排到最外层，结果区里同一个提示词的几张才会挨在一起
+  const texts = textValues.value
+  if (texts.length > 1) multi.unshift({ key: 'prompt', values: texts, isText: true })
   for (const m of multi) {
     const next = []
     for (const c of combos) {
@@ -726,7 +756,10 @@ const variants = computed(() => {
     index,
     params,
     // 只列出「这一维在变」的参数，用来在对图上做标注
-    changed: multi.map((m) => ({ key: m.key, value: params[m.key] })),
+    changed: multi.map((m) => ({
+      key: m.key,
+      value: m.isText ? `#${m.values.indexOf(params[m.key]) + 1}` : params[m.key],
+    })),
   }))
 })
 
@@ -741,6 +774,14 @@ const multiDims = computed(() => {
 })
 
 const canBatch = computed(() => canSend.value && variants.value.length > 1)
+
+/** 对比按钮文案：文本多值时是「几组 × 每组几张」 */
+const batchBtnLabel = computed(() => {
+  if (state.comparing) return `对比中 ${state.progress.done}/${state.progress.total}`
+  if (!xyUsable.value) return `对比 ${variants.value.length} 组`
+  return `⚡ 一次出 ${xyCount.value} 张`
+})
+
 
 /* ------------------ 极速对比：一次请求连续出 N 张（Efficiency XY） ------------------ */
 const xyCheck = computed(() => canXySampler(state.nodes, state.samplerId))
@@ -759,21 +800,42 @@ const xyValues = computed(() => {
   return valuesOf(xyAxisKey.value).filter((v) => v !== '' && v !== null && v !== undefined)
 })
 
-const xyUsable = computed(() => state.xyMode && xyCheck.value.ok && xyValues.value.length > 1)
-
 /** 除扫描轴之外还有多值的参数：XY 只扫一个维度，其它取第一个值 */
 const xyIgnored = computed(() => xyAxes.value.filter((a) => a.key !== xyAxisKey.value))
+
+/** 提示词多值时走 Prompt S/R 轴 */
+const xyPromptCheck = computed(() => canXyPrompt(state.nodes, state.samplerId))
+const xyPromptTexts = computed(() => (textValues.value.length > 1 ? textValues.value : []))
+const xyHasParams = computed(() => !!xyAxisKey.value && xyValues.value.length > 1)
+
+const xyReady = computed(() => {
+  if (!xyCheck.value.ok) return false
+  if (xyPromptTexts.value.length > 1 && !xyPromptCheck.value.ok) return false
+  return xyHasParams.value || xyPromptTexts.value.length > 1
+})
+const xyUsable = computed(() => state.xyMode && xyReady.value)
+/** 一次请求总共出几张 */
+const xyCount = computed(
+  () =>
+    (xyPromptTexts.value.length > 1 ? xyPromptTexts.value.length : 1) *
+    (xyHasParams.value ? xyValues.value.length : 1)
+)
 
 const xyTip = computed(() => {
   if (!xyCheck.value.ok) return xyCheck.value.reason
   if (!state.xyMode) {
-    return '打开后：提交时临时把采样节点换成 KSampler (Efficient) + XY Plot，一次请求连续画出 N 张（模型只加载一次）'
+    return '打开后：提交时临时改造工作流（KSampler → KSampler (Efficient) + XY Plot），一次请求连续画出多张'
   }
-  if (!xyAxes.value.length) {
-    return `当前没有可扫描的参数 · 支持 ${Object.keys(XY_AXIS_LABEL).join(' / ')} 填多值`
+  if (xyPromptTexts.value.length > 1 && !xyPromptCheck.value.ok) return xyPromptCheck.value.reason
+  if (!xyReady.value) {
+    return `给 ${Object.keys(XY_AXIS_LABEL).join(' / ')} 里某一项填多值，或再加几个提示词`
   }
-  return `一次请求扫 ${xyAxisKey.value} 的 ${xyValues.value.length} 个值`
+  const parts = []
+  if (xyPromptTexts.value.length > 1) parts.push(`提示词 ×${xyPromptTexts.value.length}`)
+  if (xyHasParams.value) parts.push(`${xyAxisKey.value} ×${xyValues.value.length}`)
+  return `一次请求出 ${xyCount.value} 张 · ${parts.join(' · ')}`
 })
+
 
 watch(
   () => state.xyMode,
@@ -1100,6 +1162,13 @@ function buildNodes(params, opts = {}) {
   if (!node) throw new Error(`节点 ${state.inId} 不存在于当前工作流`)
   // 留空的字段沿用当前值，所以只写「动过」的那些
   applyDrafts(nodes)
+  // 提示词多值时，这一组用哪个文本由 params.prompt 决定
+  if (params && typeof params.prompt === 'string' && promptKey.value) {
+    const [target, field] = draftTarget(nodes, promptKey.value)
+    if (target?.inputs && typeof target.inputs[field] === 'string') {
+      target.inputs[field] = params.prompt
+    }
+  }
 
   const sampler = nodes[state.samplerId]
   if (sampler?.inputs) {
@@ -1107,11 +1176,24 @@ function buildNodes(params, opts = {}) {
       if (key in sampler.inputs) sampler.inputs[key] = val
     }
   }
-  // 批量对比时必须固定 seed，否则差异里混着种子噪声，比不出东西
-  if (state.randomSeed && !opts.fixedSeed) randomizeSeeds(nodes)
+  // seed 策略：整批共用一个值（批内可比），勾了「随机 seed」时每次点发送换一个
+  if (typeof opts.seed === 'number') {
+    for (const n of Object.values(nodes)) {
+      for (const k of ['seed', 'noise_seed']) {
+        if (typeof n?.inputs?.[k] === 'number') n.inputs[k] = opts.seed
+      }
+    }
+  } else if (state.randomSeed && !opts.fixedSeed) {
+    randomizeSeeds(nodes)
+  }
   applyClipboardToggles(nodes)
   wrapListWidgets(nodes)
   return nodes
+}
+
+/** 一次发送共用同一个种子：勾了随机 seed 就新抽一个，否则沿用工作流里的值 */
+function batchSeed() {
+  return state.randomSeed ? Math.floor(Math.random() * 1e15) : null
 }
 
 /** 把草稿写回节点图：文本按字符串、数字/开关/下拉按原类型，空值跳过 */
@@ -1244,10 +1326,10 @@ async function sendBatch() {
   const list = variants.value
   if (!list.length || !canSend.value) return
 
-  // 极速对比：能走 XY 就只发一次请求，失败再回退串行
+  // 极速对比：能走 XY 就只发一次请求（文本多值按组串行），失败再回退串行
   if (xyUsable.value) {
     try {
-      await runXy()
+      await runXy(list)
       return
     } catch (err) {
       state.results = []
@@ -1271,8 +1353,10 @@ async function sendBatch() {
   state.stopFlag = false
   state.failed = false
   state.progress = { done: 0, total: list.length }
-  state.message = `开始对比：${list.length} 组（seed 固定，只变你勾的维度）`
+  state.message = `开始对比：${list.length} 组（批内 seed 相同，只变你勾的维度）`
 
+  // 一批只抽一次种子：批内可比，点一次换一批
+  const seedUsed = batchSeed()
   try {
     for (let i = 0; i < list.length; i += 1) {
       if (state.stopFlag) {
@@ -1283,7 +1367,7 @@ async function sendBatch() {
       r.status = 'running'
       const started = Date.now()
       try {
-        const nodes = buildNodes(r.params, { fixedSeed: true })
+        const nodes = buildNodes(r.params, { seed: seedUsed })
         const resp = await submitPrompt(nodes, state.extraData ? { extra_data: state.extraData } : {})
         r.promptId = resp.prompt_id
         state.runPromptId = resp.prompt_id
@@ -1309,39 +1393,65 @@ async function sendBatch() {
 }
 
 /**
- * 极速对比：改一份工作流副本（采样节点换成 KSampler (Efficient) + XY Plot），
- * 只提交一次，拿回来的 N 张图按扫描值顺序贴到 results 上。
+ * 极速对比：只发**一次**请求。
+ *   X 轴 = 提示词（多值时，靠 Prompt S/R + Efficient Loader）
+ *   Y 轴 = cfg / steps / denoise（多值时，靠 Manual XY Entry）
+ * 两个都多值就是 2D 网格，比如 3 个提示词 × 3 档 cfg = 9 张一次出。
  */
-async function runXy() {
-  const axis = xyAxisKey.value
-  const values = xyValues.value
-  if (!axis || values.length < 2) throw new Error('没有可扫描的参数')
-  const baseParams = variants.value[0]?.params || {}
+async function runXy(list) {
+  const plan = list.length ? list : variants.value
+  const hasPrompts = xyPromptTexts.value.length > 1
+  const hasParams = xyHasParams.value
+  if (!hasPrompts && !hasParams) throw new Error('没有可扫描的参数')
 
-  state.results = values.map((v, i) => ({
-    index: i,
-    params: { ...baseParams, [axis]: v },
-    changed: [{ key: axis, value: v }],
-    status: 'pending',
-    images: [],
-    error: '',
-    promptId: '',
-    ms: 0,
-  }))
+  // 出图顺序 = Efficiency 的循环顺序：Y（数值，外层）× X（提示词，内层）。
+  // results 必须按这个顺序排，图才和标签对得上（踩过：按笛卡尔积排会错位）。
+  const axis = hasParams ? xyAxisKey.value : ''
+  const yVals = hasParams ? xyValues.value : [null]
+  const xVals = hasPrompts ? xyPromptTexts.value : [null]
+  const order = []
+  for (const y of yVals) for (const x of xVals) order.push({ y, x })
+
+  state.results = order.map((o, i) => {
+    const params = {}
+    if (hasParams) params[axis] = o.y
+    if (hasPrompts) params.prompt = o.x
+    const changed = []
+    if (hasPrompts) changed.push({ key: 'prompt', value: `#${xVals.indexOf(o.x) + 1}` })
+    if (hasParams) changed.push({ key: axis, value: o.y })
+    return {
+      index: i,
+      params,
+      changed,
+      status: 'pending',
+      images: [],
+      error: '',
+      promptId: '',
+      ms: 0,
+    }
+  })
   state.comparing = true
   state.stopFlag = false
   state.failed = false
-  state.progress = { done: 0, total: values.length }
-  state.message = `⚡ 单请求：${axis} 扫 ${values.length} 档，等待出图…`
+  state.progress = { done: 0, total: order.length }
+  state.message = `⚡ 一次请求：${order.length} 张，等待出图…`
 
+  // 整批共用同一个种子；勾了「随机 seed」时每次点发送换一个（否则第二次点击会出一样的图）
+  const seedUsed = batchSeed()
   const started = Date.now()
   try {
-    // 先把提示词草稿 / 非扫描轴的单值写回节点图，再改造成 XY 版本
-    const nodes = buildNodes(baseParams)
+    // 基准参数取第一组，把「交给轴的维度」摘掉，剩下的照常写回节点图
+    const baseParams = { ...(plan[0]?.params || {}) }
+    if (hasParams) delete baseParams[axis]
+    if (hasPrompts) delete baseParams.prompt
+
+    const nodes = buildNodes(baseParams, { seed: seedUsed })
     const { prompt } = buildXyPrompt(nodes, {
       samplerId: state.samplerId,
       axis,
-      values,
+      values: xyValues.value,
+      promptNodeId: state.inId,
+      promptTexts: hasPrompts ? xyPromptTexts.value : [],
     })
     const resp = await submitPrompt(prompt, state.extraData ? { extra_data: state.extraData } : {})
     state.runPromptId = resp.prompt_id
@@ -1360,11 +1470,11 @@ async function runXy() {
     state.results.forEach((r) => {
       if (r.status === 'pending') r.status = 'empty'
     })
-    state.progress.done = images.length
+    state.progress.done = Math.min(images.length, order.length)
     state.message =
-      images.length === values.length
+      images.length === order.length
         ? `⚡ 一次请求完成 · ${images.length} 张 · ${(ms / 1000).toFixed(1)}s`
-        : `⚡ 一次请求完成 · 只拿到 ${images.length}/${values.length} 张 · ${(ms / 1000).toFixed(1)}s`
+        : `⚡ 一次请求完成 · 只拿到 ${images.length}/${order.length} 张 · ${(ms / 1000).toFixed(1)}s`
   } finally {
     state.comparing = false
   }
@@ -1999,6 +2109,29 @@ onUnmounted(() => {
               v-model="promptText"
               placeholder="输入要替换进去的提示词…"
             ></textarea>
+            <!-- 提示词多值：第 2 个起竖排，每个可单独编辑/删除 -->
+            <div
+              v-if="inFieldMeta.type === 'text' && state.promptExtra.length"
+              class="prompt-more"
+            >
+              <div v-for="(_, i) in state.promptExtra" :key="i" class="prompt-extra">
+                <textarea
+                  v-model="state.promptExtra[i]"
+                  :placeholder="`第 ${i + 2} 个提示词（对比用）`"
+                ></textarea>
+                <button class="prompt-del" title="删掉这个提示词" @click="removePromptExtra(i)">
+                  ×
+                </button>
+              </div>
+            </div>
+            <div v-if="inFieldMeta.type === 'text'" class="prompt-more-foot">
+              <button class="mini" @click="addPromptExtra">
+                ＋ {{ state.promptExtra.length ? '再加一个提示词' : '加一个提示词（对比用）' }}
+              </button>
+              <span v-if="textValues.length > 1" class="hint xy-warn" style="margin: 0">
+                {{ textValues.length }} 个提示词 · 每个跑一次请求
+              </span>
+            </div>
             <select v-else-if="inFieldMeta.type === 'enum'" v-model="fieldDraft">
               <option
                 v-if="fieldDraft && !inFieldMeta.options.includes(fieldDraft)"
@@ -2048,7 +2181,7 @@ onUnmounted(() => {
               :disabled="!canBatch || state.comparing"
               @click="sendBatch"
             >
-              {{ state.comparing ? `对比中 ${state.progress.done}/${state.progress.total}` : xyUsable ? `⚡ 一次出 ${xyValues.length} 张` : `对比 ${variants.length} 组` }}
+              {{ batchBtnLabel }}
             </button>
             <button v-if="state.comparing || state.submitting" class="stop-btn" @click="stopRun">停止</button>
             <label class="check" style="margin: 0">
@@ -2101,9 +2234,13 @@ onUnmounted(() => {
             </div>
           </div>
           <div class="card-body">
-            <!-- 极速对比：选一个扫描轴，一次请求连画 N 张 -->
+            <!-- 极速对比：X=提示词（可选）× Y=数值参数（可选），一次请求出整张网格 -->
             <div class="xy-bar" v-if="state.xyMode && xyCheck.ok">
               <span class="pkey mono">扫描轴</span>
+              <span v-if="xyPromptTexts.length > 1" class="xy-axis-tag on">
+                提示词 ×{{ xyPromptTexts.length }}
+              </span>
+              <span v-if="xyPromptTexts.length > 1 && xyAxes.length" class="xy-times">×</span>
               <div class="chips" v-if="xyAxes.length">
                 <button
                   v-for="a in xyAxes"
@@ -2116,13 +2253,19 @@ onUnmounted(() => {
                   {{ a.key }} · {{ a.n }}
                 </button>
               </div>
-              <span v-else class="hint">
-                还没有多值参数 —— 给
+              <span v-if="!xyPromptTexts.length && !xyAxes.length" class="hint">
+                还没有多值 —— 给
                 {{ Object.keys(XY_AXIS_LABEL).join(' / ') }}
-                里某一项点 + 加几个值
+                里某一项点 + 加几个值，或在左边再加几个提示词
               </span>
-              <span v-if="xyUsable" class="xy-count">一次请求出 {{ xyValues.length }} 张 · {{ (xyValues || []).join(' / ') }}</span>
+              <span v-if="xyUsable" class="xy-count">一次请求出 {{ xyCount }} 张</span>
             </div>
+            <p
+              v-if="state.xyMode && xyPromptTexts.length > 1 && !xyPromptCheck.ok"
+              class="hint xy-warn"
+            >
+              提示词多值走不了单请求：{{ xyPromptCheck.reason }}
+            </p>
             <p v-if="xyUsable && xyIgnored.length" class="hint xy-warn">
               其它多值参数（{{ xyIgnored.map((a) => a.key).join(' / ') }}）在 XY 模式下只会取第一个值
             </p>
@@ -2650,6 +2793,42 @@ onUnmounted(() => {
 }
 .xy-count { font-size: 10.5px; color: #a15c07; font-family: var(--mono); }
 .xy-warn { color: #a15c07; margin: 0 0 8px; }
+.xy-axis-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  font-size: 11px;
+  color: #a15c07;
+  background: #fdf1da;
+  border: 1px solid #e6c58a;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.xy-times { color: #a15c07; font-size: 11px; }
+
+/* —— 提示词多值 —— */
+.prompt-more { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.prompt-extra { display: flex; align-items: flex-start; gap: 6px; }
+.prompt-extra textarea { flex: 1 1 auto; min-height: 54px; }
+.prompt-del {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--ink-3);
+  background: var(--input);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.prompt-del:hover { color: var(--bad); border-color: var(--bad); }
+.prompt-more-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+
 
 .sampler-card > .card-body {
   flex: 1 1 0;

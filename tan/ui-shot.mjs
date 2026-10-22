@@ -96,7 +96,7 @@ try {
 
     const rowInfo = await evaluate(`(() => {
     const rows = [...document.querySelectorAll('.prow')]
-    const row = rows.find(r => (r.querySelector('.pkey')?.textContent || '').trim() === 'cfg')
+    const row = rows.find(r => /(^|\s)cfg(\s|$)/.test((r.querySelector('.pkey')?.textContent || '').trim()))
     if (!row) return { ok: false, keys: rows.map(r => (r.querySelector('.pkey')?.textContent||'').trim()) }
     return { ok: true, html: row.innerHTML.slice(0, 1500), buttons: [...row.querySelectorAll('button')].map(b => b.outerHTML.slice(0, 120)) }
   })()`)
@@ -108,7 +108,7 @@ try {
     // 点 cfg 行里的 + 两次
     const clicked = await evaluate(`(() => {
     const rows = [...document.querySelectorAll('.prow')]
-    const row = rows.find(r => (r.querySelector('.pkey')?.textContent || '').trim() === 'cfg')
+    const row = rows.find(r => /(^|\s)cfg(\s|$)/.test((r.querySelector('.pkey')?.textContent || '').trim()))
     if (!row) return 'no-row'
     const plus = [...row.querySelectorAll('button')].find(b => (b.textContent || '').includes('+'))
     if (!plus) return 'no-plus'
@@ -145,10 +145,40 @@ try {
     console.log('UI 状态:', JSON.stringify(state, null, 1))
 
     // --run：把 cfg 改成 7/3/1，点「⚡ 一次出 3 张」，等结果
-    if (process.argv.includes('--run')) {
+    // --multi：文本多值（3 个提示词）
+    if (process.argv.includes('--multi')) {
+      const TEXTS = [
+        'a cat sitting on a wooden table',
+        'a golden retriever puppy sitting on a wooden table',
+        'a red apple on a wooden table',
+      ]
+      const add = await evaluate(`(() => {
+      const btn = document.querySelector('.prompt-more-foot .mini')
+      if (!btn) return 'no-add-btn'
+      btn.click(); btn.click()
+      return 'ok'
+    })()`)
+      await sleep(400)
+      const filled = await evaluate(`(() => {
+      const texts = ${JSON.stringify(TEXTS)}
+      const main = document.querySelectorAll('.card .card-body textarea')[0]
+      const extras = [...document.querySelectorAll('.prompt-extra textarea')]
+      const all = [main, ...extras].filter(Boolean)
+      all.forEach((el, i) => {
+        if (texts[i] === undefined) return
+        el.value = texts[i]
+        el.dispatchEvent(new Event('input', { bubbles: true }))
+      })
+      return { n: all.length, values: all.map(e => e.value.slice(0, 26)) }
+    })()`)
+      console.log('加提示词:', add, '· 填值:', JSON.stringify(filled))
+      await sleep(400)
+    }
+
+    if (process.argv.includes('--run') || process.argv.includes('--multi')) {
         const set = await evaluate(`(() => {
       const rows = [...document.querySelectorAll('.prow')]
-      const row = rows.find(r => (r.querySelector('.pkey')?.textContent || '').trim() === 'cfg')
+      const row = rows.find(r => /(^|\s)cfg(\s|$)/.test((r.querySelector('.pkey')?.textContent || '').trim()))
       if (!row) return 'no-row'
       const inputs = [...row.querySelectorAll('input[type=number]')]
       const want = ['7', '3', '1']
@@ -179,10 +209,16 @@ try {
 
         const t0 = Date.now()
         let msg = ''
+        const EXPECT = Number(process.env.EXPECT || 0)
         for (; ;) {
             await sleep(800)
-            msg = await evaluate(`document.querySelector('.msg')?.innerText || ''`)
-            if (/一次请求完成|失败|停止|回退/.test(msg)) break
+            const snap = await evaluate(`({
+              shots: document.querySelectorAll('.images .shot img').length,
+              msg: document.querySelector('.msg')?.innerText || '',
+            })`)
+            msg = snap.msg
+            if (EXPECT && snap.shots >= EXPECT) break
+            if (/失败|停止|回退/.test(msg)) break
             if (Date.now() - t0 > 180000) {
                 msg = '（超时）' + msg
                 break
@@ -200,6 +236,8 @@ try {
         console.log('耗时:', ((Date.now() - t0) / 1000).toFixed(1), 's')
     }
 
+    await sleep(2500) // 等结果图加载完再截
+    await sleep(2500) // 等结果图加载完再截
     const shot = await send('Page.captureScreenshot', { format: 'png' })
     if (shot.result?.data) {
         await fs.writeFile(SHOT, Buffer.from(shot.result.data, 'base64'))
