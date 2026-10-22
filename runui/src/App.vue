@@ -2097,7 +2097,7 @@ onUnmounted(() => {
                   v-model.number="state.resultZoom"
                   type="range"
                   min="60"
-                  max="180"
+                  max="200"
                   step="10"
                   aria-label="缩放对比图"
                 />

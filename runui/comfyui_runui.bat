@@ -9,4 +9,3 @@ echo 正在启动 serve 预览服务器...
 start "pnpm-serve" cmd /k "pnpm run serve"
 
 echo 两个服务已在独立窗口中启动
-pause
