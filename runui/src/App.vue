@@ -53,6 +53,7 @@ const state = reactive({
   // /object_info 缓存：{ class_type: { 字段: [候选值] } }
   nodeOptions: {},
   randomSeed: true,
+  sendCount: 1,
   samplerId: '',
   samplerParams: {},
   samplerOptions: {},
@@ -1097,14 +1098,8 @@ async function send() {
     state.message = '先选好输入节点和写入字段'
     return
   }
-  let nodes
-  try {
-    // 单次只跑第一组参数
-    nodes = buildNodes(variants.value[0]?.params || {})
-  } catch (err) {
-    state.message = err.message
-    return
-  }
+  // 发送数量：同一套设置连着跑几遍（开随机 seed 时每遍都不一样）
+  const times = Math.max(1, Math.min(50, Math.round(Number(state.sendCount) || 1)))
 
   state.submitting = true
   state.running = false
@@ -1114,23 +1109,44 @@ async function send() {
   state.failed = false
   state.results = []
   state.message = '正在提交…'
+  const collected = []
+  let done = 0
+  let nodes = null
   try {
-    const resp = await submitPrompt(nodes, state.extraData ? { extra_data: state.extraData } : {})
-    state.runPromptId = resp.prompt_id
-    const warnings = parseNodeErrors(resp.node_errors, nodes, state.outId)
-    state.warnings = warnings
-    const blocking = warnings.filter((w) => w.blocking)
-    if (blocking.length) {
-      state.failed = true
-      state.message =
-        `已入队，但节点 ${blocking.map((w) => w.node).join(' / ')} 挡住了输出 ` +
-        `${state.outId} —— ComfyUI 会把该输出整个忽略，本次不会出图（日志里是 "Output will be ignored"）`
-    } else if (warnings.length) {
-      state.message = `已入队 · ${warnings.length} 条校验警告（不影响绑定输出）`
-    } else {
-      state.message = '已入队，等待执行…'
+    for (let i = 0; i < times; i += 1) {
+      // 每遍单独组图，随机 seed 才会重新抽
+      nodes = buildNodes(variants.value[0]?.params || {})
+      const resp = await submitPrompt(nodes, state.extraData ? { extra_data: state.extraData } : {})
+      state.runPromptId = resp.prompt_id
+      const warnings = parseNodeErrors(resp.node_errors, nodes, state.outId)
+      if (!i) state.warnings = warnings
+      const blocking = warnings.filter((w) => w.blocking)
+      if (blocking.length) {
+        state.failed = true
+        state.message =
+          `已入队，但节点 ${blocking.map((w) => w.node).join(' / ')} 挡住了输出 ` +
+          `${state.outId} —— ComfyUI 会把该输出整个忽略，本次不会出图（日志里是 "Output will be ignored"）`
+      } else if (warnings.length) {
+        state.message = `已入队 · ${warnings.length} 条校验警告（不影响绑定输出）`
+      } else {
+        state.message =
+          times > 1 ? `已入队（第 ${i + 1}/${times} 次），等待执行…` : '已入队，等待执行…'
+      }
+
+      const res = await waitResult(resp.prompt_id)
+      done = i + 1
+      if (res.images.length) {
+        collected.push(...res.images)
+        state.images = [...collected]
+      }
+      if (res.failed) break
+      if (times > 1 && res.images.length) {
+        state.message = `第 ${done}/${times} 次完成 · 累计 ${collected.length} 张图`
+      }
     }
-    await waitResult(resp.prompt_id)
+    if (times > 1 && !state.failed) {
+      state.message = `已发送 ${done} 次 · 共 ${collected.length} 张图`
+    }
   } catch (err) {
     state.failed = true
     state.message = err.message || String(err)
@@ -1144,7 +1160,7 @@ async function send() {
   }
 }
 
-/** 等一个 prompt 出图；返回 { images, entry }。被取消 / 失败 / 超时都抛错。 */
+/** 等一个 prompt 出图；返回 { images, entry, failed }（被取消 / 失败 / 超时返回 failed: true） */
 async function waitImages(promptId, timeoutMs = 15 * 60 * 1000) {
   const started = Date.now()
   let tick = 0
@@ -1235,10 +1251,9 @@ async function waitResult(promptId) {
       if (entry) {
         const images = collectImages(entry, state.outId)
         if (images.length) {
-          state.images = images
           state.entry = entry
           state.message = `完成 · 用时 ${Math.round((Date.now() - started) / 1000)} 秒 · ${images.length} 张图`
-          return
+          return { images, entry }
         }
         if (entry.status?.completed) {
           const outputs = entry.outputs || {}
@@ -1251,7 +1266,7 @@ async function waitResult(promptId) {
               '，右侧保留的是上一次的图'
             : '执行完成，但没有任何图片输出（右侧保留的是上一次的图）'
           state.entry = entry
-          return
+          return { images: [], entry }
         }
       }
 
@@ -1268,7 +1283,7 @@ async function waitResult(promptId) {
               st === 'cancelled'
                 ? `任务被取消（ComfyUI 里点了「取消当前任务」），共等待 ${Math.round((Date.now() - started) / 1000)} 秒`
                 : '任务执行失败，去 ComfyUI 控制台看报错'
-            return
+            return { images: [], entry: null, failed: true }
           }
         } catch {
           /* job 查不到就继续等 */
@@ -1279,6 +1294,7 @@ async function waitResult(promptId) {
     }
     state.failed = true
     state.message = '等待超时（15 分钟）'
+    return { images: [], entry: null, failed: true }
   } finally {
     clearInterval(timer)
     state.running = false
@@ -1543,8 +1559,15 @@ watch(
   () => {
     const lb = state.lightbox
     if (!lb || lb.source !== 'single' || !state.images.length) return
-    lb.items = state.images.map((img) => ({ img, tags: [], ms: 0, nodeId: img.nodeId }))
-    lb.index = 0
+    const items = state.images.map((img) => ({ img, tags: [], ms: 0, nodeId: img.nodeId }))
+    // 末尾追加（发送数量 > 1）就跳到第一张新的，整批替换则从第一张开始
+    const appended =
+      lb.items.length > 0 &&
+      lb.items.length < items.length &&
+      lb.items.every((it, i) => items[i]?.img === it.img)
+    const at = lb.items.length
+    lb.items = items
+    lb.index = appended ? at : 0
   }
 )
 
@@ -1802,6 +1825,17 @@ onUnmounted(() => {
             >
               {{ state.submitting ? '发送中…' : variants.length > 1 ? '发送第一组' : '发送到 ComfyUI' }}
             </button>
+            <label class="count-field" title="一次点发送连着跑几遍；开随机 seed 时每遍的种子不同">
+              <span>数量</span>
+              <input
+                v-model.number="state.sendCount"
+                type="number"
+                min="1"
+                max="50"
+                step="1"
+                :disabled="state.submitting || state.comparing"
+              />
+            </label>
             <button
               v-if="variants.length > 1"
               class="compare-btn"
@@ -2815,7 +2849,22 @@ button.danger:hover:not(:disabled) { background: var(--bad-hover); border-color:
 }
 .field-check span { color: var(--ink); }
 
-.send-row { display: flex; align-items: center; gap: 10px; }
+.send-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; row-gap: 8px; }
+
+/* 发送数量：紧贴发送按钮的小数字框 */
+.count-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.count-field input {
+  width: 58px;
+  padding: 6px 4px 6px 8px;
+  text-align: center;
+}
 button.primary.sending {
   background: var(--warn);
   border-color: var(--warn);
