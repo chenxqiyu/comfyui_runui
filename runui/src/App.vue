@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import JSZip from 'jszip'
 import LoraPanel from './components/LoraPanel.vue'
 import {
@@ -1351,6 +1351,49 @@ const resultItems = computed(() => state.results.filter((r) => r.images.length))
 /** 对比图网格的最小列宽：缩放百分比越大，单张图越大 */
 const shotMin = computed(() => `${Math.round(240 * (state.resultZoom / 100))}px`)
 
+/* ---------------- 单张图：适应可视区域 ----------------
+ * 结果区只有一张图时，网格切成单列、左上对齐，图片**永远不超出可视区域**：
+ *   缩放 100% = 刚好塞满可用高度/宽度里的较小者（完整可见，不滚动）
+ *   往下拖 = 按比例缩小；单张图时滑块上限就是 100%，再大也没意义
+ * 可用高度用 JS 量（clientHeight - 一行 figcaption），窗口变化时重算。
+ */
+const imagesEl = ref(null)
+const imgFitH = ref(0)
+
+const singleShot = computed(() => {
+  if (state.results.length) return state.results.length === 1
+  return state.images.length === 1
+})
+
+/** 单张图时缩放上限 100%：保证图不超出可见区域 */
+const zoomMax = computed(() => (singleShot.value ? 100 : 200))
+const zoomShown = computed(() => Math.min(state.resultZoom, zoomMax.value))
+
+const fitStyle = computed(() => ({
+  '--fit-h': imgFitH.value ? `${imgFitH.value}px` : '70vh',
+  '--zoom': String(zoomShown.value / 100),
+}))
+
+function measureImages() {
+  const el = imagesEl.value
+  if (!el) return
+  // 图片直接用满整个可视高度；底下那行文件名是浮层，不占图片尺寸
+  imgFitH.value = Math.max(140, Math.round(el.clientHeight))
+}
+
+watch(
+  [
+    () => state.images.length,
+    () => state.results.length,
+    () => state.showResultImages,
+    singleShot,
+  ],
+  async () => {
+    await nextTick()
+    measureImages()
+  }
+)
+
 watch(
   () => state.resultZoom,
   (v) => localStorage.setItem('runui.resultZoom', String(v))
@@ -1634,14 +1677,22 @@ function onLightboxKey(e) {
   }
 }
 
+/** 窗口尺寸变了，单张图的自适应高度要重算 */
+function onWindowResize() {
+  measureImages()
+}
+
 onMounted(() => {
   loadPresets()
   refreshAll()
   window.addEventListener('keydown', onLightboxKey)
+  window.addEventListener('resize', onWindowResize)
+  measureImages()
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onLightboxKey)
+  window.removeEventListener('resize', onWindowResize)
 })
 </script>
 
@@ -2102,16 +2153,16 @@ onUnmounted(() => {
                   {{ state.results.filter((r) => r.images.length).length }} / {{ state.results.length }}
                 </span>
               </span>
-              <label class="zoom-ctl" title="缩放对比图大小（点击图片仍可看大图）">
+              <label class="zoom-ctl" title="缩放对比图大小（单张图最大 100%，不超出可视区域；点击图片仍可看大图）">
                 <input
                   v-model.number="state.resultZoom"
                   type="range"
                   min="60"
-                  max="200"
+                  :max="zoomMax"
                   step="10"
                   aria-label="缩放对比图"
                 />
-                <span class="mono zoom-val">{{ state.resultZoom }}%</span>
+                <span class="mono zoom-val">{{ zoomShown }}%</span>
               </label>
               <button
                 class="mini"
@@ -2130,7 +2181,13 @@ onUnmounted(() => {
           <div class="card-body" :style="{ '--shot-min': shotMin }">
             <!-- 批量对比结果 -->
             <template v-if="state.showResultImages">
-              <div class="images" v-if="state.results.length">
+              <div
+                v-if="state.results.length"
+                ref="imagesEl"
+                class="images"
+                :class="{ single: singleShot }"
+                :style="fitStyle"
+              >
                 <figure
                   v-for="r in state.results"
                   :key="r.index"
@@ -2152,7 +2209,7 @@ onUnmounted(() => {
               </div>
 
               <!-- 单次结果 / 历史图 -->
-              <div class="images" v-else>
+              <div v-else ref="imagesEl" class="images" :class="{ single: singleShot }" :style="fitStyle">
                 <figure v-for="(img, i) in state.images" :key="i" class="shot">
                   <img :src="viewUrl(img)" :alt="img.filename" @click="openSingle(i)" />
                   <figcaption class="mono small">{{ img.nodeId }} · {{ img.filename }}</figcaption>
@@ -3025,4 +3082,56 @@ button.primary.sending {
 .shot { margin: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: var(--card); }
 .shot img { display: block; width: 100%; cursor: zoom-in; }
 .shot figcaption { padding: 6px 8px; color: var(--ink-3); border-top: 1px solid var(--line); }
+
+/* —— 只有一张图：单列、左上对齐、尺寸不超过可视区域 ——
+   --fit-h 是实测的可用高度（整块，不减文件名那行）；
+   底下那行文件名单做成浮层，不参与图片尺寸计算 */
+.images.single {
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: start;
+  align-items: start;
+  align-content: start;
+  overflow: hidden;
+  margin-top: 0;
+}
+.images.single > .shot {
+  position: relative;
+  width: fit-content;
+  max-width: 100%;
+  justify-self: start;
+}
+.images.single > .shot > img {
+  display: block;
+  height: calc(var(--fit-h, 70vh) * var(--zoom, 1));
+  width: auto;
+  max-width: 100%;
+  object-fit: contain;
+  object-position: left top;
+}
+/* 对比模式多一层 .thumb 包裹 */
+.images.single > .shot > .thumb {
+  width: fit-content;
+  max-width: 100%;
+  height: auto;
+  min-height: 0;
+  justify-content: flex-start;
+  align-items: flex-start;
+  background: transparent;
+}
+.images.single > .shot > .thumb > img {
+  display: block;
+  height: calc(var(--fit-h, 70vh) * var(--zoom, 1));
+  width: auto;
+  max-width: 100%;
+  object-fit: contain;
+  object-position: left top;
+}
+/* 文件名只占一行，别把高度撑出去 */
+.images.single > .shot > figcaption,
+.images.single > .shot > .thumb + figcaption {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 </style>

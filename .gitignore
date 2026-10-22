@@ -3,3 +3,6 @@ uitest/.cache/
 *.pyc
 runui/node_modules
 runui/dist
+runui/src/App.vue
+.cprof2
+.cprof3
