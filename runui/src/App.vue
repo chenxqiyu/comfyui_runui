@@ -65,6 +65,8 @@ const state = reactive({
   submitting: false,
   running: false,
   runPromptId: '',
+  // 本批已提交、还没收完的 prompt_id：停止时要把队列里剩下的都删掉
+  queuedIds: [],
   elapsed: 0,
   images: [],
   warnings: [],
@@ -824,7 +826,7 @@ const multiDims = computed(() => {
 /** 对比按钮文案：文本多值时是「几组 × 每组几张」 */
 const batchBtnLabel = computed(() => {
   if (state.comparing) return `对比中 ${state.progress.done}/${state.progress.total}`
-  if (!xyActive.value) return `对比 ${variants.value.length} 组`
+  if (!xyUsable.value) return `对比 ${variants.value.length} 组`
   return `⚡ 一次出 ${xyCount.value} 张`
 })
 
@@ -873,14 +875,6 @@ const xyReady = computed(() => {
   return xyHasParams.value || xyPromptTexts.value.length > 1
 })
 const xyUsable = computed(() => state.xyMode && xyReady.value)
-/**
- * 值得用 XY 的情况：有数值轴要多扫（组内 N 档）。
- * 只有提示词多值时 XY 没有意义——ComfyUI 要等整轮跑完才一次性交出所有图，
- * 反而看不到「画完一张显示一张」，所以那种情况直接走串行，逐张出。
- */
-const xyWorth = computed(() => xyUsable.value && xyHasParams.value)
-/** 真的走一次请求：有数值轴要扫，且「全部画完」开着（关掉就逐张出） */
-const xyActive = computed(() => xyWorth.value && state.waitAll)
 /** 一次请求总共出几张 */
 const xyCount = computed(
   () =>
@@ -1405,7 +1399,7 @@ async function sendBatch() {
   if (!list.length || !canSend.value) return
 
   // 极速对比：数值轴要多扫时才用 XY；只有提示词多值时走串行，逐张出图
-  if (xyActive.value) {
+  if (xyUsable.value) {
     try {
       await runXy(list)
       return
@@ -1439,21 +1433,39 @@ async function sendBatch() {
   const waitAll = state.waitAll
   const held = []
   try {
+    // 第一步：把整批一次性推进 ComfyUI 队列。
+    // 队列是接着往下执行的，中间不会像「跑一组→轮询等完→再提交下一组」那样空一拍
+    // （那种做法 GPU 曲线会一座山一座山地掉到 0，模型还可能被回收重载）。
+    const submitted = []
+    state.queuedIds = []
     for (let i = 0; i < list.length; i += 1) {
-      if (state.stopFlag) {
-        state.message = `已停止 · 完成 ${i}/${list.length}`
-        break
-      }
+      if (state.stopFlag) break
       const r = state.results[i]
       r.status = 'running'
-      const started = Date.now()
       try {
         const nodes = buildNodes(r.params, { seed: seedUsed })
         const resp = await submitPrompt(nodes, state.extraData ? { extra_data: state.extraData } : {})
         r.promptId = resp.prompt_id
         state.runPromptId = resp.prompt_id
-        if (state.stopFlag) await stopRun()
-        const { images } = await waitImages(resp.prompt_id)
+        state.queuedIds.push(resp.prompt_id)
+        submitted.push({ r, id: resp.prompt_id })
+      } catch (err) {
+        r.status = 'error'
+        r.error = err.message || String(err)
+      }
+    }
+    if (state.stopFlag) await stopRun()
+
+    // 第二步：按提交顺序收图，收到一张就贴一张（「全部画完」开着就先攒着）
+    for (let i = 0; i < submitted.length; i += 1) {
+      if (state.stopFlag) {
+        state.message = `已停止 · 完成 ${i}/${list.length}`
+        break
+      }
+      const { r, id } = submitted[i]
+      const started = Date.now()
+      try {
+        const { images } = await waitImages(id)
         if (waitAll) held.push({ r, images })
         else {
           r.images = images
@@ -1470,6 +1482,7 @@ async function sendBatch() {
         : `对比中 ${i + 1}/${list.length}`
     }
   } finally {
+    state.queuedIds = []
     // 攒着的图一次性贴出来（中途停止也把已经画好的贴上，别白跑）
     for (const { r, images } of held) {
       r.images = images
@@ -1580,13 +1593,20 @@ async function stopRun() {
   } catch {
     /* 中断失败就只靠 stopFlag 收尾 */
   }
-  if (state.runPromptId) {
+  // 整批都推进过队列，排队中的要一起删掉，不然停了之后还会继续画
+  const ids = state.queuedIds.length
+    ? [...state.queuedIds]
+    : state.runPromptId
+      ? [state.runPromptId]
+      : []
+  if (ids.length) {
     try {
-      await deleteQueued([state.runPromptId])
+      await deleteQueued(ids)
     } catch {
       /* 已经在跑的任务删不掉，正常 */
     }
   }
+  state.queuedIds = []
 }
 
 async function waitResult(promptId) {
@@ -2314,14 +2334,15 @@ onUnmounted(() => {
               <input v-model="state.randomSeed" type="checkbox" />
               <span>随机 seed</span>
             </label>
-            <!-- 一组提示词：默认等全部画完再一起出图；关掉就画一张显示一张 -->
+            <!-- 一组提示词：全部画完再一起出图；关掉就画一张显示一张 -->
             <label
               class="check"
               style="margin: 0"
-              title="开：这一批全部画完再一起出图；关：每画完一张就立刻显示"
+              title="开：这一批全部画完再一起出图（配合「⚡ 一次出多张」会合并成一次请求）；关：每画完一张就立刻显示"
             >
-              <input v-model="state.waitAll" type="checkbox" />
+              <input v-model="state.waitAll" type="checkbox" :disabled="xyUsable" />
               <span>全部画完</span>
+              <span v-if="xyUsable" class="hint" style="margin: 0">（⚡ 模式必然是全部画完）</span>
             </label>
             <span class="hint" v-if="state.running && !state.comparing">执行中 · {{ state.elapsed }}s</span>
           </div>
@@ -2393,13 +2414,7 @@ onUnmounted(() => {
                 {{ Object.keys(XY_AXIS_LABEL).join(' / ') }}
                 里某一项点 + 加几个值，或在左边再加几个提示词
               </span>
-              <span v-if="xyActive" class="xy-count">一次请求出 {{ xyCount }} 张</span>
-              <span v-else-if="xyWorth" class="xy-count">
-                「全部画完」关着 · 一组一组画，逐张出图
-              </span>
-              <span v-else-if="xyUsable" class="xy-count">
-                没有数值轴要多扫 · 按提示词逐张出图
-              </span>
+              <span v-if="xyUsable" class="xy-count">一次请求出 {{ xyCount }} 张</span>
             </div>
             <p
               v-if="state.xyMode && xyPromptTexts.length > 1 && !xyPromptCheck.ok"

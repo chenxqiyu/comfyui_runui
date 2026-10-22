@@ -81,6 +81,7 @@ try {
     if (ready === 'ready') break
   }
 
+  await sleep(3000) // 等工作流首次加载 + refreshAll 完事
   // 填 3 组
   await evaluate(`(() => {
     const ta = document.querySelector('.prompt-group textarea')
@@ -91,14 +92,15 @@ try {
   })()`)
   await sleep(600)
 
-  // 可选：关掉「全部画完」
-  if (process.env.WAITALL === '0') {
+  // 可选：切换「全部画完」（1=开 0=关）
+  if (process.env.WAITALL) {
     const r = await evaluate(`(() => {
       const lb = [...document.querySelectorAll('.send-row label.check')].find(l => l.textContent.includes('全部画完'))
       if (!lb) return 'no checkbox'
       const cb = lb.querySelector('input')
+      const want = ${JSON.stringify(process.env.WAITALL)} === '1'
       const before = cb.checked
-      if (before) cb.click()
+      if (before !== want) cb.click()
       return { before, after: cb.checked }
     })()`)
     console.log('全部画完开关:', JSON.stringify(r))
@@ -129,6 +131,17 @@ try {
     }
   })()`)
   console.log('发送前:', JSON.stringify(info, null, 1))
+  console.log('诊断:', JSON.stringify(await evaluate(`(() => ({
+    switchCls: document.querySelector('.xy-switch')?.className || null,
+    bar: document.querySelector('.xy-bar')?.innerText.replace(/\s+/g,' ').trim() || null,
+    warns: [...document.querySelectorAll('.xy-warn')].map(x => x.textContent.replace(/\s+/g,' ').trim()),
+    barExists: !!document.querySelector('.xy-bar'),
+    mainBtn: document.querySelector('.send-row .primary')?.textContent.trim(),
+    waitAllChecked: (() => {
+      const lb = [...document.querySelectorAll('.send-row label.check')].find(l => l.textContent.includes('全部画完'))
+      return lb ? lb.querySelector('input').checked : 'n/a'
+    })(),
+  }))()`), null, 1))
 
   // 点发送
   await evaluate(`(() => {
