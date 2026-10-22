@@ -75,6 +75,7 @@ const state = reactive({
   stopFlag: false,
   packing: false,
   resultZoom: Number(localStorage.getItem('runui.resultZoom')) || 100,
+  showResultImages: true,
   clipboardOff: {},
   // 禁用时记下原连线，刷新页面/跑过一轮后还能恢复
   clipboardLinks: (() => {
@@ -2110,6 +2111,10 @@ onUnmounted(() => {
               >
                 {{ state.packing ? '打包中…' : `⬇ 打包 ${downloadCount} 张` }}
               </button>
+              <label class="img-toggle" title="关闭后只留参数和状态，图片区收起">
+                <input v-model="state.showResultImages" type="checkbox" />
+                <span>显示图片</span>
+              </label>
             </div>
           </div>
           <div class="card-body" :style="{ '--shot-min': shotMin }">
@@ -2130,37 +2135,40 @@ onUnmounted(() => {
             </div>
 
             <!-- 批量对比结果 -->
-            <div class="images" v-if="state.results.length">
-              <figure
-                v-for="r in state.results"
-                :key="r.index"
-                class="shot cell"
-                :class="r.status"
-              >
-                <div class="thumb" @click="r.images[0] && openResult(r.index)">
-                  <img v-if="r.images[0]" :src="viewUrl(r.images[0])" :alt="String(r.index)" />
-                  <div v-else class="ph">{{ statusLabel(r.status) }}</div>
-                </div>
-                <figcaption>
-                  <span v-for="c in r.changed" :key="c.key" class="kv">
-                    <em>{{ shortKey(c.key) }}</em>{{ c.value }}
-                  </span>
-                  <span v-if="r.ms" class="ms">{{ (r.ms / 1000).toFixed(1) }}s</span>
-                  <span v-if="r.error" class="err">{{ r.error }}</span>
-                </figcaption>
-              </figure>
-            </div>
+            <template v-if="state.showResultImages">
+              <div class="images" v-if="state.results.length">
+                <figure
+                  v-for="r in state.results"
+                  :key="r.index"
+                  class="shot cell"
+                  :class="r.status"
+                >
+                  <div class="thumb" @click="r.images[0] && openResult(r.index)">
+                    <img v-if="r.images[0]" :src="viewUrl(r.images[0])" :alt="String(r.index)" />
+                    <div v-else class="ph">{{ statusLabel(r.status) }}</div>
+                  </div>
+                  <figcaption>
+                    <span v-for="c in r.changed" :key="c.key" class="kv">
+                      <em>{{ shortKey(c.key) }}</em>{{ c.value }}
+                    </span>
+                    <span v-if="r.ms" class="ms">{{ (r.ms / 1000).toFixed(1) }}s</span>
+                    <span v-if="r.error" class="err">{{ r.error }}</span>
+                  </figcaption>
+                </figure>
+              </div>
 
-            <!-- 单次结果 / 历史图 -->
-            <div class="images" v-else>
-              <figure v-for="(img, i) in state.images" :key="i" class="shot">
-                <img :src="viewUrl(img)" :alt="img.filename" @click="openSingle(i)" />
-                <figcaption class="mono small">{{ img.nodeId }} · {{ img.filename }}</figcaption>
-              </figure>
-              <p v-if="!state.images.length" class="hint empty">
-                还没有图片。提交后会显示绑定节点输出的图；给采样参数填多个值就能横向对比。
-              </p>
-            </div>
+              <!-- 单次结果 / 历史图 -->
+              <div class="images" v-else>
+                <figure v-for="(img, i) in state.images" :key="i" class="shot">
+                  <img :src="viewUrl(img)" :alt="img.filename" @click="openSingle(i)" />
+                  <figcaption class="mono small">{{ img.nodeId }} · {{ img.filename }}</figcaption>
+                </figure>
+                <p v-if="!state.images.length" class="hint empty">
+                  还没有图片。提交后会显示绑定节点输出的图；给采样参数填多个值就能横向对比。
+                </p>
+              </div>
+            </template>
+            <p v-else class="hint empty">图片已隐藏 · 右上角「显示图片」可以重新打开</p>
           </div>
       </section>
     </main>
@@ -2428,6 +2436,24 @@ onUnmounted(() => {
   cursor: pointer;
 }
 .zoom-val { width: 32px; text-align: right; font-size: 10.5px; color: var(--ink-2); }
+.img-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--ink-2);
+  cursor: pointer;
+  user-select: none;
+}
+.img-toggle input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  cursor: pointer;
+}
+.img-toggle span { white-space: nowrap; }
+.img-toggle:hover { color: var(--ink); }
 button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
 
 /* 参数收藏 */
