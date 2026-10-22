@@ -6,3 +6,6 @@ runui/dist
 runui/src/App.vue
 .cprof2
 .cprof3
+tan/.cprof-g
+.gitignore
+tan/.cprof-r/

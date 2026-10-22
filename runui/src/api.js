@@ -84,9 +84,22 @@ export function nodesFromHistoryEntry(entry) {
 }
 
 /**
+ * 判断一份 prompt 是不是「被 runui 改造过」的（极速对比会临时注入 XY 节点）。
+ * 改造版只存在于提交的 prompt 里，如果每次读历史都拿它当工作流，
+ * 下次再改造就会一层层叠加 XY Plot，越跑越乱 —— 所以要优先挑没改造过的那份。
+ */
+function looksInjected(nodes) {
+  return Object.values(nodes || {}).some((n) =>
+    /^XY Input: (Prompt S\/R|Manual XY Entry)$/.test(n.class_type || '')
+  )
+}
+
+/**
  * 找「当前工作流」：正在执行的优先，其次排队中的，最后退回到最近一次执行过的。
+ * 多个候选里优先选**没被 runui 改造过**的原版工作流。
  */
 export async function fetchCurrentWorkflow() {
+  const cands = []
   const queue = await apiGet('/queue')
   const running = queue.queue_running || []
   const pending = queue.queue_pending || []
@@ -97,7 +110,7 @@ export async function fetchCurrentWorkflow() {
   ]) {
     for (const item of list) {
       const got = nodesFromQueueItem(item)
-      if (got?.nodes) return { ...got, source: label }
+      if (got?.nodes) cands.push({ ...got, source: label })
     }
   }
 
@@ -107,16 +120,22 @@ export async function fetchCurrentWorkflow() {
     const history = await apiGet(`/history/${job.id}`)
     const entry = history[job.id]
     const got = nodesFromHistoryEntry(entry)
-    if (got?.nodes) return { ...got, source: `最近一次执行 · ${job.status}`, entry }
+    if (got?.nodes) cands.push({ ...got, source: `最近一次执行 · ${job.status}`, entry })
   }
 
-  const history = await apiGet('/history?max_items=10')
-  for (const pid of Object.keys(history)) {
-    const got = nodesFromHistoryEntry(history[pid])
-    if (got?.nodes) return { ...got, source: '历史记录', entry: history[pid] }
+  if (!cands.length) {
+    const history = await apiGet('/history?max_items=10')
+    for (const pid of Object.keys(history)) {
+      const got = nodesFromHistoryEntry(history[pid])
+      if (got?.nodes) cands.push({ ...got, source: '历史记录', entry: history[pid] })
+    }
   }
 
-  throw new Error('ComfyUI 里还没有任何执行记录，先在 ComfyUI 里跑一次工作流')
+  if (!cands.length) throw new Error('ComfyUI 里还没有任何执行记录，先在 ComfyUI 里跑一次工作流')
+
+  // 有原版就用原版：改造版的 XY 节点会一次比一次多，拿它当底稿会越改越乱
+  const clean = cands.find((c) => !looksInjected(c.nodes))
+  return clean || cands[0]
 }
 
 export const submitPrompt = (nodes, extra = {}) =>

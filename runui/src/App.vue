@@ -79,6 +79,14 @@ const state = reactive({
   xyAxis: localStorage.getItem('runui.xyAxis') || '',
   // 输入字段（提示词）的额外取值：第一个值用 textDrafts，这里存第 2 个起
   promptExtra: [],
+  // 「一组提示词」：一个框里粘多组，按 ; / 换行自动拆分。按字段 key 各存一份
+  promptGroups: (() => {
+    try {
+      return JSON.parse(localStorage.getItem('runui.promptGroups')) || {}
+    } catch {
+      return {}
+    }
+  })(),
   packing: false,
   resultZoom: Number(localStorage.getItem('runui.resultZoom')) || 100,
   showResultImages: true,
@@ -375,8 +383,46 @@ const promptKey = computed(() =>
   state.inId && state.inField ? `${state.inId}:${state.inField}` : ''
 )
 
-/** 提示词多值：第一个值就是主输入框，后面几个是「对比用」的额外值 */
+/** 「一组提示词」的原始文本：一个框里可能塞了好几组，按字段 key 各存一份 */
+const groupRaw = computed({
+  get: () => (promptKey.value ? state.promptGroups[promptKey.value] ?? '' : ''),
+  set: (v) => {
+    if (!promptKey.value) return
+    state.promptGroups = { ...state.promptGroups, [promptKey.value]: v }
+  },
+})
+
+/** 按 ; 或换行切组，空段丢掉 —— 纯自动，不需要手动拆 */
+function splitGroups(text) {
+  return String(text || '')
+    .split(/[;\r\n]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+const groupTexts = computed(() => splitGroups(groupRaw.value))
+/** 组框里只要识别到内容就自动接管，主输入框和「对比用」额外框都不再参与 */
+const groupActive = computed(() => groupTexts.value.length > 0)
+
+// 组内容比较长，按字段存进 localStorage，刷新页面不丢（只留最近 40 个有内容的字段）
+watch(
+  () => state.promptGroups,
+  (v) => {
+    try {
+      const keep = Object.entries(v || {})
+        .filter(([, s]) => String(s || '').trim())
+        .slice(-40)
+      localStorage.setItem('runui.promptGroups', JSON.stringify(Object.fromEntries(keep)))
+    } catch {
+      /* 配额满了就算了，不影响使用 */
+    }
+  },
+  { deep: true }
+)
+
+/** 提示词多值：组框优先；否则回落到 主输入框 + 额外框 */
 const textValues = computed(() => {
+  if (groupActive.value) return groupTexts.value.length > 1 ? groupTexts.value : []
   const all = [promptText.value.trim(), ...state.promptExtra.map((s) => String(s || '').trim())]
   const used = all.filter(Boolean)
   return used.length > 1 ? all.filter((v, i) => v || i === 0) : []
@@ -773,13 +819,24 @@ const multiDims = computed(() => {
   return out
 })
 
-const canBatch = computed(() => canSend.value && variants.value.length > 1)
-
 /** 对比按钮文案：文本多值时是「几组 × 每组几张」 */
 const batchBtnLabel = computed(() => {
   if (state.comparing) return `对比中 ${state.progress.done}/${state.progress.total}`
   if (!xyUsable.value) return `对比 ${variants.value.length} 组`
   return `⚡ 一次出 ${xyCount.value} 张`
+})
+
+/** 主按钮：有多个组合时直接全跑，只有一个时就是普通发送 */
+function primarySend() {
+  if (variants.value.length > 1) return sendBatch()
+  return send()
+}
+
+const primaryLabel = computed(() => {
+  if (state.submitting) return '发送中…'
+  if (state.comparing) return `对比中 ${state.progress.done}/${state.progress.total}`
+  if (variants.value.length > 1) return batchBtnLabel.value
+  return '发送到 ComfyUI'
 })
 
 
@@ -1162,6 +1219,13 @@ function buildNodes(params, opts = {}) {
   if (!node) throw new Error(`节点 ${state.inId} 不存在于当前工作流`)
   // 留空的字段沿用当前值，所以只写「动过」的那些
   applyDrafts(nodes)
+  // 「一组提示词」优先：第一组直接写进节点，其余交给 XY 轴 / 串行对比
+  if (groupActive.value && promptKey.value) {
+    const [target, field] = draftTarget(nodes, promptKey.value)
+    if (target?.inputs && typeof target.inputs[field] === 'string') {
+      target.inputs[field] = groupTexts.value[0]
+    }
+  }
   // 提示词多值时，这一组用哪个文本由 params.prompt 决定
   if (params && typeof params.prompt === 'string' && promptKey.value) {
     const [target, field] = draftTarget(nodes, promptKey.value)
@@ -2105,13 +2169,13 @@ onUnmounted(() => {
             <label class="label" style="margin-top: 12px">{{ fieldLabel(inFieldMeta) }}</label>
             <!-- 按字段类型换控件：文本 / 下拉 / 数字 / 开关 -->
             <textarea
-              v-if="inFieldMeta.type === 'text'"
+              v-if="inFieldMeta.type === 'text' && !groupActive"
               v-model="promptText"
               placeholder="输入要替换进去的提示词…"
             ></textarea>
-            <!-- 提示词多值：第 2 个起竖排，每个可单独编辑/删除 -->
+            <!-- 提示词多值：第 2 个起竖排，每个可单独编辑/删除（组框接管时停用） -->
             <div
-              v-if="inFieldMeta.type === 'text' && state.promptExtra.length"
+              v-if="inFieldMeta.type === 'text' && state.promptExtra.length && !groupActive"
               class="prompt-more"
             >
               <div v-for="(_, i) in state.promptExtra" :key="i" class="prompt-extra">
@@ -2125,14 +2189,47 @@ onUnmounted(() => {
               </div>
             </div>
             <div v-if="inFieldMeta.type === 'text'" class="prompt-more-foot">
-              <button class="mini" @click="addPromptExtra">
+              <button v-if="!groupActive" class="mini" @click="addPromptExtra">
                 ＋ {{ state.promptExtra.length ? '再加一个提示词' : '加一个提示词（对比用）' }}
               </button>
               <span v-if="textValues.length > 1" class="hint xy-warn" style="margin: 0">
-                {{ textValues.length }} 个提示词 · 每个跑一次请求
+                共 {{ textValues.length }} 个提示词
               </span>
             </div>
-            <select v-else-if="inFieldMeta.type === 'enum'" v-model="fieldDraft">
+            <!-- 一组提示词：常驻，粘进去就自动拆；不为空时自动接管，无需开关 -->
+            <div
+              v-if="inFieldMeta.type === 'text'"
+              class="prompt-group"
+              :class="{ off: !groupActive }"
+            >
+              <div class="pg-head">
+                <span class="pg-title">一组提示词</span>
+                <span class="hint">
+                  {{ groupActive ? '已生效 · 第 1 组就是主提示词' : '留空则用上面的单个提示词' }}
+                </span>
+              </div>
+              <textarea
+                v-model="groupRaw"
+                placeholder="每行一组，或用 ; 分隔：&#10;a cat, best quality;&#10;a dog, best quality;&#10;a red apple"
+              ></textarea>
+              <div class="pg-foot">
+                <span class="pg-count" :class="{ on: groupActive }">
+                  {{ groupActive ? `识别到 ${groupTexts.length} 组` : '还没识别到组' }}
+                </span>
+                <div class="pg-tags" v-if="groupActive">
+                  <span v-for="(g, i) in groupTexts" :key="i" class="pg-tag" :title="g">
+                    <em>{{ i + 1 }}</em>{{ g.length > 16 ? `${g.slice(0, 16)}…` : g }}
+                  </span>
+                </div>
+                <button v-if="groupRaw" class="mini" @click="groupRaw = ''">清空</button>
+              </div>
+              <p class="hint pg-tip">
+                分号 ; 和换行都算分组，组内逗号照常；只有 1 组时按普通单次跑
+              </p>
+            </div>
+            <!-- 注意：上面这些 v-if 是各自独立的，不能改成 v-else-if 链——
+                 主输入框在「一组提示词」生效时不渲染，链一断就会掉到最后的 else 分支 -->
+            <select v-if="inFieldMeta.type === 'enum'" v-model="fieldDraft">
               <option
                 v-if="fieldDraft && !inFieldMeta.options.includes(fieldDraft)"
                 :value="fieldDraft"
@@ -2142,14 +2239,14 @@ onUnmounted(() => {
               <option v-for="o in inFieldMeta.options" :key="o" :value="o">{{ o }}</option>
             </select>
             <input
-              v-else-if="inFieldMeta.type === 'number'"
+              v-if="inFieldMeta.type === 'number'"
               type="number"
               step="any"
               :value="fieldDraft"
               placeholder="留空则不改"
               @input="setFieldNumber"
             />
-            <label v-else class="check field-check">
+            <label v-if="inFieldMeta.type === 'bool'" class="check field-check">
               <input type="checkbox" v-model="fieldDraft" />
               <span>{{ fieldDraft ? '开' : '关' }}</span>
             </label>
@@ -2159,10 +2256,11 @@ onUnmounted(() => {
           <div class="send-row">
             <button
               class="primary"
-              :class="{ sending: state.submitting }"
-              @click="send"
+              :class="{ sending: state.submitting || state.comparing }"
+              :disabled="!canSend || state.comparing || state.submitting"
+              @click="primarySend"
             >
-              {{ state.submitting ? '发送中…' : variants.length > 1 ? '发送第一组' : '发送到 ComfyUI' }}
+              {{ primaryLabel }}
             </button>
             <label class="count-field" title="一次点发送连着跑几遍；开随机 seed 时每遍的种子不同">
               <span>数量</span>
@@ -2178,10 +2276,11 @@ onUnmounted(() => {
             <button
               v-if="variants.length > 1"
               class="compare-btn"
-              :disabled="!canBatch || state.comparing"
-              @click="sendBatch"
+              :disabled="!canSend || state.comparing || state.submitting"
+              title="只发第 1 组，先看看效果"
+              @click="send"
             >
-              {{ batchBtnLabel }}
+              只发第 1 组
             </button>
             <button v-if="state.comparing || state.submitting" class="stop-btn" @click="stopRun">停止</button>
             <label class="check" style="margin: 0">
@@ -2828,6 +2927,52 @@ onUnmounted(() => {
 }
 .prompt-del:hover { color: var(--bad); border-color: var(--bad); }
 .prompt-more-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+
+/* —— 一组提示词：常驻，识别到内容就自动生效（边框转实线 + 暖色） —— */
+.prompt-group {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px dashed var(--line-strong, var(--line));
+  border-radius: 8px;
+  background: var(--line-soft, rgba(0, 0, 0, .02));
+}
+.prompt-group:not(.off) {
+  border-style: solid;
+  border-color: var(--warn-line, var(--line-strong));
+}
+.prompt-group.off .pg-title { color: var(--ink-3); }
+.prompt-group textarea { min-height: 78px; }
+.pg-head { display: flex; align-items: baseline; gap: 6px; margin-bottom: 6px; }
+.pg-title { font-size: 11px; color: var(--ink-2); font-weight: 600; }
+.pg-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.pg-count {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink-3);
+  padding: 1px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  white-space: nowrap;
+}
+.pg-count.on {
+  color: var(--warn-ink, #a15c07);
+  border-color: var(--warn-line, #e8cf9b);
+  background: var(--warn-soft, #fdf6e6);
+}
+.pg-tags { display: flex; gap: 4px; flex-wrap: wrap; min-width: 0; }
+.pg-tag {
+  max-width: 148px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: var(--ink-2);
+  padding: 1px 6px;
+  border-radius: 5px;
+  background: var(--line, rgba(0, 0, 0, .06));
+}
+.pg-tag em { font-style: normal; font-family: var(--mono); opacity: .55; margin-right: 4px; }
+.pg-tip { margin: 6px 0 0; }
 
 
 .sampler-card > .card-body {
