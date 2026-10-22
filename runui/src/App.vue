@@ -1321,6 +1321,7 @@ async function send() {
     for (let i = 0; i < times; i += 1) {
       // 每遍单独组图，随机 seed 才会重新抽
       nodes = buildNodes(variants.value[0]?.params || {})
+      const t0 = Date.now()
       const resp = await submitPrompt(nodes, state.extraData ? { extra_data: state.extraData } : {})
       state.runPromptId = resp.prompt_id
       // 提交途中按了停止：把刚提交的这个也掐掉，别留在 ComfyUI 里跑
@@ -1343,7 +1344,10 @@ async function send() {
       const res = await waitResult(resp.prompt_id)
       done = i + 1
       if (res.images.length) {
-        collected.push(...res.images)
+        // 记一下这一批的耗时/完成时刻，单张图的说明里也要显示
+        const ms = Date.now() - t0
+        const at = Date.now()
+        collected.push(...res.images.map((img) => ({ ...img, ms, at })))
         state.images = [...collected]
       }
       if (res.stopped) {
@@ -1947,7 +1951,7 @@ function openResult(index) {
 
 function openSingle(index) {
   openLightbox(
-    state.images.map((img) => ({ img, tags: [], ms: 0, nodeId: img.nodeId })),
+    state.images.map((img) => ({ img, tags: [], ms: img.ms || 0, nodeId: img.nodeId })),
     index,
     'single'
   )
@@ -1978,7 +1982,7 @@ watch(
   () => {
     const lb = state.lightbox
     if (!lb || lb.source !== 'single' || !state.images.length) return
-    const items = state.images.map((img) => ({ img, tags: [], ms: 0, nodeId: img.nodeId }))
+    const items = state.images.map((img) => ({ img, tags: [], ms: img.ms || 0, nodeId: img.nodeId }))
     // 末尾追加（发送数量 > 1）就跳到第一张新的，整批替换则从第一张开始
     const appended =
       lb.items.length > 0 &&
@@ -2666,7 +2670,10 @@ onUnmounted(() => {
               <div v-else ref="imagesEl" class="images" :class="{ single: singleShot }" :style="fitStyle">
                 <figure v-for="(img, i) in state.images" :key="i" class="shot">
                   <img :src="viewUrl(img)" :alt="img.filename" @click="openSingle(i)" />
-                  <figcaption class="mono small">{{ img.nodeId }} · {{ img.filename }}</figcaption>
+                  <figcaption class="mono small">
+                    {{ img.nodeId }} · {{ img.filename }}
+                    <span v-if="img.ms" class="ms">{{ (img.ms / 1000).toFixed(1) }}s</span>
+                  </figcaption>
                 </figure>
                 <p v-if="!state.images.length" class="hint empty">
                   还没有图片。提交后会显示绑定节点输出的图；给采样参数填多个值就能横向对比。
