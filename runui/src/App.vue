@@ -2081,8 +2081,18 @@ onUnmounted(() => {
       </div>
 
       <section class="card col">
-          <div class="card-head">
-            <span>④ 对比结果</span>
+          <div class="card-head result-head">
+            <div class="head-left">
+              <span>④ 对比结果</span>
+              <!-- 输出节点绑定：不单独占一行，直接并进标题行 -->
+              <label
+                class="head-out"
+                title="输出节点 ID。也可以点左侧节点列表里的「出」按钮直接绑定"
+              >
+                <span class="mono">输出</span>
+                <input v-model="state.outId" class="mono" type="text" placeholder="例如 9" />
+              </label>
+            </div>
             <div class="head-actions">
               <span class="small">
                 <span v-if="state.comparing" class="mono">
@@ -2118,22 +2128,6 @@ onUnmounted(() => {
             </div>
           </div>
           <div class="card-body" :style="{ '--shot-min': shotMin }">
-            <div class="outline-row">
-              <span class="pkey mono">输出节点</span>
-              <input v-model="state.outId" class="mono" type="text" placeholder="例如 9" />
-              <div class="chips" v-if="outNodes.length">
-                <button
-                  v-for="n in outNodes.slice(0, 6)"
-                  :key="n.id"
-                  class="chip"
-                  :class="{ on: n.id === state.outId }"
-                  @click="state.outId = n.id"
-                >
-                  {{ n.id }} · {{ n.cls }}
-                </button>
-              </div>
-            </div>
-
             <!-- 批量对比结果 -->
             <template v-if="state.showResultImages">
               <div class="images" v-if="state.results.length">
@@ -2692,8 +2686,26 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
   white-space: nowrap;
 }
 
-.outline-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
-.outline-row > input { flex: 1 1 110px; min-width: 0; }
+/* ④ 对比结果：输出节点输入并进标题行，省掉一整行高度 */
+.result-head { flex-wrap: wrap; row-gap: 6px; }
+.head-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+.head-out {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--ink-3);
+  cursor: text;
+}
+.head-out > span { font-size: 11px; }
+.head-out > input {
+  width: 58px;
+  height: 22px;
+  padding: 0 6px;
+  font-size: 11.5px;
+  border-radius: 6px;
+}
 .shot.cell .thumb {
   position: relative;
   background: var(--panel-2);
