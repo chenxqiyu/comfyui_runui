@@ -1,5 +1,6 @@
 <script setup>
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { fastApply, fastJob, fastRestore, fastStatus, sleep } from '../api'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -64,6 +65,7 @@ const filters = computed(() => [
   { key: 'active', label: '已勾选', count: activeCount.value },
   { key: 'inactive', label: '未勾选', count: items.value.length - activeCount.value },
   { key: 'all', label: '全部', count: items.value.length },
+  { key: 'fast', label: '极速', count: fastCount.value },
 ])
 const visibleRows = computed(() =>
   items.value
@@ -71,6 +73,7 @@ const visibleRows = computed(() =>
     .filter(({ item }) => {
       if (filter.value === 'active') return isActive(item)
       if (filter.value === 'inactive') return !isActive(item)
+      if (filter.value === 'fast') return isFast(item)
       return true
     })
 )
@@ -78,6 +81,7 @@ const emptyText = computed(() => {
   if (!items.value.length) return '还没有 LoRA，用上面的输入框粘贴标签添加'
   if (filter.value === 'active') return '没有已勾选的 LoRA'
   if (filter.value === 'inactive') return '没有未勾选的 LoRA'
+  if (filter.value === 'fast') return '这个堆叠里还没有 LoRA 在极速目录'
   return '没有可编辑的 LoRA'
 })
 
@@ -195,6 +199,197 @@ function addFromText() {
   addError.value = ''
   filter.value = 'active'
 }
+
+/* ---------------------------------------------------------------- 极速模式
+ * 把已勾选的 LoRA 的实体文件搬到快盘（默认 F:\ai\fastlora），
+ * 原位置留一个软连接，ComfyUI 请求的路径不变 → 加载却走快盘。
+ * 搬过的东西记在 _fastlora-manifest.json，并生成一份离线一键还原 ps1。
+ */
+const fast = ref({
+  ready: false, // 本机服务（/api/fastlora）在不在
+  fastDir: '',
+  scriptFile: '',
+  keys: [], // 已在极速目录里的名字（小写，含「路径/名」和「名」两种键）
+  count: 0,
+  sizeTotal: 0,
+  err: '',
+})
+const fastKeys = computed(() => new Set(fast.value.keys || []))
+const job = ref(null)
+const busy = computed(() => job.value?.state === 'running')
+const askRestore = ref(false)
+
+/** 名字归一：去掉扩展名、反斜杠转正斜杠、小写 */
+function normName(name) {
+  return String(name || '')
+    .replace(/\\/g, '/')
+    .replace(/\.(safetensors|sft|pt|pth|ckpt|bin)$/i, '')
+    .trim()
+    .toLowerCase()
+}
+
+function isFast(item) {
+  const n = normName(readName(item))
+  if (!n) return false
+  return fastKeys.value.has(n)
+}
+
+function fastTip(item) {
+  if (!fast.value.ready) return '本机服务未启动，极速模式不可用'
+  if (isFast(item)) return `⚡ 已在极速目录：${fast.value.fastDir}\n原路径下是软连接，ComfyUI 照常能用`
+  return '这条 LoRA 还在原目录（慢盘）。打开极速模式会把已勾选的搬进快盘'
+}
+
+const fastCount = computed(() => items.value.filter(isFast).length)
+const fastOn = computed(() => fast.value.count > 0)
+/** 已勾选但还没进快盘的那些 */
+const pendingFastNames = computed(() =>
+  items.value
+    .filter((it) => isActive(it) && !isFast(it))
+    .map(readName)
+    .filter(Boolean)
+)
+
+const fastSub = computed(() => {
+  if (!fast.value.ready) return '本机服务不可用 · 用 npm run dev / serve 启动才有极速模式'
+  if (busy.value) {
+    const j = job.value
+    const verb = j.kind === 'restore' ? '还原' : '搬进快盘'
+    // 首次搬运前要先扫一遍 LoRA 目录（跟软链，慢盘上几秒），这时还没文件名，就把日志摊出来
+    if (!j.current) {
+      const last = j.log?.length ? j.log[j.log.length - 1].msg : ''
+      return last || `${verb}中…`
+    }
+    return `${verb}中 ${j.done}/${j.total || '?'} · ${j.current}`
+  }
+  if (job.value?.state === 'partial' && job.value.errors?.length) {
+    return `上次 ${job.value.failed} 个没成功 · ${job.value.errors[0]}`
+  }
+  if (fastOn.value) {
+    const mb = (fast.value.sizeTotal / 1073741824).toFixed(2)
+    return `${fast.value.count} 个在快盘 · ${mb} GB`
+  }
+  return '未使用 · 打开后把已勾选的 LoRA 搬进快盘'
+})
+
+const fastPct = computed(() => {
+  const j = job.value
+  if (!j || !j.total) return busy.value ? 8 : 0
+  return Math.min(100, Math.round((j.done / j.total) * 100))
+})
+
+async function refreshFast() {
+  try {
+    const d = await fastStatus()
+    fast.value = {
+      ready: true,
+      fastDir: d.fastDir || '',
+      scriptFile: d.scriptFile || '',
+      keys: Array.isArray(d.keys) ? d.keys : [],
+      count: Number(d.count || 0),
+      sizeTotal: Number(d.sizeTotal || 0),
+      err: '',
+    }
+  } catch (err) {
+    fast.value = { ...fast.value, ready: false, err: err?.message || String(err) }
+  }
+}
+
+let pollToken = 0
+
+/** 轮询后台任务进度，跑完刷新一次状态 */
+async function track(jobId) {
+  const token = ++pollToken
+  for (;;) {
+    let got
+    try {
+      got = await fastJob(jobId)
+    } catch (err) {
+      fast.value = { ...fast.value, err: err?.message || String(err) }
+      break
+    }
+    if (token !== pollToken) return
+    job.value = got.job
+    if (got.job.state !== 'running') break
+    await sleep(400)
+  }
+  await refreshFast()
+}
+
+async function applyFast(names) {
+  fast.value = { ...fast.value, err: '' }
+  try {
+    const res = await fastApply(names)
+    job.value = res.job
+    await track(res.job.id)
+  } catch (err) {
+    if (err.job) {
+      job.value = err.job
+      await track(err.job.id)
+    } else {
+      fast.value = { ...fast.value, err: err?.message || String(err) }
+    }
+  }
+}
+
+async function turnOnFast() {
+  const names = items.value.filter(isActive).map(readName).filter(Boolean)
+  if (!names.length) {
+    fast.value = { ...fast.value, err: '先把要加速的 LoRA 勾上，再打开极速模式' }
+    return
+  }
+  await applyFast(names)
+}
+
+/** 开关已经开着时，把新勾选、还没加速的追加进去 */
+async function doAppend() {
+  askRestore.value = false
+  const names = pendingFastNames.value
+  if (!names.length) return
+  await applyFast(names)
+}
+
+async function doRestore() {
+  askRestore.value = false
+  fast.value = { ...fast.value, err: '' }
+  try {
+    const res = await fastRestore([])
+    job.value = res.job
+    await track(res.job.id)
+  } catch (err) {
+    if (err.job) {
+      job.value = err.job
+      await track(err.job.id)
+    } else {
+      fast.value = { ...fast.value, err: err?.message || String(err) }
+    }
+  }
+}
+
+function onSwitch() {
+  if (busy.value || !fast.value.ready) return
+  if (fastOn.value) {
+    askRestore.value = true
+    return
+  }
+  turnOnFast()
+}
+
+function dismissFastErr() {
+  fast.value = { ...fast.value, err: '' }
+}
+
+onMounted(refreshFast)
+watch(
+  () => props.open,
+  (open) => {
+    if (open) refreshFast()
+  }
+)
+onBeforeUnmount(() => {
+  pollToken++
+})
+
 </script>
 
 <template>
@@ -217,6 +412,56 @@ function addFromText() {
           <button type="button" class="lp-close" title="收起面板" @click="emit('close')">×</button>
         </div>
       </header>
+
+      <!-- 极速模式：把已勾选的 LoRA 实体文件搬到快盘，原位置留软连接 -->
+      <div
+        class="lp-fastbar"
+        :class="{ on: fastOn, busy, off: !fast.ready }"
+        :title="fast.ready ? `快盘目录：${fast.fastDir}\n还原脚本：${fast.scriptFile}` : fastSub"
+      >
+        <span class="lp-fastbar-bolt" :class="{ on: fastOn }">⚡</span>
+        <div class="lp-fastbar-text">
+          <span class="lp-fastbar-title">极速模式</span>
+          <span class="lp-fastbar-sub">{{ fastSub }}</span>
+        </div>
+        <button
+          type="button"
+          class="lp-switch"
+          :class="{ on: fastOn, busy, disabled: !fast.ready || busy }"
+          :disabled="!fast.ready || busy"
+          :title="
+            !fast.ready
+              ? '本机服务未启动，极速模式不可用'
+              : fastOn
+                ? '关闭并把极速目录里的 LoRA 还原回原路径'
+                : `把当前已勾选的 ${activeCount} 个 LoRA 搬进 ${fast.fastDir}`
+          "
+          :aria-pressed="fastOn"
+          @click="onSwitch"
+        >
+          <i></i>
+        </button>
+      </div>
+      <div v-if="busy || job?.state === 'partial'" class="lp-progress" :class="{ bad: job?.state === 'partial' }">
+        <i :style="{ width: fastPct + '%' }"></i>
+      </div>
+
+      <div v-if="askRestore" class="lp-ask">
+        <span>
+          {{ fast.count }} 个在快盘<template v-if="pendingFastNames.length">
+            · 还能再搬 {{ pendingFastNames.length }} 个</template
+          >
+        </span>
+        <div class="lp-ask-actions">
+          <button v-if="pendingFastNames.length" type="button" @click="doAppend">搬新的</button>
+          <button type="button" class="danger" @click="doRestore">全部还原</button>
+          <button type="button" @click="askRestore = false">取消</button>
+        </div>
+      </div>
+
+      <p v-if="fast.err && fast.ready" class="lp-fast-err" @click="dismissFastErr">
+        {{ fast.err }}
+      </p>
 
       <div v-if="chains.length" class="lp-chains">
         <div v-for="chain in chains" :key="chain.ids.join('>')" class="lp-chain">
@@ -320,6 +565,13 @@ function addFromText() {
                   @change="setActive(i, $event.target.checked)"
                 />
               </label>
+              <span
+                class="lp-bolt"
+                :class="{ on: isFast(item) }"
+                :title="fastTip(item)"
+                @click.stop
+                >⚡</span
+              >
               <span class="lp-name" :title="readName(item)">{{ readName(item) || '（未命名）' }}</span>
               <div class="lp-step" @click.stop>
                 <button type="button" class="lp-arrow" title="减少 0.05" @click="nudgeStrength(i, -0.05)">
@@ -361,6 +613,9 @@ function addFromText() {
       <span class="fab-dot"></span>
       <span class="fab-label">LoRA 堆叠</span>
       <span v-if="nodes.length" class="fab-count">{{ nodes.length }}</span>
+      <span v-if="fast.count" class="fab-fast" :title="`${fast.count} 个 LoRA 已在极速目录 ${fast.fastDir}`">
+        ⚡{{ fast.count }}
+      </span>
       <span class="fab-caret">{{ open ? '▾' : '▴' }}</span>
     </button>
   </div>
@@ -384,7 +639,7 @@ function addFromText() {
 /* —— 面板：贴合截图里的节点外观 —— */
 .lp {
   width: 380px;
-  height: min(660px, calc(100vh - 120px));
+  height: min(700px, calc(100vh - 110px));
   display: flex;
   flex-direction: column;
   background: #383838;
@@ -445,6 +700,138 @@ function addFromText() {
   cursor: pointer;
 }
 .lp-close:hover { color: #f0f0f0; background: #3d3d3d; border-color: #4f4f4f; }
+
+/* —— 极速模式条 —— */
+.lp-fastbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  background: #2b2b2b;
+  border-bottom: 1px solid #1f1f1f;
+}
+.lp-fastbar.on { background: linear-gradient(#332f22, #2b2820); }
+.lp-fastbar.off { opacity: .72; }
+.lp-fastbar-bolt {
+  flex: 0 0 auto;
+  font-size: 13px;
+  line-height: 1;
+  color: #6a6a6a;
+  filter: grayscale(1);
+  opacity: .6;
+}
+.lp-fastbar-bolt.on {
+  color: #ffd24a;
+  filter: none;
+  opacity: 1;
+  text-shadow: 0 0 8px rgba(255, 210, 74, .8);
+}
+.lp-fastbar-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.3;
+  flex: 1 1 auto;
+}
+.lp-fastbar-title { font-size: 12px; color: #dedede; font-weight: 600; letter-spacing: .2px; }
+.lp-fastbar-sub {
+  font-size: 10px;
+  color: #8d8d8d;
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lp-fastbar.on .lp-fastbar-sub { color: #b9a97b; }
+
+/* 开关 */
+.lp-switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 20px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid #4d4d4d;
+  background: #1f1f1f;
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.lp-switch i {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #8a8a8a;
+  transition: transform .16s ease, background .15s;
+}
+.lp-switch:hover:not(.disabled) { border-color: #6c6c6c; }
+.lp-switch.on { background: #4a3f1e; border-color: #8a7330; }
+.lp-switch.on i { transform: translateX(18px); background: #ffd24a; box-shadow: 0 0 8px rgba(255, 210, 74, .75); }
+.lp-switch.disabled { opacity: .45; cursor: not-allowed; }
+.lp-switch.busy i { animation: lp-pulse .9s ease-in-out infinite; }
+@keyframes lp-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .35; }
+}
+
+/* 进度条 */
+.lp-progress {
+  flex: 0 0 auto;
+  height: 2px;
+  background: #232323;
+  overflow: hidden;
+}
+.lp-progress i {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #ffcf4a, #ffb020);
+  transition: width .3s ease;
+}
+.lp-progress.bad i { background: #c9564f; }
+
+/* 还原确认 */
+.lp-ask {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 12px;
+  font-size: 11px;
+  color: #e7cfa0;
+  background: #3a3222;
+  border-bottom: 1px solid #1f1f1f;
+}
+.lp-ask-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.lp-ask-actions button {
+  height: 21px;
+  padding: 0 8px;
+  font-size: 11px;
+  color: #d8d8d8;
+  background: #454545;
+  border: 1px solid #5c5c5c;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.lp-ask-actions button:hover { background: #525252; }
+.lp-ask-actions button.danger { color: #ffdede; background: #6d3a37; border-color: #8e4a46; }
+.lp-ask-actions button.danger:hover { background: #7d4340; }
+
+.lp-fast-err {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 6px 12px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: #f0b0ab;
+  background: #3a2725;
+  border-bottom: 1px solid #1f1f1f;
+  cursor: pointer;
+}
 
 /* —— 串联链路 —— */
 .lp-chains {
@@ -636,19 +1023,20 @@ function addFromText() {
 .lp-filter button {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
   height: 20px;
-  padding: 0 6px;
-  font-size: 10.5px;
+  padding: 0 5px;
+  font-size: 10px;
   color: #9a9a9a;
   background: transparent;
   border: none;
   border-radius: 5px;
   cursor: pointer;
+  white-space: nowrap;
 }
 .lp-filter button:hover { color: #dedede; background: #343434; }
 .lp-filter button.on { color: #d6e9fb; background: #3d5468; }
-.lp-filter-count { font-family: var(--mono); font-size: 9.5px; opacity: .85; }
+.lp-filter-count { font-family: var(--mono); font-size: 9px; opacity: .85; }
 .lp-rows-empty { padding: 18px 12px; text-align: center; font-size: 11px; color: #8a8a8a; }
 .lp-rows {
   flex: 1 1 auto;
@@ -673,6 +1061,24 @@ function addFromText() {
 .lp-row:last-child { border-bottom: none; }
 .lp-row:hover { background: #3b3b3b; }
 .lp-row.off .lp-name { color: #858585; }
+/* 极速目录里的行：点亮的闪电；否则灰掉 */
+.lp-bolt {
+  flex: 0 0 auto;
+  width: 13px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1;
+  color: #5c5c5c;
+  filter: grayscale(1);
+  opacity: .45;
+  cursor: help;
+}
+.lp-bolt.on {
+  color: #ffd24a;
+  filter: none;
+  opacity: 1;
+  text-shadow: 0 0 7px rgba(255, 210, 74, .75);
+}
 .lp-name {
   flex: 1 1 auto;
   min-width: 0;
@@ -802,6 +1208,16 @@ function addFromText() {
   font-family: var(--mono);
 }
 .fab-caret { color: #9a9a9a; font-size: 9px; line-height: 1; }
+.fab-fast {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #4a3f1e;
+  border: 1px solid #8a7330;
+  color: #ffd24a;
+  font-size: 10.5px;
+  font-weight: 600;
+  font-family: var(--mono);
+}
 
 @media (max-width: 640px) {
   .lora-dock { right: 10px; bottom: 10px; left: 10px; align-items: stretch; }

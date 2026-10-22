@@ -1,9 +1,31 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
+import { loraApi, ensureFastLoraFiles } from './tools/lora-speed.mjs'
+
+// 极速模式要在本机搬文件，dev 模式下由这个中间件提供 /api/fastlora/*
+function fastLoraApiPlugin() {
+  return {
+    name: 'runui-fastlora-api',
+    async buildStart() {
+      await ensureFastLoraFiles()
+    },
+    configureServer(server) {
+      ensureFastLoraFiles()
+      server.middlewares.use((req, res, next) => {
+        if (!req.url?.startsWith('/api/fastlora')) return next()
+        loraApi(req, res).catch((err) => {
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json; charset=utf-8')
+          res.end(JSON.stringify({ ok: false, error: String(err?.message || err) }))
+        })
+      })
+    },
+  }
+}
 
 export default defineConfig({
   base: './',
-  plugins: [vue()],
+  plugins: [vue(), fastLoraApiPlugin()],
   server: {
     host: '127.0.0.1',
     port: 5187,

@@ -138,3 +138,58 @@ export function collectImages(entry, outNodeId) {
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/* ------------------------------------------------------------ 极速模式（本机文件） */
+/**
+ * /api/fastlora/* 由 runui 自己的本机服务提供（vite 中间件 / tools/serve.mjs），
+ * 不走 ComfyUI 的 /comfy 前缀。相对 document.baseURI 解析，dist 放在子路径也能用。
+ */
+function fastUrl(path) {
+  try {
+    return new URL(`api/fastlora${path}`, document.baseURI).toString()
+  } catch {
+    return `/api/fastlora${path}`
+  }
+}
+
+async function fastRequest(path, options = {}) {
+  let res
+  try {
+    res = await fetch(fastUrl(path), { cache: 'no-store', ...options })
+  } catch {
+    throw new Error('本机服务没起来：极速模式要用 npm run dev 或 npm run serve 启动界面')
+  }
+  const type = res.headers.get('content-type') || ''
+  if (!type.includes('application/json')) {
+    throw new Error('本机服务没起来：极速模式要用 npm run dev 或 npm run serve 启动界面')
+  }
+  const data = await res.json().catch(() => null)
+  if (!res.ok || !data?.ok) {
+    const err = new Error(data?.error || `HTTP ${res.status}`)
+    if (data?.job) err.job = data.job
+    throw err
+  }
+  return data
+}
+
+/** 极速目录状态 + 已经在极速目录里的 LoRA 名字键 */
+export const fastStatus = () => fastRequest('/status')
+
+/** 把 LoRA 搬进极速目录（后台任务，返回 job 用于轮询） */
+export const fastApply = (names) =>
+  fastRequest('/apply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ names }),
+  })
+
+/** 还原：names 为空 = 还原全部 */
+export const fastRestore = (names = []) =>
+  fastRequest('/restore', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ names }),
+  })
+
+export const fastJob = (id) => fastRequest(`/job?id=${encodeURIComponent(id)}`)
+

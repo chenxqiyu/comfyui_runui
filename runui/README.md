@@ -49,6 +49,48 @@ set COMFY=http://127.0.0.1:8188 && npm run serve
 
 收藏存在 （key ），纯本地，不落服务端。应用收藏时是**以工作流原始参数为底再叠加**，所以收藏里缺哪个字段，那个字段就保持原值、控件不会消失。
 
+## LoRA 堆叠器 · 极速模式
+
+右下角「LoRA 堆叠」浮层除了改权重/勾选，还有一个 **极速模式** 开关（⚡）。背景是本机 `models/loras` 被软链到了慢盘：
+
+```
+F:\ai\fastai\models        -> I:\aidraw\ComfyUI-Nunchaku-ver\ComfyUI\models
+F:\ai\fastai\models\loras  -> I:\loras          ← LoRA 实体都在 I: 慢盘
+```
+
+打开开关会把**当前堆叠里已勾选**的 LoRA 实体文件搬到快盘 `F:\ai\fastlora`，再在原位置留一个软连接：
+
+```
+I:\loras\xxx\yyy.safetensors            软连接 -> F:\ai\fastlora\xxx\yyy.safetensors
+F:\ai\fastlora\xxx\yyy.safetensors      实体文件（保留子目录结构，避开同名冲突）
+F:\ai\fastlora\_fastlora-manifest.json  还原信息：原路径 / 现路径 / 大小 / 时间
+F:\ai\fastlora\还原-fastlora.ps1        离线一键还原脚本
+```
+
+ComfyUI 请求的路径没变（还是 `I:\loras\...`），真正读的却是快盘，所以首次加载明显快一截；已经在显存里的 LoRA 本来就不受影响。
+
+- 搬运是**后台任务**，浮层顶部有进度条和当前文件名，跑完自动刷新。
+- 列表每条 LoRA 前面有个 ⚡：**已在快盘的点亮成黄色**，没搬的还是灰的；`极速` 筛选只列已在快盘的；右下角按钮上也会挂一个 ⚡N。
+- 开关已经开着时再点，会给出「搬新的（把新勾选但还没加速的追加进去）」/「全部还原」/「取消」。
+- 关闭开关 = 把快盘里的东西全部搬回原路径（先删软连接，再移回实体文件），顺手清掉空目录。
+
+### 离线还原
+
+`F:\ai\fastlora\还原-fastlora.ps1` 不依赖 runui，双击即可（或 `powershell -ExecutionPolicy Bypass -File .\还原-fastlora.ps1`）：
+
+- 幂等：已经还原过的条目会跳过，重复跑没有副作用；
+- `-DryRun` 只列出会做什么；`-NoPause` 跑完不等按键（给计划任务用）；
+- 全部成功时把清单归档成 `_fastlora-manifest.restored-<时间>.json`；有失败就保留清单，修好再跑一次。
+
+### 配置 / 依赖
+
+- 环境变量：`FASTLORA_DIR`（默认 `F:\ai\fastlora`）、`LORA_ROOTS`（默认 `I:\loras`，多个用 `;` 分隔，会先 realpath 归一）。
+- **必须用 `npm run dev` 或 `npm run serve` 起界面**：搬文件是本机服务做的（`/api/fastlora/*`，dev 下由 vite 中间件提供，生产由 `tools/serve.mjs` 提供）。直接打开 `dist/index.html` 或换别的静态服务器，极速模式会显示「本机服务不可用」。
+- 建**软连接**在 Windows 上需要权限：管理员运行，或系统设置里打开「开发者模式」。没权限时任务会报错并把文件搬回原位，不会留下半截状态。
+- 改完 `vite.config.js` 要重启一次 `npm run dev`，新增的中间件才生效。
+- **改完 `tools/lora-speed.mjs` 也要重启 dev**：它是服务端代码，vite 的 HMR 只热更前端，不会重载它。
+- LoRA 名字一般只是文件名，所以第一次搬之前要扫一遍 `LORA_ROOTS` 建索引（跟软链目录走，慢盘上约 5 秒，浮层里会显示「正在扫描 LoRA 目录…」）。索引缓存 5 分钟。
+
 ## 提交时为什么要包 `__value__`
 
 ComfyUI 里**数组默认代表节点连接**（`[node_id, slot_index]`），所以「值本身是 list 的 widget」提交时必须包一层：
@@ -92,10 +134,12 @@ ComfyUI 有一层来源校验：请求的 `Host` 和 `Origin` 的 `host:port` �
 
 ```
 index.html
-vite.config.js        /comfy -> http://127.0.0.1:8189 代理
-src/api.js            读当前工作流 / 提交 / 轮询 / 收图
+vite.config.js        /comfy -> http://127.0.0.1:8189 代理；/api/fastlora 中间件
+src/api.js            读当前工作流 / 提交 / 轮询 / 收图；极速模式的接口封装
 src/App.vue           三栏界面
-tools/serve.mjs       静态托管 dist + 反向代理（生产用）
+src/components/LoraPanel.vue   LoRA 堆叠浮层（含极速模式开关 / ⚡ 标记）
+tools/serve.mjs       静态托管 dist + 反向代理 + /api/fastlora（生产用）
+tools/lora-speed.mjs  极速模式的本机文件服务：搬文件、建软连接、清单、还原 ps1
 ```
 
 ## 限制

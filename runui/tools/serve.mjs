@@ -4,12 +4,14 @@
  * 这样前端不需要 ComfyUI 开 CORS。
  *
  * 环境变量：PORT=5187  COMFY=http://127.0.0.1:8189
+ *           FASTLORA_DIR=F:\ai\fastlora  LORA_ROOTS=I:\loras
  */
 import { createServer, request as httpRequest } from 'node:http'
 import { createReadStream } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { extname, join, normalize, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { loraApi, ensureFastLoraFiles, fastLoraConfig } from './lora-speed.mjs'
 
 const DIST = fileURLToPath(new URL('../dist/', import.meta.url))
 const PORT = Number(process.env.PORT || 5187)
@@ -58,6 +60,7 @@ function proxy(req, res) {
 
 const server = createServer(async (req, res) => {
   try {
+    if (await loraApi(req, res)) return
     if (req.url.startsWith('/comfy/')) return proxy(req, res)
 
     const urlPath = decodeURIComponent(req.url.split('?')[0])
@@ -92,4 +95,7 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`RunUI:  http://127.0.0.1:${PORT}`)
   console.log(`Proxy:  /comfy  ->  ${COMFY.origin}`)
+  console.log(`FastLoRA: ${fastLoraConfig.FAST_DIR}`)
 })
+
+ensureFastLoraFiles()
