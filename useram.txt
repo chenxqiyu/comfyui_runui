@@ -1,0 +1,29 @@
+小模型是生效的，但切换的大头已经不在 T5 上了。日志对得上：T5 从 9.32GB 降到 2.97GB 后，单张从 26~34s 降到 ~20s；可三个权重变体每个仍然是 Requested to load FluxClipModel_（3.0GB）+ Requested to load Flux（11.35GB）。图上的每个锯齿，就是一次“整个模型卸下再装回”。
+
+为什么换了小模型还是慢
+这是 ComfyUI 的固定行为，跟显存够不够无关：
+
+每个不同的 LoRA 权重都会 load_lora_for_models → model.clone()（
+comfy/sd.py:107
+），clone 和原模型共享同一个 BaseModel，但对象不同
+load_models_gpu 在装载新 clone 时，会先把所有 is_clone 的旧模型 detach 到 CPU：
+model_management.py:984
+is_clone 判断的是 self.model is other.model：
+model_patcher.py:592
+，所以前一个权重变体必然被认成同一个模型的旧 clone
+detach 会把权重整体搬到 offload device：
+model_patcher.py:1298
+也就是说：即使 32GB 全空着，ComfyUI 也会先卸旧 clone、再装新 clone。CLIP 同理（CR Apply LoRA Stack 同时克隆 CLIP），所以 T5 每张也重载。
+
+现在每张 20s 的账
+T5 2.97GB ≈ 3.5s
+Flux 11.35GB ≈ 6.6s
+采样 + VAE + 其他 ≈ 8.7s
+换 T5 之前 T5 那步是 10.4s，所以省了 6~7s。剩下的切换时间基本由 realFascinationHyper 这个 11.35GB 的 UNET 体积决定——换小 T5 只砍掉了小头。
+
+想再快，按收益排序
+把权重循环放进一个 prompt 内：同一个 ModelPatcher 换 patch 连续采样多张，不产生 clone churn，切换接近零。这是唯一能真正“秒切”的路；Efficiency XY 也是重发 prompt，一样会触发卸载重载，救不了。现成节点没有的话需要做一个。
+换更小的 UNET：GGUF Q4/Q5 或 4bit（约 6~7GB），6.6s 会按体积降到 3~4s。T5 已经 3GB，再压收益很小。
+如果被测 LoRA 不含 CLIP 权重：把文本编码移出扫描——用基座 CLIP 编码一次，LoRA 只作用在 MODEL 上。这样 T5 不参与克隆，能再省 ~3.5s/张。
+--disable-dynamic-vram 不是这次锯齿的原因（clone 卸载是必发的），但去掉它值得试一次做对比。
+前端不是瓶颈：日志里三个变体在 09:39:48~09:39:50 两秒内就全部排进队列了，之后全是 ComfyUI 内部的装载开销。
