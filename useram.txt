@@ -1,3 +1,6 @@
+--disable-dynamic-vram
+
+
 查清了：文件本身没问题，是加载节点用错了。你这条工作流里的 CLIP 是走 DualCLIPLoaderGGUFMultiGPU 加载的，而 GGUF 加载器不认 ComfyUI 原生 NVFP4 的 comfy_quant 打包格式。
 
 报错链路
