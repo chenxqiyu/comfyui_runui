@@ -93,6 +93,16 @@ ComfyUI 请求的路径没变（还是 `I:\loras\...`），真正读的却是快
 - **改完 `tools/lora-speed.mjs` 也要重启 dev**：它是服务端代码，vite 的 HMR 只热更前端，不会重载它。
 - LoRA 名字一般只是文件名，所以第一次搬之前要扫一遍 `LORA_ROOTS` 建索引（跟软链目录走，慢盘上约 5 秒，浮层里会显示「正在扫描 LoRA 目录…」）。索引缓存 5 分钟。
 
+## LoRA 权重对比
+
+浮层里每条**已勾选**的 LoRA 右侧有个 **⇄** 按钮：点开后给它填多个权重，生成时每个权重各出一张。默认围绕当前值给 `-0.2 / 当前 / +0.2` 三档，也可以点「快速加 0.4 / 0.6 / 0.8 / 1.0」，或直接改 chip 里的数字、用 `＋` 再加一档。
+
+- 只影响**本次提交**：写入的是提交副本里 LoraManager 的 `strength` / `clipStrength`，堆叠里的原值不变；「收起」或删到只剩一个值就退出对比。
+- 可以和提示词组、cfg / steps / denoise 等维度叠加：组合数是各维度相乘，结果图标签直接写 `LoRA短名 0.60`。
+- 同一批仍共用一个 seed，权重差异不会被种子噪声盖掉。
+- **只能逐组提交**：Efficiency 的 XY 轴改不了 `CR Apply LoRA Stack` 这类堆叠节点，所以有权重对比时 ⚡ 一次请求暂不生效（界面会提示）；「全部画完」仍然会全部跑完再统一收图。
+- 停用某条 LoRA 会自动清掉它的权重对比；面板底部的「清除对比」清空所有项。
+
 ## 极速对比：一次请求出 N 张（Efficiency XY）
 
 默认的「对比 N 组」是**串行**：一组一提交，跑完再跑下一组。装了 Efficiency Nodes 之后，
@@ -235,7 +245,7 @@ vite.config.js        /comfy -> http://127.0.0.1:8189 代理；/api/fastlora 中
 src/xy.js             极速对比：把任意 KSampler 改造成 KSampler (Efficient) + XY Plot
 src/api.js            读当前工作流 / 提交 / 轮询 / 收图；极速模式的接口封装
 src/App.vue           三栏界面
-src/components/LoraPanel.vue   LoRA 堆叠浮层（含极速模式开关 / ⚡ 标记）
+src/components/LoraPanel.vue   LoRA 堆叠浮层（权重对比 / 极速模式 / ⚡ 标记）
 tools/serve.mjs       静态托管 dist + 反向代理 + /api/fastlora（生产用）
 tools/lora-speed.mjs  极速模式的本机文件服务：搬文件、建软连接、清单、还原 ps1
 ```

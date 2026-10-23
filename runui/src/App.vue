@@ -115,6 +115,8 @@ const state = reactive({
   showLora: localStorage.getItem('runui.loraOpen') === '1',
   loraId: localStorage.getItem('runui.loraNode') || '',
   loraBaseline: {},
+  // 权重对比：{ [节点id]: { [LoRA 在堆叠里的下标]: [权重1, 权重2, ...] } }
+  loraSweeps: {},
 })
 
 const currentTheme = computed(() => THEMES.find((t) => t.id === state.theme) || THEMES[0])
@@ -375,6 +377,60 @@ const loraChains = computed(() => {
     })
     .sort((a, b) => Number(b.chained) - Number(a.chained) || Number(b.connected) - Number(a.connected))
 })
+
+function readLoraName(item) {
+  if (item && typeof item === 'object') return String(item.name ?? item.lora ?? '')
+  return String(item ?? '')
+}
+
+/** 结果标签用的短名：去掉目录和扩展名，太长就截断 */
+function loraShortName(item) {
+  const name = readLoraName(item)
+    .replace(/\\/g, '/')
+    .split('/')
+    .pop()
+    .replace(/\.(safetensors|ckpt|pt|bin)$/i, '')
+  return name.length > 14 ? `${name.slice(0, 13)}…` : name
+}
+
+/**
+ * LoRA 权重对比维度：每条启用的 LoRA 可以填多个权重，
+ * 生成时和提示词 / 采样参数一起做笛卡尔积（逐组提交）。
+ * 只影响提交副本，不改工作流里堆叠的原值。
+ */
+const loraSweepDims = computed(() => {
+  const out = []
+  for (const stack of loraNodes.value) {
+    const byIndex = state.loraSweeps?.[stack.id]
+    if (!byIndex) continue
+    for (const [idx, raw] of Object.entries(byIndex)) {
+      const item = stack.loras[Number(idx)]
+      if (!item || !loraActive(item)) continue
+      const values = []
+      for (const v of Array.isArray(raw) ? raw : []) {
+        const n = Math.round(Number(v) * 100) / 100
+        if (Number.isFinite(n) && !values.includes(n)) values.push(n)
+      }
+      if (values.length < 2) continue
+      out.push({
+        key: `lora:${stack.id}:${idx}`,
+        nodeId: stack.id,
+        index: Number(idx),
+        label: loraShortName(item),
+        values,
+      })
+    }
+  }
+  return out
+})
+
+/** LoRA 权重对比总共几组（没有对比时是 1） */
+const loraSweepCombos = computed(() =>
+  loraSweepDims.value.reduce((n, d) => n * d.values.length, 1)
+)
+
+/** LoRA 权重只能逐组改值，XY 单请求的轴改不了堆叠节点 */
+const xyBlockedByLora = computed(() => loraSweepDims.value.length > 0)
 
 const inNode = computed(() => state.nodes?.[state.inId] || null)
 const inFieldsAll = computed(() => writableFields(inNode.value))
@@ -643,6 +699,11 @@ function shortKey(key) {
     .replace('prompt', '提示词')
 }
 
+/** 结果标签的文字：LoRA 权重对比用 LoRA 短名，其余用参数名 */
+function tagLabel(t) {
+  return t?.label || shortKey(t?.key || '')
+}
+
 function statusLabel(status) {
   return {
     pending: '等待',
@@ -777,7 +838,13 @@ function resetSamplerParams() {
 const variants = computed(() => {
   const fields = samplerFields.value
   if (!fields.length) return []
-  const multi = []
+  // LoRA 权重对比也是独立维度，放在提示词之后、采样参数之前
+  const multi = loraSweepDims.value.map((d) => ({
+    key: d.key,
+    values: d.values,
+    isLora: true,
+    label: d.label,
+  }))
   const base = {}
   for (const f of fields) {
     if (f.type === 'boolean') {
@@ -809,7 +876,12 @@ const variants = computed(() => {
     // 只列出「这一维在变」的参数，用来在对图上做标注
     changed: multi.map((m) => ({
       key: m.key,
-      value: m.isText ? `#${m.values.indexOf(params[m.key]) + 1}` : params[m.key],
+      value: m.isText
+        ? `#${m.values.indexOf(params[m.key]) + 1}`
+        : m.isLora
+          ? Number(params[m.key]).toFixed(2)
+          : params[m.key],
+      label: m.isLora ? m.label : '',
     })),
   }))
 })
@@ -879,7 +951,9 @@ const xyReady = computed(() => {
   return xyHasParams.value || xyPromptTexts.value.length > 1
 })
 /** 实际合并成一次请求：⚡ 开着，或「全部画完」要求合并（提示词组也一起扫） */
-const useXy = computed(() => xyReady.value && (state.xyMode || state.waitAll))
+const useXy = computed(
+  () => xyReady.value && !xyBlockedByLora.value && (state.xyMode || state.waitAll)
+)
 /**
  * 全部画完 + 提示词扫不了（如 UNETLoader 分离加载）：每组提示词各发一次 XY 请求，
  * 组内 cfg / steps / denoise 合并扫描，最后统一收图。
@@ -887,6 +961,7 @@ const useXy = computed(() => xyReady.value && (state.xyMode || state.waitAll))
 const xyPerPrompt = computed(
   () =>
     state.waitAll &&
+    !xyBlockedByLora.value &&
     xyCheck.value.ok &&
     xyPromptTexts.value.length > 1 &&
     !xyPromptCheck.value.ok &&
@@ -901,6 +976,9 @@ const xyCount = computed(
 
 const xyTip = computed(() => {
   if (!xyCheck.value.ok) return xyCheck.value.reason
+  if (xyBlockedByLora.value) {
+    return `有 ${loraSweepDims.value.length} 项 LoRA 权重对比：只能逐组提交，⚡ 一次请求本次不生效`
+  }
   if (!state.xyMode && !state.waitAll) {
     return '打开后：提交时临时改造工作流（KSampler → KSampler (Efficient) + XY Plot），一次请求连续画出多张'
   }
@@ -1111,6 +1189,7 @@ function applyPicked(picked) {
   const stacks = loraNodes.value
   if (!stacks.some((n) => n.id === state.loraId)) state.loraId = stacks[0]?.id || ''
   state.loraBaseline = {}
+  state.loraSweeps = {}
   for (const n of stacks) {
     state.loraBaseline[n.id] = JSON.parse(
       JSON.stringify(loraList(state.nodes[n.id].inputs.loras) || [])
@@ -1185,12 +1264,59 @@ function updateLoras(list) {
   const cur = node.inputs.loras
   node.inputs.loras =
     cur && !Array.isArray(cur) && Array.isArray(cur.__value__) ? { ...cur, __value__: next } : next
+  // 被停用的 LoRA 不再参与权重对比，顺手把它的扫描值清掉
+  pruneLoraSweeps(state.loraId, next)
+}
+
+/** 去掉这个节点上已停用 / 已不存在的 LoRA 的对比值 */
+function pruneLoraSweeps(nodeId, list) {
+  const map = state.loraSweeps?.[nodeId]
+  if (!map) return
+  const next = { ...map }
+  let changed = false
+  for (const key of Object.keys(next)) {
+    const item = list[Number(key)]
+    if (item && loraActive(item)) continue
+    delete next[key]
+    changed = true
+  }
+  if (!changed) return
+  const all = { ...state.loraSweeps }
+  if (Object.keys(next).length) all[nodeId] = next
+  else delete all[nodeId]
+  state.loraSweeps = all
+}
+
+/** 面板里改某条 LoRA 的对比权重：≥2 个值才生效，删到 1 个就退出对比 */
+function setLoraSweep({ nodeId, index, values }) {
+  if (!nodeId) return
+  const clean = []
+  for (const v of Array.isArray(values) ? values : []) {
+    const n = Math.round(Number(v) * 100) / 100
+    if (Number.isFinite(n) && !clean.includes(n)) clean.push(n)
+  }
+  const map = { ...(state.loraSweeps[nodeId] || {}) }
+  if (clean.length >= 2) map[index] = clean
+  else delete map[index]
+  const all = { ...state.loraSweeps }
+  if (Object.keys(map).length) all[nodeId] = map
+  else delete all[nodeId]
+  state.loraSweeps = all
+}
+
+function clearLoraSweeps() {
+  state.loraSweeps = {}
 }
 
 function resetLoras() {
   const base = state.loraBaseline?.[state.loraId]
   if (!Array.isArray(base)) return
   updateLoras(JSON.parse(JSON.stringify(base)))
+  if (state.loraSweeps[state.loraId]) {
+    const all = { ...state.loraSweeps }
+    delete all[state.loraId]
+    state.loraSweeps = all
+  }
 }
 
 function applyPrefix() {
@@ -1238,6 +1364,25 @@ function applyClipboardToggles(nodes) {
   }
 }
 
+/**
+ * 把这一组的 LoRA 权重写进提交副本（只改 loras 数组里的值，不增删节点）。
+ * LoraManager 执行时读 strength / clipStrength，面板只有一个权重，两个一起写。
+ */
+function applyLoraWeights(nodes, params) {
+  for (const [key, val] of Object.entries(params || {})) {
+    const m = /^lora:(\d+):(\d+)$/.exec(key)
+    if (!m) continue
+    const weight = Number(val)
+    if (!Number.isFinite(weight)) continue
+    const raw = nodes[m[1]]?.inputs?.loras
+    const list = Array.isArray(raw) ? raw : raw?.__value__
+    const item = Array.isArray(list) ? list[Number(m[2])] : null
+    if (!item || typeof item !== 'object') continue
+    item.strength = weight
+    if ('clipStrength' in item) item.clipStrength = weight
+  }
+}
+
 /** 组一份可提交的节点图：写提示词 + 这一组采样参数 */
 function buildNodes(params, opts = {}) {
   const nodes = JSON.parse(JSON.stringify(state.nodes))
@@ -1266,6 +1411,7 @@ function buildNodes(params, opts = {}) {
       if (key in sampler.inputs) sampler.inputs[key] = val
     }
   }
+  applyLoraWeights(nodes, params)
   // seed 策略：整批共用一个值（批内可比），勾了「随机 seed」时每次点发送换一个
   if (typeof opts.seed === 'number') {
     for (const n of Object.values(nodes)) {
@@ -1487,7 +1633,9 @@ async function sendBatch() {
   // 全部画完但合并不了：先只记「这组跑完了」，图留到最后一次性收
   const finished = []
   state.message = waitAll
-    ? `全部画完 · 合并不了，${list.length} 组逐组发送（最后统一出图）`
+    ? loraSweepDims.value.length
+      ? `全部画完 · LoRA 权重对比 ${list.length} 组逐组发送（最后统一出图）`
+      : `全部画完 · 合并不了，${list.length} 组逐组发送（最后统一出图）`
     : `开始对比：${list.length} 组（批内 seed 相同，只变你勾的维度）`
   try {
     // 第一步：把整批一次性推进 ComfyUI 队列。
@@ -2094,7 +2242,7 @@ async function downloadAll() {
     const folder = zip.folder('comfy-runui')
     for (let i = 0; i < items.length; i += 1) {
       const { img, tags } = items[i]
-      const label = (tags || []).map((t) => `${shortKey(t.key)}=${t.value}`).join('_')
+      const label = (tags || []).map((t) => `${tagLabel(t)}=${t.value}`).join('_')
       const name = `${String(i + 1).padStart(2, '0')}${label ? `_${safeName(label)}` : ''}.png`
       const blob = await fetch(viewUrl(img)).then((r) => r.blob())
       folder.file(name, blob)
@@ -2584,10 +2732,14 @@ onUnmounted(() => {
             <div class="head-actions">
               <label
                 class="xy-switch"
-                :class="{ on: state.xyMode, off: !xyCheck.ok }"
+                :class="{ on: state.xyMode && !xyBlockedByLora, off: !xyCheck.ok || xyBlockedByLora }"
                 :title="xyTip"
               >
-                <input v-model="state.xyMode" type="checkbox" :disabled="!xyCheck.ok" />
+                <input
+                  v-model="state.xyMode"
+                  type="checkbox"
+                  :disabled="!xyCheck.ok || xyBlockedByLora"
+                />
                 <span>⚡ 一次出多张</span>
               </label>
               <span class="tag" v-if="samplerFields.length">{{ samplerFields.length }} 项</span>
@@ -2598,7 +2750,10 @@ onUnmounted(() => {
           </div>
           <div class="card-body">
             <!-- 极速对比：X=提示词（可选）× Y=数值参数（可选），一次请求出整张网格 -->
-            <div class="xy-bar" v-if="(state.xyMode || state.waitAll) && xyCheck.ok">
+            <div
+              class="xy-bar"
+              v-if="(state.xyMode || state.waitAll) && xyCheck.ok && !xyBlockedByLora"
+            >
               <span class="pkey mono">扫描轴</span>
               <span v-if="xyPromptTexts.length > 1" class="xy-axis-tag on">
                 提示词 ×{{ xyPromptTexts.length }}
@@ -2629,7 +2784,13 @@ onUnmounted(() => {
                 每组提示词一次请求 · 共 {{ xyPromptTexts.length * xyValues.length }} 张 · 最后统一出图
               </span>
             </div>
-            <p v-if="xyPerPrompt" class="hint xy-warn">
+            <p v-if="xyBlockedByLora" class="hint xy-warn">
+              有 {{ loraSweepDims.length }} 项 LoRA 权重对比：本次逐组提交，⚡ 合并暂不生效<template
+                v-if="state.waitAll"
+                >（「全部画完」仍会最后统一收图）</template
+              >。
+            </p>
+            <p v-else-if="xyPerPrompt" class="hint xy-warn">
               提示词扫不了（{{ xyPromptCheck.reason }}）：改为每组提示词各发一次请求，
               组内 {{ xyAxisKey }} 的 {{ xyValues.length }} 档合并，全部跑完再统一出图。
             </p>
@@ -2783,10 +2944,21 @@ onUnmounted(() => {
               {{ state.samplerId ? '该节点没有可编辑的采样参数' : '当前工作流里没有 KSampler 节点' }}
             </p>
 
-            <p class="hint combo-line" v-if="multiDims.length">
+            <p class="hint combo-line" v-if="multiDims.length || loraSweepDims.length || textValues.length > 1">
               组合 <b>{{ variants.length }}</b> 组：
+              <span v-if="textValues.length > 1" class="dim">提示词 ×{{ textValues.length }}</span>
+              <span
+                v-for="d in loraSweepDims"
+                :key="d.key"
+                class="dim lora-dim"
+                :title="`LoRA 权重对比：${d.values.map((v) => v.toFixed(2)).join(' / ')}`"
+              >
+                {{ d.label }} ×{{ d.values.length }}
+              </span>
               <span v-for="d in multiDims" :key="d.key" class="dim">{{ shortKey(d.key) }} ×{{ d.n }}</span>
-              <br />批量对比时 seed 固定，只有你加多值的维度在变
+              <br />批量对比时 seed 固定，只有你加多值的维度在变<template v-if="loraSweepDims.length">
+                · LoRA 权重对比逐组提交，不改堆叠原值</template
+              >
             </p>
 
             <div class="send-row" style="margin-top: 6px">
@@ -2870,8 +3042,8 @@ onUnmounted(() => {
                     <div v-else class="ph">{{ statusLabel(r.status) }}</div>
                   </div>
                   <figcaption>
-                    <span v-for="c in r.changed" :key="c.key" class="kv">
-                      <em>{{ shortKey(c.key) }}</em>{{ c.value }}
+                    <span v-for="c in r.changed" :key="c.key" class="kv" :title="c.label || c.key">
+                      <em>{{ tagLabel(c) }}</em>{{ c.value }}
                     </span>
                     <span v-if="r.ms" class="ms">{{ (r.ms / 1000).toFixed(1) }}s</span>
                     <span v-if="r.error" class="err">{{ r.error }}</span>
@@ -2906,11 +3078,16 @@ onUnmounted(() => {
       :node-id="state.loraId"
       :loras="loraLoras"
       :baseline="state.loraBaseline[state.loraId] || null"
+      :sweeps="state.loraSweeps"
+      :sweep-dims="loraSweepDims.length"
+      :sweep-combos="loraSweepCombos"
       @toggle="toggleLora"
       @close="closeLora"
       @select-node="selectLoraNode"
       @change="updateLoras"
       @reset="resetLoras"
+      @sweep="setLoraSweep"
+      @clear-sweeps="clearLoraSweeps"
     />
 
     <!-- 通用确认弹窗 -->
@@ -2957,8 +3134,9 @@ onUnmounted(() => {
               v-for="t in state.lightbox.items[state.lightbox.index].tags || []"
               :key="t.key"
               class="kv"
+              :title="t.label || t.key"
             >
-              <em>{{ shortKey(t.key) }}</em>{{ t.value }}
+              <em>{{ tagLabel(t) }}</em>{{ t.value }}
             </span>
             <span
               v-if="!state.lightbox.items[state.lightbox.index].tags?.length"
@@ -3416,6 +3594,13 @@ button.mini { padding: 3px 8px; font-size: 11px; border-radius: 6px; }
 .combo-line { margin-top: 8px; line-height: 1.5; }
 .combo-line b { color: var(--brand); font-size: 13px; }
 .combo-line .dim { display: inline-block; margin-right: 8px; color: var(--ink-2); }
+.combo-line .dim.lora-dim {
+  padding: 0 5px;
+  color: var(--brand);
+  background: var(--brand-soft);
+  border: 1px solid var(--brand-line);
+  border-radius: 4px;
+}
 .compare-btn { border-color: var(--brand); color: var(--brand); }
 
 /* —— 对比结果 —— */

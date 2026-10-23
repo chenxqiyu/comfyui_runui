@@ -9,9 +9,13 @@ const props = defineProps({
   nodeId: { type: String, default: '' },
   loras: { type: Array, default: () => [] },
   baseline: { type: Array, default: null },
+  // 权重对比：{ [节点id]: { [LoRA 下标]: [权重...] } }
+  sweeps: { type: Object, default: () => ({}) },
+  sweepDims: { type: Number, default: 0 },
+  sweepCombos: { type: Number, default: 1 },
 })
 
-const emit = defineEmits(['toggle', 'close', 'select-node', 'change', 'reset'])
+const emit = defineEmits(['toggle', 'close', 'select-node', 'change', 'reset', 'sweep', 'clear-sweeps'])
 
 const items = computed(() => (Array.isArray(props.loras) ? props.loras : []))
 const currentNode = computed(() => props.nodes.find((n) => n.id === props.nodeId) || null)
@@ -153,6 +157,90 @@ function onStrengthChange(index, event) {
 function nudgeStrength(index, delta) {
   setStrength(index, readStrength(items.value[index]) + delta)
 }
+
+/* ---------------------------------------------------------------- 权重对比
+ * 给一条启用的 LoRA 填多个权重，生成时按笛卡尔积逐组出图。
+ * 对比值只存在 App 的提交维度里，不会覆盖堆叠里的原权重。
+ */
+const round2 = (n) => Math.round(n * 100) / 100
+
+function sweepOf(index) {
+  const list = props.sweeps?.[props.nodeId]?.[index]
+  return Array.isArray(list) ? list : []
+}
+
+function hasSweep(index) {
+  return sweepOf(index).length >= 2
+}
+
+/** 当前节点里有几条 LoRA 开了权重对比 */
+const nodeSweepCount = computed(
+  () => items.value.reduce((n, _, i) => n + (hasSweep(i) ? 1 : 0), 0)
+)
+
+/** 默认围绕当前权重给三档：-0.2 / 当前 / +0.2（不往负数走） */
+function defaultSweep(item) {
+  const base = round2(readStrength(item))
+  const values = [...new Set([round2(base - 0.2), base, round2(base + 0.2)])]
+    .filter((v) => v >= 0)
+    .sort((a, b) => a - b)
+  if (values.length < 2) values.push(round2(base + 0.4))
+  return [...new Set(values)].sort((a, b) => a - b)
+}
+
+function emitSweep(index, values) {
+  const clean = []
+  for (const v of values) {
+    const n = round2(Number(v))
+    if (Number.isFinite(n) && !clean.includes(n)) clean.push(n)
+  }
+  // 少于两个值就不算对比
+  emit('sweep', { nodeId: props.nodeId, index, values: clean.length >= 2 ? clean : [] })
+}
+
+function toggleSweep(index) {
+  if (hasSweep(index)) emitSweep(index, [])
+  else emitSweep(index, defaultSweep(items.value[index]))
+}
+
+function setSweepValue(index, vi, value) {
+  const vals = [...sweepOf(index)]
+  vals[vi] = value
+  emitSweep(index, vals)
+}
+
+function onSweepValue(index, vi, event) {
+  const raw = event.target.value
+  const n = Number(raw)
+  if (raw === '' || !Number.isFinite(n)) {
+    event.target.value = Number(sweepOf(index)[vi]).toFixed(2)
+    return
+  }
+  setSweepValue(index, vi, round2(n))
+}
+
+function addSweepValue(index) {
+  const vals = sweepOf(index)
+  const last = vals.length ? Math.max(...vals) : readStrength(items.value[index])
+  emitSweep(index, [...vals, round2(last + 0.2)])
+}
+
+function removeSweepValue(index, vi) {
+  const vals = sweepOf(index).filter((_, i) => i !== vi)
+  emitSweep(index, vals)
+}
+
+const SWEEP_PRESETS = [0.4, 0.6, 0.8, 1]
+function sweepPresets(index) {
+  const vals = sweepOf(index)
+  return SWEEP_PRESETS.filter((p) => !vals.includes(p))
+}
+
+function addSweepPreset(index, value) {
+  emitSweep(index, [...sweepOf(index), value])
+}
+
+const fmtSweep = (v) => Number(v).toFixed(2)
 
 /** 手动添加：识别 <lora:名称:权重>，一条输入里可以贴多个 */
 const addText = ref('')
@@ -528,6 +616,9 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <p v-if="addError" class="lp-add-err">{{ addError }}</p>
+          <p v-if="nodeSweepCount" class="lp-sweep-note">
+            当前节点 {{ nodeSweepCount }} 条 LoRA 开了权重对比：生成时按对比值，上面标签里是原权重。
+          </p>
         </div>
 
         <div class="lp-list">
@@ -552,42 +643,124 @@ onBeforeUnmount(() => {
             <div
               v-for="({ item, index: i }) in visibleRows"
               :key="i"
-              class="lp-row"
-              :class="{ off: !isActive(item) }"
-              :title="isActive(item) ? '点击停用这条 LoRA' : '点击启用这条 LoRA'"
-              @click="setActive(i, !isActive(item))"
+              class="lp-row-wrap"
+              :class="{ off: !isActive(item), sweeping: hasSweep(i) }"
             >
-              <label class="lp-check" @click.stop>
-                <input
-                  type="checkbox"
-                  :checked="isActive(item)"
-                  :title="isActive(item) ? '停用这一条' : '启用这一条'"
-                  @change="setActive(i, $event.target.checked)"
-                />
-              </label>
-              <span
-                class="lp-bolt"
-                :class="{ on: isFast(item) }"
-                :title="fastTip(item)"
-                @click.stop
-                >⚡</span
+              <div
+                class="lp-row"
+                :title="isActive(item) ? '点击停用这条 LoRA' : '点击启用这条 LoRA'"
+                @click="setActive(i, !isActive(item))"
               >
-              <span class="lp-name" :title="readName(item)">{{ readName(item) || '（未命名）' }}</span>
-              <div class="lp-step" @click.stop>
-                <button type="button" class="lp-arrow" title="减少 0.05" @click="nudgeStrength(i, -0.05)">
-                  ‹
+                <label class="lp-check" @click.stop>
+                  <input
+                    type="checkbox"
+                    :checked="isActive(item)"
+                    :title="isActive(item) ? '停用这一条' : '启用这一条'"
+                    @change="setActive(i, $event.target.checked)"
+                  />
+                </label>
+                <span
+                  class="lp-bolt"
+                  :class="{ on: isFast(item) }"
+                  :title="fastTip(item)"
+                  @click.stop
+                  >⚡</span
+                >
+                <span class="lp-name" :title="readName(item)">{{ readName(item) || '（未命名）' }}</span>
+                <div
+                  class="lp-step"
+                  :class="{ muted: hasSweep(i) }"
+                  :title="hasSweep(i) ? '这条已开权重对比，生成时按下面的多个权重' : ''"
+                  @click.stop
+                >
+                  <button
+                    type="button"
+                    class="lp-arrow"
+                    title="减少 0.05"
+                    :disabled="hasSweep(i)"
+                    @click="nudgeStrength(i, -0.05)"
+                  >
+                    ‹
+                  </button>
+                  <input
+                    type="number"
+                    step="0.05"
+                    :value="fmtStrength(item)"
+                    title="强度（0.05 步进，可直接输入）"
+                    :disabled="hasSweep(i)"
+                    @change="onStrengthChange(i, $event)"
+                    @keyup.enter="$event.target.blur()"
+                  />
+                  <button
+                    type="button"
+                    class="lp-arrow"
+                    title="增加 0.05"
+                    :disabled="hasSweep(i)"
+                    @click="nudgeStrength(i, 0.05)"
+                  >
+                    ›
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  class="lp-cmp"
+                  :class="{ on: hasSweep(i) }"
+                  :disabled="!isActive(item)"
+                  :title="
+                    hasSweep(i)
+                      ? '关闭权重对比'
+                      : '权重对比：勾多个权重，生成时各出一张（不改堆叠原值）'
+                  "
+                  @click.stop="toggleSweep(i)"
+                >
+                  {{ hasSweep(i) ? `×${sweepOf(i).length}` : '⇄' }}
                 </button>
-                <input
-                  type="number"
-                  step="0.05"
-                  :value="fmtStrength(item)"
-                  title="强度（0.05 步进，可直接输入）"
-                  @change="onStrengthChange(i, $event)"
-                  @keyup.enter="$event.target.blur()"
-                />
-                <button type="button" class="lp-arrow" title="增加 0.05" @click="nudgeStrength(i, 0.05)">
-                  ›
-                </button>
+              </div>
+              <div v-if="hasSweep(i)" class="lp-sweep" @click.stop>
+                <div class="lp-sweep-head">
+                  <span class="lp-sweep-title">权重对比</span>
+                  <span class="lp-sweep-sub">每个权重各出一张 · 不改原值</span>
+                  <button type="button" class="lp-sweep-off" @click="toggleSweep(i)">收起</button>
+                </div>
+                <div class="lp-sweep-vals">
+                  <label v-for="(w, wi) in sweepOf(i)" :key="wi" class="lp-sweep-val">
+                    <input
+                      type="number"
+                      step="0.05"
+                      :value="fmtSweep(w)"
+                      title="这一档权重（可直接改）"
+                      @change="onSweepValue(i, wi, $event)"
+                      @keyup.enter="$event.target.blur()"
+                    />
+                    <button
+                      type="button"
+                      class="lp-sweep-del"
+                      title="移除这一档"
+                      @click="removeSweepValue(i, wi)"
+                    >
+                      ×
+                    </button>
+                  </label>
+                  <button
+                    type="button"
+                    class="lp-sweep-add"
+                    title="再加一个权重"
+                    @click="addSweepValue(i)"
+                  >
+                    ＋
+                  </button>
+                </div>
+                <div v-if="sweepPresets(i).length" class="lp-sweep-presets">
+                  <span>快速加</span>
+                  <button
+                    v-for="p in sweepPresets(i)"
+                    :key="p"
+                    type="button"
+                    @click="addSweepPreset(i, p)"
+                  >
+                    {{ p.toFixed(1) }}
+                  </button>
+                </div>
               </div>
             </div>
             <div v-if="!visibleRows.length" class="lp-rows-empty">{{ emptyText }}</div>
@@ -595,10 +768,26 @@ onBeforeUnmount(() => {
         </div>
 
         <footer class="lp-foot">
-          <span class="lp-hint">改动会写回当前工作流，下次「发送」生效</span>
-          <button type="button" class="lp-reset" :disabled="!baseline" @click="emit('reset')">
-            恢复原值
-          </button>
+          <span class="lp-hint" :class="{ warn: sweepDims }">
+            <template v-if="sweepDims">
+              权重对比 {{ sweepDims }} 项 · 共 {{ sweepCombos }} 组，逐组生成
+            </template>
+            <template v-else>改动会写回当前工作流，下次「发送」生效</template>
+          </span>
+          <div class="lp-foot-actions">
+            <button
+              v-if="sweepDims"
+              type="button"
+              class="lp-reset warn"
+              title="清除所有 LoRA 的权重对比"
+              @click="emit('clear-sweeps')"
+            >
+              清除对比
+            </button>
+            <button type="button" class="lp-reset" :disabled="!baseline" @click="emit('reset')">
+              恢复原值
+            </button>
+          </div>
         </footer>
       </template>
     </section>
@@ -978,6 +1167,7 @@ onBeforeUnmount(() => {
 .lp-add-btn:hover:not(:disabled) { background: #46617a; border-color: #5b7fa5; }
 .lp-add-btn:disabled { opacity: .45; cursor: not-allowed; }
 .lp-add-err { margin: 5px 0 0; font-size: 10.5px; color: #e08b8b; }
+.lp-sweep-note { margin: 7px 0 0; font-size: 10.5px; line-height: 1.5; color: #8fb4d4; }
 
 /* —— 列表 —— */
 .lp-list {
@@ -1049,16 +1239,19 @@ onBeforeUnmount(() => {
 .lp-rows::-webkit-scrollbar-thumb { background: #555; border-radius: 4px; }
 .lp-rows::-webkit-scrollbar-track { background: transparent; }
 
+.lp-row-wrap { border-bottom: 1px solid #3d3d3d; }
+.lp-row-wrap:last-child { border-bottom: none; }
+.lp-row-wrap.off .lp-name { color: #858585; }
+.lp-row-wrap.sweeping { background: #2f3438; }
+
 .lp-row {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 6px 10px;
-  border-bottom: 1px solid #3d3d3d;
   cursor: pointer;
   transition: background .12s;
 }
-.lp-row:last-child { border-bottom: none; }
 .lp-row:hover { background: #3b3b3b; }
 .lp-row.off .lp-name { color: #858585; }
 /* 极速目录里的行：点亮的闪电；否则灰掉 */
@@ -1137,8 +1330,148 @@ onBeforeUnmount(() => {
   border-radius: 0;
   cursor: pointer;
 }
-.lp-arrow:hover { background: #404040; color: #e6e6e6; }
-.lp-arrow:active { background: #4a4a4a; }
+.lp-arrow:hover:not(:disabled) { background: #404040; color: #e6e6e6; }
+.lp-arrow:active:not(:disabled) { background: #4a4a4a; }
+.lp-step.muted { opacity: .5; }
+.lp-step.muted input,
+.lp-step.muted .lp-arrow { cursor: not-allowed; }
+
+/* 对比开关：⇄ / ×N */
+.lp-cmp {
+  flex: 0 0 auto;
+  min-width: 28px;
+  height: 24px;
+  padding: 0 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1;
+  color: #8f8f8f;
+  background: #2a2a2a;
+  border: 1px solid #484848;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color .12s, background .12s, border-color .12s;
+}
+.lp-cmp:hover:not(:disabled) { color: #dedede; background: #343434; border-color: #5f5f5f; }
+.lp-cmp.on {
+  color: #cfe6fb;
+  background: #3d5468;
+  border-color: #4d6a85;
+  box-shadow: 0 0 0 1px rgba(91, 155, 213, .2);
+}
+.lp-cmp:disabled { opacity: .35; cursor: not-allowed; }
+
+/* 权重对比展开区 */
+.lp-sweep {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 8px 10px 10px;
+  background: #2d3237;
+  border-top: 1px dashed #444c54;
+  cursor: default;
+}
+.lp-sweep-head { display: flex; align-items: center; gap: 8px; }
+.lp-sweep-title {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: #bcd6ee;
+  letter-spacing: .2px;
+}
+.lp-sweep-title::before { content: '⇄'; margin-right: 5px; color: #6fa8d8; }
+.lp-sweep-sub {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 10px;
+  color: #7f8b95;
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lp-sweep-off {
+  flex: 0 0 auto;
+  height: 20px;
+  padding: 0 7px;
+  font-size: 10px;
+  color: #9a9a9a;
+  background: #3a3a3a;
+  border: 1px solid #505050;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.lp-sweep-off:hover { color: #e2e2e2; background: #454545; }
+.lp-sweep-vals { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.lp-sweep-val {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 2px 0 6px;
+  background: #1f1f1f;
+  border: 1px solid #4d5a66;
+  border-radius: 6px;
+}
+.lp-sweep-val input {
+  width: 42px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: #d8ebff;
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: center;
+  outline: none;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.lp-sweep-val input::-webkit-outer-spin-button,
+.lp-sweep-val input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+.lp-sweep-del {
+  width: 17px;
+  height: 20px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: 1;
+  color: #8f8f8f;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.lp-sweep-del:hover { color: #ffd4d0; background: #5a3a37; }
+.lp-sweep-add {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11px;
+  color: #cfe6fb;
+  background: #33424f;
+  border: 1px dashed #4d6a85;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.lp-sweep-add:hover { background: #3b4d5c; border-color: #6f92b0; }
+.lp-sweep-presets { display: flex; align-items: center; gap: 5px; font-size: 10px; color: #7f8b95; }
+.lp-sweep-presets button {
+  height: 18px;
+  padding: 0 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: #9fb8cc;
+  background: #333b42;
+  border: 1px solid #46525c;
+  border-radius: 999px;
+  cursor: pointer;
+}
+.lp-sweep-presets button:hover { color: #d8ebff; border-color: #5b7fa5; background: #3b4852; }
 
 /* —— 底部 —— */
 .lp-foot {
@@ -1150,12 +1483,16 @@ onBeforeUnmount(() => {
   padding: 9px 12px 11px;
 }
 .lp-hint {
+  flex: 1 1 auto;
+  min-width: 0;
   font-size: 10.5px;
   color: #8a8a8a;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.lp-hint.warn { color: #a9c9e6; }
+.lp-foot-actions { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
 .lp-reset {
   flex: 0 0 auto;
   padding: 3px 9px;
@@ -1168,6 +1505,12 @@ onBeforeUnmount(() => {
 }
 .lp-reset:hover:not(:disabled) { background: #4a4a4a; border-color: #6b6b6b; }
 .lp-reset:disabled { opacity: .4; cursor: not-allowed; }
+.lp-reset.warn {
+  color: #cfe6fb;
+  background: #33424f;
+  border-color: #4d6a85;
+}
+.lp-reset.warn:hover:not(:disabled) { background: #3b4d5c; border-color: #6f92b0; }
 
 .lp-empty { padding: 18px 14px 20px; }
 .lp-empty p { margin: 0 0 6px; font-size: 12px; color: #cfcfcf; }
