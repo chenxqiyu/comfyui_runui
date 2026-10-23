@@ -4,7 +4,8 @@
  *
  * 两个轴：
  *   X = 提示词（Efficiency 的 Prompt S/R）—— 需要先把 Loader 换成 Efficient Loader
- *   Y = 数值参数（cfg / steps / denoise，用 XY Input: Manual XY Entry）
+ *   Y = 数值 / 枚举参数（cfg / steps / denoise / sampler_name / scheduler，
+ *       用 XY Input: Manual XY Entry）
  *
  * 改造只发生在提交副本上，不动 state.nodes。五个必须做对的地方：
  *   1. 采样节点 KSampler/KSamplerAdvanced → KSampler (Efficient)，丢掉它没有的输入
@@ -16,11 +17,13 @@
  *      XY Plot 会静默返回 None（表现就是「扫了但只出一张」）
  */
 
-/** 能扫的数值参数 → Efficiency 的 plot_type */
+/** 能扫的参数 → Efficiency 的 plot_type */
 export const XY_AXIS_LABEL = {
   cfg: 'CFG Scale',
   steps: 'Steps',
   denoise: 'Denoise',
+  sampler_name: 'Sampler',
+  scheduler: 'Scheduler',
 }
 
 const isLink = (v) =>
