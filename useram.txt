@@ -1,3 +1,52 @@
+查清了：文件本身没问题，是加载节点用错了。你这条工作流里的 CLIP 是走 DualCLIPLoaderGGUFMultiGPU 加载的，而 GGUF 加载器不认 ComfyUI 原生 NVFP4 的 comfy_quant 打包格式。
+
+报错链路
+日志里其实已经识别到了量化元数据（09:28:54 Found quantization metadata version 1，来源
+sd3_clip.py:29
+ 的 detect_layer_quantization），但紧接着被 GGUF 加载器整个绕过了：
+GGUF 的 CLIP 加载器对非 .gguf 文件只挡了 scaled_fp8，没挡 comfy_quant：
+ComfyUI-GGUF/nodes.py:229
+它固定传 custom_operations=GGMLOps 来构建 T5：
+ComfyUI-GGUF/nodes.py:240
+而 ComfyUI 的原生量化路径只在没有 custom_operations 时才会接管：
+sd1_clip.py:109
+。GGMLOps 一存在，就走不到
+sd1_clip.py:114
+ 的 mixed_precision_ops(..., full_precision_mm=True)
+GGUF 的权重加载没有任何形状校验，把打包后的 4bit 权重原样塞进 Linear：
+ComfyUI-GGUF/ops.py:124
+前向时 is_ggml_quantized() 对普通 torch tensor 返回 false（
+ops.py:103
+），于是走 manual_cast 的普通 F.linear，只做了 U8→bf16 的类型转换，没有反量化、也没拆包
+于是 q 层拿到的是磁盘上的 [4096,2048] uint8（4096×4096 的 4bit 打包），F.linear 里转置成 [2048,4096]，和输入 [256,4096] 相乘，正好就是你看到的 (256x4096 and 2048x4096)。
+
+这个文件确实是原生 NVFP4
+我查过 F:\sd3\stable-diffusion-3-medium\text_encoders\t5xxl_nvfp4.safetensors：3.13 GB / 724 个张量，_quantization_metadata 是 version 1.0、format: nvfp4、group_size: 16、orig_shape: [4096,4096]；q 权重存 [4096,2048] U8 + weight_scale [4096,256] F8_E4M3 + 标量 weight_scale_2 + comfy_quant。原生路径会按
+comfy/ops.py:1195
+ /
+comfy/ops.py:1223
+ 把它装成 QuantizedTensor，前向时反量化再算，完全正常。
+怎么用起来
+把 DualCLIPLoaderGGUFMultiGPU 换成原生 DualCLIPLoader 或 MultiGPU 的原生版 DualCLIPLoaderMultiGPU（
+wrappers.py:515
+，只改设备不改 ops）：
+type = flux
+clip_name1 = clip_l_ablit_v2.safetensors
+clip_name2 = t5xxl_nvfp4.safetensors
+原生路径：flux_clip(t5_quantization_metadata=...)（
+flux.py:65
+、
+sd.py:2025
+）→ 选 mixed_precision_ops → 加载时反量化，正常出 bf16/fp16 权重。
+另外两点：
+
+现在 CLIP 落在 cuda:0（4080 SUPER，Ada），不是阻断点。文本编码器这条路径固定 full_precision_mm=True，只做反量化 + 普通 matmul；真正需要 Blackwell sm_100 的 NVFP4 tensor-core 矩阵乘（
+model_management.py:2044
+）在 T5 这里用不到。
+日志里 model weight dtype torch.float8_e4m3fn, manual cast: torch.bfloat16 是后面 Flux UNET（model_type FLUX）打的，不是 T5，别被它带偏。--disable-dynamic-vram 也和这个报错无关。
+如果不想换节点，也可以继续用 GGUF 加载器，但文件要换成品：真 GGUF 的 T5（Q4_K_M/Q5_K_M 之类）或普通 t5xxl_fp8/fp16.safetensors。
+
+`````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````````
 小模型是生效的，但切换的大头已经不在 T5 上了。日志对得上：T5 从 9.32GB 降到 2.97GB 后，单张从 26~34s 降到 ~20s；可三个权重变体每个仍然是 Requested to load FluxClipModel_（3.0GB）+ Requested to load Flux（11.35GB）。图上的每个锯齿，就是一次“整个模型卸下再装回”。
 
 为什么换了小模型还是慢
@@ -27,3 +76,49 @@ Flux 11.35GB ≈ 6.6s
 如果被测 LoRA 不含 CLIP 权重：把文本编码移出扫描——用基座 CLIP 编码一次，LoRA 只作用在 MODEL 上。这样 T5 不参与克隆，能再省 ~3.5s/张。
 --disable-dynamic-vram 不是这次锯齿的原因（clone 卸载是必发的），但去掉它值得试一次做对比。
 前端不是瓶颈：日志里三个变体在 09:39:48~09:39:50 两秒内就全部排进队列了，之后全是 ComfyUI 内部的装载开销。
+
+
+````````````````````````````````````````````````````````````````````````````````````````````
+
+--disable-dynamic-vram 开启与关闭的区别
+这个参数用来强制关掉动态 VRAM（comfy-aimdo），回退到旧的“按估算加载”模式。在 NVIDIA 显卡上，默认是开启的（
+cli_args.py:326
+）；此外，--highvram、--gpu-only、--novram、--cpu 也会间接关掉它，而 --lowvram 在动态模式下完全无效。
+一、两条加载路径的核心差异
+项目	动态 VRAM（不加该 flag）	--disable-dynamic-vram（旧模式）
+加载器类	ModelPatcherDynamic（
+main.py:268
+）	ModelPatcher
+加载时做什么	只分配虚拟地址空间（VBAR）并固定宿主缓冲，权重按模块按需搬运	按估算把整个模型搬到显存
+日志特征	... prepared for dynamic VRAM loading. X MB Staged. N patches attached.（
+model_patcher.py:2034
+）	loaded completely; ... MB loaded, full load: True（
+model_patcher.py:1099
+）
+显存不够时	由 VBAR 分页按需换入换出，模型可以比显存大	先整模 unload 别的模型；仍不够就走 lowvram 部分加载
+腾显存策略	在 free_memory(for_dynamic=True) 中不会为了动态模型去卸载其他动态模型（
+model_management.py:893
+）	会把其他模型整体卸载/搬到 CPU
+附带能力	NVML 显存压力监测、异步 offload（N 卡默认 2 流）、--fast-disk 磁盘直载、--vram-headroom、Linear 懒初始化（跳过 torch.empty，避免 Windows 重复 commit）、prefetch/comfy compiler 依赖 aimdo	以上全部不可用
+补充两点：
+
+GGUF/量化格式：官方在
+main.py:602
+ 明确警告“用 GGUF 建议保留动态 VRAM，并尽量换原生 fp8/int8/w4a8 格式”，且该 flag 计划被移除。
+显存曲线：动态模式下权重的换入是分页流式的；旧模式是整体加载、整体卸载，所以你截图里那种满上─掉下来的锯齿，是旧模式的典型形态。
+二、与你的 LoRA 权重对比直接相关
+load_models_gpu 里“同底模的旧 clone 先 detach”这段逻辑两种模式都有（
+model_management.py:981
+），所以：
+换一个 LoRA 权重 = 新 model.clone() = 旧 clone 被驱逐，这个机制不会因为开关而消失；
+差别在驱逐之后要搬多少东西：旧模式每次按估算把 11.35 GB UNET 整体重走一遍加载（你日志里每张都有 loaded completely ... full load: True），这就是 ~6.6s 的来源；动态模式的权重页挂在共享的 base model 的 VBAR 上，detach 本身不搬权重，没被 LoRA 改到的模块可以复用，只有被 patch 的层需要重算/重搬。
+实际收益取决于 LoRA 覆盖范围：Flux LoRA 通常打满所有线性层，那收益会缩小到“流式加载一次”的量级；只改部分层的 LoRA 提速会更明显。这点建议实测确认，不要只看机制推断。
+另外，动态模式下前端队列、/free、节点逻辑都一样，前端仍然不是瓶颈（上次测过 3 个权重 2 秒内就全部提交了）。
+
+三、给你的实际建议
+当前命令行带着 --disable-dynamic-vram，所以你看到的是旧模式的整模重载。建议去掉该 flag，用同一组 3 权重对比跑一遍，比较每张耗时和任务管理器曲线；启动日志会从 Dynamic vram disabled with argument 变成 DynamicVRAM support detected and enabled，加载日志会从 loaded completely 变成 prepared for dynamic VRAM loading。
+注意代价：动态模式会 pin 宿主内存（Windows 上限约系统 RAM 的 40%，
+model_management.py:1640
+）。11.9 GB UNET + 3 GB T5 的场景下如果内存吃紧，可加 --disable-pinned-memory，或者用 --fast-disk 走 NVMe。
+如果动态模式下出现显存抖动/驱动压力问题，用 --vram-headroom 1~2 或 --reserve-vram 调，而不是退回去；--lowvram 在动态模式无效，别同时加。
+最根本的提速仍是让整组权重在同一个 prompt 内循环（同一个 ModelPatcher、只换 patch），这样连 clone 驱逐都不会发生；调 flag 只是把“每次重载 11 GB”降级成“每次流式补 LoRA 涉及的层”。
