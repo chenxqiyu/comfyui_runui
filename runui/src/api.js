@@ -58,6 +58,9 @@ export const interruptRun = () => postSilent('/interrupt')
 /** 从队列里删掉还没开始的任务 */
 export const deleteQueued = (ids) => postSilent('/queue', { delete: ids })
 
+/** 把 ComfyUI 侧的相对路径拼上当前前缀，预览图这类直接交给 <img> */
+export const apiUrl = (path) => base() + path
+
 /** 图片直链（走同一个前缀，dev 下由 vite 代理） */
 export function viewUrl(img) {
   const q = new URLSearchParams({

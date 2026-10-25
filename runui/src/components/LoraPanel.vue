@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { fastApply, fastJob, fastRestore, fastStatus, sleep } from '../api'
+import { apiGet, apiUrl, fastApply, fastJob, fastRestore, fastStatus, sleep } from '../api'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -13,9 +13,20 @@ const props = defineProps({
   sweeps: { type: Object, default: () => ({}) },
   sweepDims: { type: Number, default: 0 },
   sweepCombos: { type: Number, default: 1 },
+  // 已经加到「新提示词」里的触发词，用于在面板里标亮
+  addedWords: { type: Array, default: () => [] },
 })
 
-const emit = defineEmits(['toggle', 'close', 'select-node', 'change', 'reset', 'sweep', 'clear-sweeps'])
+const emit = defineEmits([
+  'toggle',
+  'close',
+  'select-node',
+  'change',
+  'reset',
+  'sweep',
+  'clear-sweeps',
+  'prompt-tag-toggle',
+])
 
 const items = computed(() => (Array.isArray(props.loras) ? props.loras : []))
 const currentNode = computed(() => props.nodes.find((n) => n.id === props.nodeId) || null)
@@ -34,7 +45,9 @@ const previewItems = computed(() => {
   if (!chain?.chained) return items.value
   return chain.nodes.flatMap((n) => (Array.isArray(n.loras) ? n.loras : []))
 })
-const previewEnabled = computed(() => previewItems.value.filter(isActive).length)
+const previewEnabled = computed(
+  () => previewItems.value.filter((x) => isActive(x) && !isBypassed(x)).length
+)
 const previewLabel = computed(() => (chainOfNode.value?.chained ? '串联启用预览' : 'lora堆栈'))
 
 function readName(item) {
@@ -42,9 +55,26 @@ function readName(item) {
   return String(item ?? '')
 }
 
+/** 名称行会被省略号截断，悬停时用 tooltip 显示完整名称，并带上点击含义 */
+function nameTitle(item) {
+  const name = readName(item)
+  const hint = isActive(item) ? '点击停用这条 LoRA（移出已勾选）' : '点击启用这条 LoRA（加回已勾选）'
+  return name ? `${name}\n${hint}` : hint
+}
+
 function readStrength(item) {
   const n = Number(item?.strength)
   return Number.isFinite(n) ? n : 1
+}
+
+function readClip(item) {
+  const n = Number(item?.clipStrength)
+  return Number.isFinite(n) ? n : readStrength(item)
+}
+
+/** clip 行展开 = CLIP 强度单独生效；收起时跟模型强度同步（与 LoraManager 一致） */
+function clipOpen(item) {
+  return !!(item && typeof item === 'object' && item.expanded)
 }
 
 function isActive(item) {
@@ -58,6 +88,20 @@ function isActive(item) {
 function clone(item) {
   if (item && typeof item === 'object') return { ...item }
   return { name: String(item ?? ''), strength: 1 }
+}
+
+/** 禁用保留：还在已勾选列表里，但生成时不参与 */
+function isBypassed(item) {
+  return !!(item && typeof item === 'object' && item.bypass)
+}
+
+function setBypass(index, value) {
+  const list = items.value.map(clone)
+  const item = list[index]
+  if (!item) return
+  if (value) item.bypass = true
+  else delete item.bypass
+  commit(list)
 }
 
 const activeCount = computed(() => items.value.filter(isActive).length)
@@ -89,13 +133,21 @@ const emptyText = computed(() => {
   return '没有可编辑的 LoRA'
 })
 
-/** 只列启用中的，生成 <lora:name:0.70> 预览 */
+/** 只列启用中的，生成 <lora:name:0.70> / <lora:name:0.70:0.60> 预览 */
 const promptText = computed(() =>
   previewItems.value
-    .filter((x) => isActive(x) && readName(x))
-    .map((x) => `<lora:${cleanName(readName(x))}:${readStrength(x).toFixed(2)}>`)
+    .filter((x) => isActive(x) && !isBypassed(x) && readName(x))
+    .map(loraTag)
     .join('')
 )
+
+/** 展开 clip 后一律写第三段（clip 为 1.00 也写成 1.00:1.00） */
+function loraTag(item) {
+  const name = cleanName(readName(item))
+  const strength = readStrength(item).toFixed(2)
+  if (!clipOpen(item)) return `<lora:${name}:${strength}>`
+  return `<lora:${name}:${strength}:${readClip(item).toFixed(2)}>`
+}
 
 function cleanName(name) {
   return String(name)
@@ -106,6 +158,7 @@ function cleanName(name) {
 }
 
 const fmtStrength = (item) => readStrength(item).toFixed(2)
+const fmtClip = (item) => readClip(item).toFixed(2)
 
 function commit(list) {
   emit('change', list)
@@ -139,23 +192,87 @@ function setStrength(index, raw) {
   const n = Number(raw)
   if (!Number.isFinite(n)) return
   const list = items.value.map(clone)
-  if (!list[index]) return
-  list[index].strength = Math.round(n * 100) / 100
+  const item = list[index]
+  if (!item) return
+  item.strength = Math.round(n * 100) / 100
+  // 没展开 clip 时 clip 强度跟随模型强度，避免留下旧值
+  if (!clipOpen(item)) item.clipStrength = item.strength
   commit(list)
 }
 
-/** 输入框清空/非法时回填原值，不要把强度误写成 0 */
-function onStrengthChange(index, event) {
+/* 手输立即生效：编辑期间输入框用本地草稿文本，避免回写的格式化值打断输入 */
+const drafts = ref({})
+const draftKey = (i, field) => `${i}:${field}`
+
+function inputText(i, item, field) {
+  const draft = drafts.value[draftKey(i, field)]
+  if (draft !== undefined) return draft
+  return field === 'clip' ? fmtClip(item) : fmtStrength(item)
+}
+
+function setDraft(i, field, text) {
+  drafts.value = { ...drafts.value, [draftKey(i, field)]: text }
+}
+
+function clearDraft(i, field) {
+  const key = draftKey(i, field)
+  if (drafts.value[key] === undefined) return
+  const next = { ...drafts.value }
+  delete next[key]
+  drafts.value = next
+}
+
+/** 每敲一个有效数字就写回，不等回车/失焦；空串和小数点中间态先攒着 */
+function onStrengthInput(index, event) {
   const raw = event.target.value
-  if (raw === '' || !Number.isFinite(Number(raw))) {
-    event.target.value = fmtStrength(items.value[index])
-    return
-  }
+  setDraft(index, 'strength', raw)
+  if (raw.trim() === '' || !Number.isFinite(Number(raw))) return
   setStrength(index, raw)
+}
+
+function onClipInput(index, event) {
+  const raw = event.target.value
+  setDraft(index, 'clip', raw)
+  if (raw.trim() === '' || !Number.isFinite(Number(raw))) return
+  setClipStrength(index, raw)
 }
 
 function nudgeStrength(index, delta) {
   setStrength(index, readStrength(items.value[index]) + delta)
+}
+
+/* ---------------------------------------------------------------- CLIP 控制
+ * 展开后 clip 强度单独生效；收起时同步回模型强度（跟 LoraManager 的收起行为一致）。
+ */
+function setClipStrength(index, raw) {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return
+  const list = items.value.map(clone)
+  const item = list[index]
+  if (!item) return
+  item.clipStrength = Math.round(n * 100) / 100
+  item.expanded = true
+  commit(list)
+}
+
+function nudgeClip(index, delta) {
+  setClipStrength(index, readClip(items.value[index]) + delta)
+}
+
+function toggleClip(index) {
+  const list = items.value.map(clone)
+  const item = list[index]
+  if (!item) return
+  if (clipOpen(item)) {
+    item.expanded = false
+    item.clipStrength = Math.round(readStrength(item) * 100) / 100
+  } else {
+    item.expanded = true
+    if (!Number.isFinite(Number(item.clipStrength))) {
+      item.clipStrength = Math.round(readStrength(item) * 100) / 100
+    }
+  }
+  commit(list)
 }
 
 /* ---------------------------------------------------------------- 权重对比
@@ -242,19 +359,25 @@ function addSweepPreset(index, value) {
 
 const fmtSweep = (v) => Number(v).toFixed(2)
 
-/** 手动添加：识别 <lora:名称:权重>，一条输入里可以贴多个 */
+/** 手动添加：识别 <lora:名称:权重[:clip]>，一条输入里可以贴多个 */
 const addText = ref('')
 const addError = ref('')
 
 function parseLoraTags(text) {
   const out = []
-  const re = /<\s*lora\s*:\s*([^:>]+?)\s*(?::\s*(-?\d*\.?\d+)\s*)?>/gi
+  const re =
+    /<\s*lora\s*:\s*([^:>]+?)\s*(?::\s*(-?\d*\.?\d+)\s*)?(?::\s*(-?\d*\.?\d+)\s*)?>/gi
   let m
   while ((m = re.exec(text))) {
     const name = m[1].trim()
     if (!name) continue
     const n = m[2] === undefined ? 1 : Number(m[2])
-    out.push({ name, strength: Number.isFinite(n) ? n : 1 })
+    const clip = m[3] === undefined ? null : Number(m[3])
+    out.push({
+      name,
+      strength: Number.isFinite(n) ? n : 1,
+      clip: clip !== null && Number.isFinite(clip) ? clip : null,
+    })
   }
   return out
 }
@@ -266,8 +389,9 @@ function addFromText() {
     return
   }
   const list = items.value.map(clone)
-  for (const { name, strength } of parsed) {
+  for (const { name, strength, clip } of parsed) {
     const weight = Math.round(strength * 100) / 100
+    const clipWeight = clip === null ? null : Math.round(clip * 100) / 100
     // 同名已存在就更新强度并勾选，避免重复堆叠
     const at = list.findIndex(
       (x) => cleanName(readName(x)).toLowerCase() === cleanName(name).toLowerCase()
@@ -278,8 +402,19 @@ function addFromText() {
       if ('on' in item) item.on = true
       if ('enabled' in item) item.enabled = true
       item.strength = weight
+      if (clipWeight === null) {
+        if (!clipOpen(item)) item.clipStrength = weight
+      } else {
+        item.clipStrength = clipWeight
+        item.expanded = true
+      }
     } else {
-      list.push({ name, strength: weight, active: true })
+      const item = { name, strength: weight, active: true }
+      if (clipWeight !== null) {
+        item.clipStrength = clipWeight
+        item.expanded = true
+      }
+      list.push(item)
     }
   }
   commit(list)
@@ -314,6 +449,416 @@ function normName(name) {
     .replace(/\.(safetensors|sft|pt|pth|ckpt|bin)$/i, '')
     .trim()
     .toLowerCase()
+}
+
+/* ---------------------------------------------------------------- 预览图
+ * LoraManager 的 /api/lm/loras/list 只返回前 100 条，工作流里的 LoRA 经常不在里面，
+ * 所以按名字逐条问 /api/lm/loras/preview-url；结果缓存，'' 表示确认没有预览图。
+ */
+const previews = ref({})
+const previewBusy = new Set()
+const itemNames = computed(() => [...new Set(items.value.map(readName).filter(Boolean))])
+
+function setPreview(key, url) {
+  previews.value = { ...previews.value, [key]: url }
+}
+
+async function fetchPreview(name) {
+  const key = normName(name)
+  if (!key || key in previews.value || previewBusy.has(key)) return
+  previewBusy.add(key)
+  try {
+    const data = await apiGet(
+      `/api/lm/loras/preview-url?name=${encodeURIComponent(name)}&license_flags=true`
+    )
+    const url = String(data?.preview_url || '')
+    // 查不到时后端也返回 success，只是指向通用的 no-preview 图，按无预览处理
+    const usable = data?.success && url && !url.includes('/no-preview.')
+    setPreview(key, usable ? apiUrl(url) : '')
+  } catch {
+    // LoRA Manager 不可用：先留空，下次打开面板再试
+  } finally {
+    previewBusy.delete(key)
+  }
+}
+
+/** 打开面板时并发 6 路把这一屏的 LoRA 预览图都问一遍 */
+function loadPreviews() {
+  const names = itemNames.value
+  let next = 0
+  const worker = async () => {
+    while (next < names.length) await fetchPreview(names[next++])
+  }
+  return Promise.all(Array.from({ length: Math.min(6, names.length) }, worker))
+}
+
+function previewOf(item) {
+  const key = normName(readName(item))
+  return key ? previews.value[key] || '' : ''
+}
+
+/** 图挂了（文件被挪走/改名）就不再重试，退回空缩略图位 */
+function onPreviewError(item) {
+  const key = normName(readName(item))
+  if (key) setPreview(key, '')
+}
+
+/* ---------------------------------------------------------------- 悬停看大图 */
+const bigPreview = ref(null)
+let bigTimer = null
+
+function showBigUrl(url, name, event) {
+  if (!url) return
+  const rect = event.currentTarget.getBoundingClientRect()
+  clearTimeout(bigTimer)
+  // 稍等一下再弹，鼠标扫过一排的时候不至于每行都闪一下
+  bigTimer = setTimeout(() => {
+    // 大图固定贴在缩略图右边，右边放不下才往左收
+    let left = rect.right + 12
+    if (left + 312 > window.innerWidth - 12) left = Math.max(12, window.innerWidth - 12 - 312)
+    bigPreview.value = {
+      url,
+      name,
+      left,
+      top: Math.max(12, Math.min(rect.top + rect.height / 2 - 200, window.innerHeight - 400)),
+    }
+  }, 160)
+}
+
+function showBigPreview(item, event) {
+  showBigUrl(previewOf(item), readName(item), event)
+}
+
+function hideBigPreview() {
+  clearTimeout(bigTimer)
+  bigPreview.value = null
+}
+
+/* ---------------------------------------------------------------- 已勾选预览图 */
+const gallery = ref(false)
+/* 顶置：已启用（勾选且没禁用）的排前面，临时禁用的沉到下面 */
+const galleryTop = ref(true)
+const checkedPreviews = computed(() => {
+  const seen = new Set()
+  const out = []
+  items.value.forEach((item, index) => {
+    if (!isActive(item)) return
+    const name = readName(item)
+    const url = previewOf(item)
+    if (!url || seen.has(name)) return
+    seen.add(name)
+    out.push({ index, item, name, url, bypassed: isBypassed(item) })
+  })
+  return out
+})
+watch(gallery, (on) => {
+  if (on) loadPreviews()
+  else closePromptPanel()
+})
+
+/** 顶置开启时：启用中的在前，临时禁用的排后面 */
+const galleryItems = computed(() => {
+  const list = checkedPreviews.value
+  if (!galleryTop.value) return list
+  return [
+    ...list.filter((p) => !p.bypassed),
+    ...list.filter((p) => p.bypassed),
+  ]
+})
+
+/* 预览图下的名称点击即复制，短暂显示「已复制」 */
+const copiedName = ref('')
+let copiedTimer = null
+
+async function copyName(name) {
+  if (!name) return
+  try {
+    await navigator.clipboard.writeText(name)
+  } catch {
+    const ta = document.createElement('textarea')
+    ta.value = name
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    ta.remove()
+  }
+  copiedName.value = name
+  clearTimeout(copiedTimer)
+  copiedTimer = setTimeout(() => {
+    copiedName.value = ''
+  }, 1100)
+}
+
+/* ---------------------------------------------------------------- 提示词标签
+ * 卡片的「标签」按钮：按名字查到文件路径，再用 LoraManager 的 metadata 接口取 trainedWords。
+ * 点触发词 → 交给 App 排成标签，写在「＋ 加一个提示词」上面一行，并同步进提示词。
+ */
+const promptPanel = ref(null) // { name, left, top }
+const promptWords = ref({}) // name -> string[]
+const promptBusy = new Set()
+const promptImagePrompts = ref({}) // name -> [{ i, text }]，civitai 例图里带的完整提示词
+/** 默认第一条：这个 LoRA 还没点过触发词时，自动把第一条加上 */
+const autoFirst = ref(false)
+/** 例图提示词：默认单选（选另一张会替换），勾上「多选」才允许同时选多条 */
+const exampleMulti = ref(false)
+
+function normalizeWords(meta) {
+  const raw = meta?.trainedWords || meta?.civitai?.trainedWords || []
+  return (Array.isArray(raw) ? raw : []).map((w) => String(w || '').trim()).filter(Boolean)
+}
+
+/** 例图里的提示词：按 images 顺序记下标，方便在面板里标「图 N」；只有图没有 prompt 的也留着 */
+function normalizeImagePrompts(meta) {
+  const imgs = Array.isArray(meta?.images) ? meta.images : []
+  const out = []
+  const seen = new Set()
+  imgs.forEach((img, i) => {
+    // 例图提示词常带换行/BOM，压成一行再当标签，免得把「一组提示词」按换行拆散
+    const text = String(img?.meta?.prompt || '')
+      .replace(/\uFEFF/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+    const url = String(img?.url || '')
+    if (!text && !url) return
+    const dedupe = text || `url:${url}`
+    if (seen.has(dedupe)) return
+    seen.add(dedupe)
+    out.push({ i, text, url })
+  })
+  return out.slice(0, 12)
+}
+
+/** 工作流里的名字可能带目录前缀 / 扩展名 / 训练步数后缀，逐个变体去搜 */
+function searchTerms(name) {
+  const base = String(name || '').replace(/\\/g, '/').split('/').pop()
+  const stem = base.replace(/\.(safetensors|sft|pt|pth|ckpt|bin)$/i, '')
+  const out = []
+  for (const t of [name, base, stem, stem.replace(/([-_.]step[-_]?\d+)$/i, '')]) {
+    const v = String(t || '').trim()
+    if (v && !out.includes(v)) out.push(v)
+  }
+  return out
+}
+
+async function fetchTrainedWords(name, force = false) {
+  const key = normName(name)
+  if (!key || promptBusy.has(key)) return
+  if (force) {
+    // 每次点「标签」都重取一遍，元数据改过也能立刻看到
+    const next = { ...promptWords.value }
+    delete next[key]
+    promptWords.value = next
+    const nextPrompts = { ...promptImagePrompts.value }
+    delete nextPrompts[key]
+    promptImagePrompts.value = nextPrompts
+  } else if (key in promptWords.value) return
+  promptBusy.add(key)
+  try {
+    // metadata 接口只认 file_path，先按名字搜一条拿路径
+    const baseName = String(name || '').replace(/\\/g, '/').split('/').pop()
+    const baseKey = normName(baseName)
+    // 工作流里写的是文件名（facialcummassive_FLUX），列表里的 model_name 可能是
+    // 「Facial cum massive FLUX」，所以文件名、模型名都要比，再退一步去掉空格比
+    const loose = (s) => normName(s).replace(/[^a-z0-9]+/g, '')
+    const hitOf = (rows) =>
+      rows.find((it) =>
+        [it.model_name, it.file_name].some((n) => {
+          const k = normName(n)
+          return k === key || (baseKey && k === baseKey)
+        })
+      ) ||
+      rows.find((it) =>
+        [it.model_name, it.file_name].some((n) => loose(n) === loose(baseName))
+      ) ||
+      null
+    let hit = null
+    let weak = null
+    for (const term of searchTerms(name)) {
+      const list = await apiGet(
+        `/api/lm/loras/list?search=${encodeURIComponent(term)}&page=1&page_size=20`
+      )
+      const rows = list?.items || []
+      if (!rows.length) continue
+      hit = hitOf(rows)
+      if (hit) break
+      if (!weak) weak = rows[0]
+    }
+    if (!hit) hit = weak
+    let words = normalizeWords({ trainedWords: hit?.civitai?.trainedWords })
+    let prompts = []
+    if (hit?.file_path) {
+      try {
+        const data = await apiGet(
+          `/api/lm/loras/metadata?file_path=${encodeURIComponent(hit.file_path)}`
+        )
+        const metaWords = normalizeWords(data?.metadata)
+        if (metaWords.length) words = metaWords
+        prompts = normalizeImagePrompts(data?.metadata)
+      } catch {
+        // metadata 读不到就退回列表里自带的触发词
+      }
+    }
+    promptWords.value = { ...promptWords.value, [key]: words }
+    promptImagePrompts.value = { ...promptImagePrompts.value, [key]: prompts }
+  } catch {
+    promptWords.value = { ...promptWords.value, [key]: [] }
+    promptImagePrompts.value = { ...promptImagePrompts.value, [key]: [] }
+  } finally {
+    promptBusy.delete(key)
+  }
+}
+
+const promptKeyNow = computed(() => normName(promptPanel.value?.name || ''))
+const promptWordsNow = computed(() => promptWords.value[promptKeyNow.value] || [])
+const promptPromptsNow = computed(() => promptImagePrompts.value[promptKeyNow.value] || [])
+const promptLoading = computed(
+  () => !!promptPanel.value && !(promptKeyNow.value in promptWords.value)
+)
+
+/** 每张卡里已经加进「新提示词」的标签（触发词 + 例图提示词），用于卡片右上角亮灯 */
+const taggedByCard = computed(() => {
+  const picked = new Set(props.addedWords)
+  const out = new Map()
+  if (!picked.size) return out
+  for (const p of checkedPreviews.value) {
+    const key = normName(p.name)
+    if (!key || out.has(key)) continue
+    const words = new Set(
+      [...(promptWords.value[key] || []), ...(promptImagePrompts.value[key] || []).map((it) => it.text)]
+        .filter((w) => picked.has(w))
+    )
+    if (words.size) out.set(key, [...words])
+  }
+  return out
+})
+function taggedWords(p) {
+  return taggedByCard.value.get(normName(p?.name)) || []
+}
+
+// 「默认第一条」：勾选中的 LoRA 都自动贡献第一条触发词；整条都没点过词才加
+const enabledLoraNames = computed(() =>
+  items.value
+    .filter((it) => isActive(it) && !isBypassed(it))
+    .map((it) => readName(it))
+    .filter(Boolean)
+)
+let autoFirstRun = 0
+const autoSettled = new Set() // 已经自动加过第一条的 LoRA；再勾回来会重新加
+
+async function runAutoFirst(names) {
+  if (!autoFirst.value || !names.length) return
+  const run = ++autoFirstRun
+  const seen = new Set(props.addedWords)
+  for (const name of names) {
+    const key = normName(name)
+    if (!key) continue
+    if (!(key in promptWords.value)) await fetchTrainedWords(name)
+    if (run !== autoFirstRun) return
+    const words = promptWords.value[key] || []
+    if (!words.length || words.some((w) => seen.has(w))) continue
+    seen.add(words[0])
+    emitTag(name, words[0])
+  }
+}
+
+watch(autoFirst, (on) => {
+  autoSettled.clear()
+  for (const n of enabledLoraNames.value) autoSettled.add(normName(n))
+  if (on) runAutoFirst([...enabledLoraNames.value])
+})
+
+// 新勾上的 LoRA 也照办；取消勾选后名字会被移出，重新勾上时再补一次
+watch(enabledLoraNames, (list) => {
+  const fresh = list.filter((n) => !autoSettled.has(normName(n)))
+  autoSettled.clear()
+  for (const n of list) autoSettled.add(normName(n))
+  if (autoFirst.value) runAutoFirst(fresh)
+})
+
+function openPromptPanel(p, event) {
+  // 同一个 LoRA 再点一次不关面板，只把触发词刷新到最新
+  if (promptPanel.value?.name === p.name) {
+    fetchTrainedWords(p.name, true)
+    return
+  }
+  const rect = event.currentTarget.getBoundingClientRect()
+  const width = 300
+  const height = 420
+  // 固定贴在按钮右边；右边真放不下再往左收，但优先靠右贴边
+  let left = rect.right + 8
+  if (left + width > window.innerWidth - 8) left = Math.max(8, window.innerWidth - width - 8)
+  promptPanel.value = {
+    name: p.name,
+    left,
+    top: Math.max(8, Math.min(rect.top - 8, window.innerHeight - height - 8)),
+  }
+  closeWeightMenu()
+  hideBigPreview()
+  fetchTrainedWords(p.name, true)
+}
+
+function closePromptPanel() {
+  promptPanel.value = null
+  hideBigPreview()
+}
+
+function onDocMouseDownPrompt(event) {
+  if (!promptPanel.value) return
+  if (event.target.closest?.('.lp-tags')) return
+  // 点同一个「标签」按钮由 click 自己切换开关，别在 mousedown 就关掉再重开
+  if (event.target.closest?.('.lp-g-tag')) return
+  closePromptPanel()
+}
+
+/** 点触发词：加进「新提示词」；已经加过的再点一次就取消 */
+function emitTag(name, word) {
+  const key = normName(name)
+  if (!key || !word) return
+  emit('prompt-tag-toggle', { id: key, name, word })
+}
+
+function addPromptTag(word) {
+  emitTag(promptPanel.value?.name || '', word)
+}
+
+/** 例图提示词：点选就把整段复制走，不给任何提示；单选时选另一张会把这一组里已选的那条换掉 */
+function pickExamplePrompt(p) {
+  const name = promptPanel.value?.name || ''
+  const key = normName(name)
+  if (!key || !p?.text) return
+  const wasAdded = props.addedWords.includes(p.text)
+  if (!exampleMulti.value) {
+    const list = promptImagePrompts.value[key] || []
+    for (const it of list) {
+      if (it.text !== p.text && props.addedWords.includes(it.text)) emitTag(name, it.text)
+    }
+  }
+  emitTag(name, p.text)
+  // 取消勾选时不复制，只有真正加进新提示词才顺手放进剪贴板
+  if (!wasAdded) copyQuiet(p.text)
+}
+
+/** 静默复制：不弹提示、不改按钮文案，失败就算了 */
+function copyQuiet(text) {
+  if (!text) return
+  try {
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {})
+      return
+    }
+  } catch { /* 走下面的兜底 */ }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    document.execCommand('copy')
+    ta.remove()
+  } catch { /* 剪贴板不可用就只当没复制 */ }
 }
 
 function isFast(item) {
@@ -467,15 +1012,105 @@ function dismissFastErr() {
   fast.value = { ...fast.value, err: '' }
 }
 
-onMounted(refreshFast)
+/* ---------------------------------------------------------------- 常用权重
+ * 点权重输入框弹出常用值，选中即写回；仍然可以直接手输 / ‹ › 微调。
+ */
+const WEIGHT_PRESETS = [
+  0, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8,
+  0.85, 0.9, 0.95, 1, 1.05, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.8, 2,
+]
+
+const weightMenu = ref(null) // { index, field: 'strength' | 'clip', left, top }
+
+function openWeightMenu(index, event, field = 'strength') {
+  if (field === 'strength' && hasSweep(index)) return
+  const rect = event.currentTarget.getBoundingClientRect()
+  const width = 232
+  const height = 218
+  weightMenu.value = {
+    index,
+    field,
+    left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)),
+    top:
+      rect.bottom + 6 + height > window.innerHeight
+        ? Math.max(8, rect.top - height - 6)
+        : rect.bottom + 6,
+  }
+}
+
+/** 弹层里高亮的那一格 */
+function menuValue() {
+  const menu = weightMenu.value
+  const item = menu ? items.value[menu.index] : null
+  if (!menu || !item) return null
+  return menu.field === 'clip' ? readClip(item) : readStrength(item)
+}
+
+function closeWeightMenu() {
+  weightMenu.value = null
+}
+
+function pickWeight(value) {
+  const menu = weightMenu.value
+  if (!menu) return
+  if (menu.field === 'clip') setClipStrength(menu.index, value)
+  else setStrength(menu.index, value)
+  weightMenu.value = null
+}
+
+function onWeightKeydown(event) {
+  if (event.key === 'Escape') {
+    closeWeightMenu()
+    event.target.blur()
+  }
+}
+
+function onDocMouseDown(event) {
+  onDocMouseDownPrompt(event)
+  if (!weightMenu.value) return
+  if (event.target.closest?.('.lp-weight-menu')) return
+  if (event.target.closest?.('.lp-step')) return
+  closeWeightMenu()
+}
+
+onMounted(() => {
+  refreshFast()
+  if (props.open) loadPreviews()
+  document.addEventListener('mousedown', onDocMouseDown, true)
+  window.addEventListener('resize', closeWeightMenu)
+})
 watch(
   () => props.open,
   (open) => {
-    if (open) refreshFast()
+    if (open) {
+      refreshFast()
+      loadPreviews()
+    } else {
+      closeWeightMenu()
+      hideBigPreview()
+      closePromptPanel()
+      drafts.value = {}
+    }
+  }
+)
+watch(itemNames, (names) => {
+  if (props.open) names.forEach(fetchPreview)
+})
+watch(
+  () => props.nodeId,
+  () => {
+    closeWeightMenu()
+    closePromptPanel()
+    drafts.value = {}
+    if (props.open) loadPreviews()
   }
 )
 onBeforeUnmount(() => {
   pollToken++
+  clearTimeout(bigTimer)
+  clearTimeout(copiedTimer)
+  document.removeEventListener('mousedown', onDocMouseDown, true)
+  window.removeEventListener('resize', closeWeightMenu)
 })
 
 </script>
@@ -589,6 +1224,10 @@ onBeforeUnmount(() => {
       </div>
 
       <template v-else>
+        <label class="lp-gallery-toggle" @click.stop>
+          <input v-model="gallery" type="checkbox" />
+          <span>已勾选预览图</span>
+        </label>
         <div class="lp-stack">
           <div class="lp-stack-head">
             <span class="lp-stack-label">{{ previewLabel }}</span>
@@ -639,18 +1278,34 @@ onBeforeUnmount(() => {
               </button>
             </div>
           </div>
-          <div class="lp-rows">
+          <div class="lp-rows" @scroll="hideBigPreview">
             <div
               v-for="({ item, index: i }) in visibleRows"
               :key="i"
               class="lp-row-wrap"
-              :class="{ off: !isActive(item), sweeping: hasSweep(i) }"
+              :class="{
+                on: isActive(item) && !isBypassed(item),
+                off: !isActive(item),
+                sweeping: hasSweep(i),
+                bypassed: isBypassed(item),
+              }"
             >
               <div
-                class="lp-row"
-                :title="isActive(item) ? '点击停用这条 LoRA' : '点击启用这条 LoRA'"
-                @click="setActive(i, !isActive(item))"
+                class="lp-thumb"
+                :class="{ empty: !previewOf(item) }"
+                @mouseenter="showBigPreview(item, $event)"
+                @mouseleave="hideBigPreview"
               >
+                <img
+                  v-if="previewOf(item)"
+                  :src="previewOf(item)"
+                  :alt="readName(item)"
+                  :title="readName(item)"
+                  loading="lazy"
+                  @error="onPreviewError(item)"
+                />
+              </div>
+              <div class="lp-row">
                 <label class="lp-check" @click.stop>
                   <input
                     type="checkbox"
@@ -666,7 +1321,26 @@ onBeforeUnmount(() => {
                   @click.stop
                   >⚡</span
                 >
-                <span class="lp-name" :title="readName(item)">{{ readName(item) || '（未命名）' }}</span>
+                <span
+                  class="lp-name"
+                  :title="nameTitle(item)"
+                  @click.stop="setActive(i, !isActive(item))"
+                  >{{ readName(item) || '（未命名）' }}</span
+                >
+                <button
+                  type="button"
+                  class="lp-keep"
+                  :class="{ on: isBypassed(item) }"
+                  :disabled="!isActive(item)"
+                  :title="
+                    isBypassed(item)
+                      ? '取消禁用：重新参与生成'
+                      : '禁用但保留：留在已勾选列表里，生成时不生效'
+                  "
+                  @click.stop="setBypass(i, !isBypassed(item))"
+                >
+                  ⊘
+                </button>
                 <div
                   class="lp-step"
                   :class="{ muted: hasSweep(i) }"
@@ -685,10 +1359,14 @@ onBeforeUnmount(() => {
                   <input
                     type="number"
                     step="0.05"
-                    :value="fmtStrength(item)"
-                    title="强度（0.05 步进，可直接输入）"
+                    :value="inputText(i, item, 'strength')"
+                    title="强度：输入即生效；点击弹出常用权重"
                     :disabled="hasSweep(i)"
-                    @change="onStrengthChange(i, $event)"
+                    @focus="$event.target.select(); openWeightMenu(i, $event)"
+                    @click.stop="openWeightMenu(i, $event)"
+                    @input="onStrengthInput(i, $event)"
+                    @blur="clearDraft(i, 'strength')"
+                    @keydown="onWeightKeydown"
                     @keyup.enter="$event.target.blur()"
                   />
                   <button
@@ -703,9 +1381,22 @@ onBeforeUnmount(() => {
                 </div>
                 <button
                   type="button"
+                  class="lp-clip-btn"
+                  :class="{ on: clipOpen(item) }"
+                  :title="
+                    clipOpen(item)
+                      ? `收起 CLIP 控制：收起后 clip 强度跟随模型强度${fmtStrength(item)}`
+                      : '展开 CLIP 控制：单独设置 clip 强度（展开后标签写第三段，如 1.00:1.00）'
+                  "
+                  @click.stop="toggleClip(i)"
+                >
+                  clip
+                </button>
+                <button
+                  type="button"
                   class="lp-cmp"
                   :class="{ on: hasSweep(i) }"
-                  :disabled="!isActive(item)"
+                  :disabled="!isActive(item) || isBypassed(item)"
                   :title="
                     hasSweep(i)
                       ? '关闭权重对比'
@@ -715,6 +1406,30 @@ onBeforeUnmount(() => {
                 >
                   {{ hasSweep(i) ? `×${sweepOf(i).length}` : '⇄' }}
                 </button>
+              </div>
+              <div v-if="clipOpen(item)" class="lp-clip" @click.stop>
+                <span class="lp-clip-tag" title="展开后标签一律写第三段（clip 为 1.00 也写成 1.00:1.00）">[clip]</span>
+                <span class="lp-clip-name" :title="readName(item)">{{ readName(item) }}</span>
+                <div class="lp-step lp-clip-step">
+                  <button type="button" class="lp-arrow" title="减少 0.05" @click="nudgeClip(i, -0.05)">
+                    ‹
+                  </button>
+                  <input
+                    type="number"
+                    step="0.05"
+                    :value="inputText(i, item, 'clip')"
+                    title="CLIP 强度：输入即生效；点击弹出常用权重"
+                    @focus="$event.target.select(); openWeightMenu(i, $event, 'clip')"
+                    @click.stop="openWeightMenu(i, $event, 'clip')"
+                    @input="onClipInput(i, $event)"
+                    @blur="clearDraft(i, 'clip')"
+                    @keydown="onWeightKeydown"
+                    @keyup.enter="$event.target.blur()"
+                  />
+                  <button type="button" class="lp-arrow" title="增加 0.05" @click="nudgeClip(i, 0.05)">
+                    ›
+                  </button>
+                </div>
               </div>
               <div v-if="hasSweep(i)" class="lp-sweep" @click.stop>
                 <div class="lp-sweep-head">
@@ -807,6 +1522,283 @@ onBeforeUnmount(() => {
       </span>
       <span class="fab-caret">{{ open ? '▾' : '▴' }}</span>
     </button>
+
+    <Teleport to="body">
+      <section
+        v-if="promptPanel"
+        class="lp-tags"
+        :style="{ left: promptPanel.left + 'px', top: promptPanel.top + 'px' }"
+      >
+        <header class="lp-tags-head">
+          <span class="lp-tags-title">提示词</span>
+          <span class="lp-tags-name" :title="promptPanel.name">{{ promptPanel.name }}</span>
+          <button type="button" class="lp-tags-close" title="关闭" @click="closePromptPanel">
+            ×
+          </button>
+        </header>
+        <div class="lp-tags-body">
+          <div class="lp-tags-scroll">
+            <div class="lp-tags-list">
+              <span class="lp-tags-label">触发词 · 点一下加到新提示词</span>
+              <p v-if="promptLoading" class="lp-tags-empty">读取中…</p>
+              <p v-else-if="!promptWordsNow.length" class="lp-tags-empty">
+                这个 LoRA 没取到触发词（需要 LoraManager 里有它的 metadata）
+              </p>
+              <button
+                v-for="w in promptWordsNow"
+                :key="w"
+                type="button"
+                class="lp-tags-word"
+                :class="{ on: addedWords.includes(w) }"
+                :title="addedWords.includes(w) ? `${w}\n再点一下从「新提示词」里移除` : w"
+                @click="addPromptTag(w)"
+              >
+                {{ w }}
+              </button>
+            </div>
+            <div v-if="promptPromptsNow.length" class="lp-tags-list">
+              <div class="lp-tags-list-head">
+                <span class="lp-tags-label">
+                  例图提示词 · {{ exampleMulti ? '多选' : '单选，选另一张会替换' }}
+                </span>
+                <label
+                  class="lp-tags-multi"
+                  title="关闭：一次只用一张例图提示词，选另一张会替换已选的；开启：可以同时选多张"
+                >
+                  <input v-model="exampleMulti" type="checkbox" />
+                  <span>多选</span>
+                </label>
+              </div>
+              <button
+                v-for="p in promptPromptsNow"
+                :key="p.i + p.text"
+                type="button"
+                class="lp-tags-word lp-tags-prompt"
+                :class="{ on: addedWords.includes(p.text), blank: !p.text }"
+                @click="pickExamplePrompt(p)"
+                @mouseenter="showBigUrl(p.url, `图 ${p.i + 1}`, $event)"
+                @mouseleave="hideBigPreview"
+              >
+                <img v-if="p.url" class="lp-tags-thumb" :src="p.url" alt="" loading="lazy" />
+                <span class="lp-tags-prompt-text">
+                  <em class="lp-tags-idx">图 {{ p.i + 1 }}</em>{{ p.text }}
+                </span>
+              </button>
+            </div>
+          </div>
+          <p class="lp-tags-foot">标签排在「＋ 加一个提示词」上面，拖动可换顺序</p>
+        </div>
+      </section>
+    </Teleport>
+
+    <Teleport to="body">
+      <section v-if="gallery" class="lp-gallery" aria-label="已勾选 LoRA 预览图">
+        <header class="lp-gallery-head">
+          <span>已勾选预览图</span>
+          <span class="lp-gallery-count">{{ checkedPreviews.length }} 张</span>
+          <label class="lp-gallery-pin" title="开启后：已启用的排前面，临时禁用的沉到下面">
+            <input v-model="galleryTop" type="checkbox" />
+            <span>顶置</span>
+          </label>
+          <label
+            class="lp-gallery-pin sub"
+            title="开启后：点开某个 LoRA 的标签面板时，没点过触发词就自动选中第一条"
+          >
+            <input v-model="autoFirst" type="checkbox" />
+            <span>默认第一条</span>
+          </label>
+          <button type="button" class="lp-gallery-close" title="关掉预览图面板" @click="gallery = false">
+            ×
+          </button>
+        </header>
+        <div v-if="checkedPreviews.length" class="lp-gallery-grid">
+          <figure
+            v-for="p in galleryItems"
+            :key="p.name"
+            class="lp-gallery-item"
+            :class="{ bypassed: p.bypassed }"
+          >
+            <button
+              type="button"
+              class="lp-g-shot"
+              :title="
+                p.bypassed
+                  ? '点击取消临时禁用：重新参与生成'
+                  : '点击临时禁用：留在已勾选里，生成时不生效'
+              "
+              @click.stop="setBypass(p.index, !p.bypassed)"
+            >
+              <img :src="p.url" :alt="p.name" loading="lazy" />
+              <span
+                v-if="taggedWords(p).length"
+                class="lp-g-tagdot"
+                :title="`已加进新提示词 ${taggedWords(p).length} 条：\n${taggedWords(p).join('\n')}`"
+              >
+                {{ taggedWords(p).length }}
+              </span>
+              <span v-if="p.bypassed" class="lp-g-off">⊘ 已禁用</span>
+            </button>
+            <button
+              type="button"
+              class="lp-g-name"
+              :class="{ copied: copiedName === p.name }"
+              :title="`点击复制：${p.name}`"
+              @click.stop="copyName(p.name)"
+            >
+              {{ copiedName === p.name ? '已复制' : p.name }}
+            </button>
+            <div class="lp-g-ctrl" @click.stop>
+              <button
+                type="button"
+                class="lp-g-tag"
+                :class="{ on: promptPanel?.name === p.name, tagged: taggedWords(p).length }"
+                :title="
+                  taggedWords(p).length
+                    ? `这个 LoRA 已有 ${taggedWords(p).length} 条标签进了新提示词\n${taggedWords(p).join('\n')}\n点击查看触发词`
+                    : '提示词标签：查看这个 LoRA 的触发词，点一下加进新提示词'
+                "
+                @click.stop="openPromptPanel(p, $event)"
+              >
+                标签
+              </button>
+              <div class="lp-g-step" :class="{ muted: hasSweep(p.index) }">
+                <button
+                  type="button"
+                  class="lp-g-arrow"
+                  :disabled="hasSweep(p.index)"
+                  title="减少 0.05"
+                  @click="nudgeStrength(p.index, -0.05)"
+                >
+                  ‹
+                </button>
+                <input
+                  type="number"
+                  step="0.05"
+                  :value="inputText(p.index, p.item, 'strength')"
+                  title="模型强度：输入即生效；点击弹出常用权重"
+                  :disabled="hasSweep(p.index)"
+                  @focus="$event.target.select(); openWeightMenu(p.index, $event)"
+                  @click.stop="openWeightMenu(p.index, $event)"
+                  @input="onStrengthInput(p.index, $event)"
+                  @blur="clearDraft(p.index, 'strength')"
+                  @keydown="onWeightKeydown"
+                  @keyup.enter="$event.target.blur()"
+                />
+                <button
+                  type="button"
+                  class="lp-g-arrow"
+                  :disabled="hasSweep(p.index)"
+                  title="增加 0.05"
+                  @click="nudgeStrength(p.index, 0.05)"
+                >
+                  ›
+                </button>
+              </div>
+              <button
+                type="button"
+                class="lp-clip-btn lp-g-clip"
+                :class="{ on: clipOpen(p.item) }"
+                :title="
+                  clipOpen(p.item)
+                    ? '收起 CLIP 控制：clip 强度跟随模型强度'
+                    : '展开 CLIP 控制：单独设置 clip 强度'
+                "
+                @click.stop="toggleClip(p.index)"
+              >
+                clip
+              </button>
+              <button
+                type="button"
+                class="lp-cmp lp-g-cmp"
+                :class="{ on: hasSweep(p.index) }"
+                :disabled="p.bypassed"
+                :title="
+                  hasSweep(p.index)
+                    ? '关闭权重对比'
+                    : '权重对比：生成时按多个权重各出一张'
+                "
+                @click.stop="toggleSweep(p.index)"
+              >
+                {{ hasSweep(p.index) ? `×${sweepOf(p.index).length}` : '⇄' }}
+              </button>
+            </div>
+            <div
+              v-if="clipOpen(p.item)"
+              class="lp-g-step lp-g-clip-step"
+              @click.stop
+            >
+              <span class="lp-g-clip-tag">clip</span>
+              <button
+                type="button"
+                class="lp-g-arrow"
+                title="减少 0.05"
+                @click="nudgeClip(p.index, -0.05)"
+              >
+                ‹
+              </button>
+              <input
+                type="number"
+                step="0.05"
+                :value="inputText(p.index, p.item, 'clip')"
+                title="CLIP 强度：输入即生效；点击弹出常用权重"
+                @focus="$event.target.select(); openWeightMenu(p.index, $event, 'clip')"
+                @click.stop="openWeightMenu(p.index, $event, 'clip')"
+                @input="onClipInput(p.index, $event)"
+                @blur="clearDraft(p.index, 'clip')"
+                @keydown="onWeightKeydown"
+                @keyup.enter="$event.target.blur()"
+              />
+              <button
+                type="button"
+                class="lp-g-arrow"
+                title="增加 0.05"
+                @click="nudgeClip(p.index, 0.05)"
+              >
+                ›
+              </button>
+            </div>
+          </figure>
+        </div>
+        <p v-else class="lp-gallery-empty">已勾选的 LoRA 还没有预览图</p>
+      </section>
+    </Teleport>
+
+    <Teleport to="body">
+      <div
+        v-if="bigPreview"
+        class="lp-big"
+        :style="{ left: bigPreview.left + 'px', top: bigPreview.top + 'px' }"
+      >
+        <img :src="bigPreview.url" :alt="bigPreview.name" />
+        <div class="lp-big-name">{{ bigPreview.name }}</div>
+      </div>
+    </Teleport>
+
+    <Teleport to="body">
+      <div
+        v-if="weightMenu"
+        class="lp-weight-menu"
+        :style="{ left: weightMenu.left + 'px', top: weightMenu.top + 'px' }"
+        @mousedown.stop
+      >
+        <div class="lp-weight-head">
+          <span>{{ weightMenu.field === 'clip' ? 'CLIP 常用权重' : '常用权重' }}</span>
+          <span class="lp-weight-hint">也可直接输入</span>
+        </div>
+        <div class="lp-weight-grid">
+          <button
+            v-for="w in WEIGHT_PRESETS"
+            :key="w"
+            type="button"
+            class="lp-weight-val"
+            :class="{ on: Math.abs((menuValue() ?? -1) - w) < 0.001 }"
+            @click="pickWeight(w)"
+          >
+            {{ w.toFixed(2) }}
+          </button>
+        </div>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -827,7 +1819,7 @@ onBeforeUnmount(() => {
 
 /* —— 面板：贴合截图里的节点外观 —— */
 .lp {
-  width: 380px;
+  width: 460px;
   height: min(700px, calc(100vh - 110px));
   display: flex;
   flex-direction: column;
@@ -1092,6 +2084,27 @@ onBeforeUnmount(() => {
 .lp-chains-hint { margin: 0; font-size: 10px; color: #7f7f7f; line-height: 1.5; }
 
 /* —— lora 堆栈文本预览 —— */
+/* 已勾选预览图开关（在「串联启用预览」上方） */
+.lp-gallery-toggle {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 12px 0;
+  font-size: 11.5px;
+  color: #b9b9b9;
+  cursor: pointer;
+  user-select: none;
+}
+.lp-gallery-toggle input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: #4b8fce;
+  cursor: pointer;
+}
+.lp-gallery-toggle:hover { color: #e2e2e2; }
+
 .lp-stack { flex: 0 0 auto; padding: 10px 12px 0; }
 .lp-stack-head {
   display: flex;
@@ -1239,20 +2252,507 @@ onBeforeUnmount(() => {
 .lp-rows::-webkit-scrollbar-thumb { background: #555; border-radius: 4px; }
 .lp-rows::-webkit-scrollbar-track { background: transparent; }
 
-.lp-row-wrap { border-bottom: 1px solid #3d3d3d; }
+/* 左侧固定缩略图位（44px），没有预览图也占位，保证各行控件对齐 */
+.lp-row-wrap {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  column-gap: 8px;
+  padding-left: 10px;
+  border-bottom: 1px solid #3d3d3d;
+}
 .lp-row-wrap:last-child { border-bottom: none; }
+.lp-thumb {
+  grid-row: 1 / -1;
+  align-self: start;
+  width: 44px;
+  height: 44px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #262626;
+  border: 1px solid #3d3d3d;
+}
+.lp-thumb.empty { border-style: dashed; border-color: #383838; }
+.lp-thumb:not(.empty) { cursor: zoom-in; }
+.lp-thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* 悬停缩略图时在缩略图右侧弹出大图 */
+.lp-big {
+  position: fixed;
+  z-index: 9999;
+  pointer-events: none;
+  padding: 5px;
+  background: #1f1f1f;
+  border: 1px solid #4f4f4f;
+  border-radius: 10px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .6);
+}
+.lp-big img {
+  display: block;
+  max-width: 300px;
+  max-height: 380px;
+  border-radius: 6px;
+  object-fit: contain;
+}
+.lp-big-name {
+  max-width: 300px;
+  padding: 5px 2px 1px;
+  font-size: 11px;
+  color: #b9b9b9;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 已勾选预览图面板：屏幕右上、LoRA 面板左侧，互不遮挡 */
+.lp-gallery {
+  position: fixed;
+  top: 16px;
+  right: 492px;
+  z-index: 54;
+  width: 420px;
+  max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+  background: #383838;
+  border: 1px solid #4f4f4f;
+  border-radius: 12px;
+  box-shadow: 0 22px 60px rgba(0, 0, 0, .55);
+  overflow: hidden;
+}
+.lp-gallery-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #454545;
+  font-size: 12px;
+  color: #d6d6d6;
+}
+.lp-gallery-count { font-size: 11px; color: #9a9a9a; }
+.lp-gallery-pin {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: #b9b9b9;
+  cursor: pointer;
+  user-select: none;
+}
+.lp-gallery-pin input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: #4b8fce;
+  cursor: pointer;
+}
+.lp-gallery-pin.sub { margin-left: 0; }
+.lp-gallery-pin:hover { color: #e2e2e2; }
+.lp-gallery-close {
+  margin-left: 0;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  font-size: 15px;
+  line-height: 1;
+  color: #9a9a9a;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.lp-gallery-close:hover { background: #4a4a4a; color: #f0f0f0; }
+.lp-gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px;
+  padding: 12px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #555 transparent;
+}
+.lp-gallery-item { margin: 0; min-width: 0; }
+.lp-g-shot {
+  position: relative;
+  display: block;
+  width: 100%;
+  padding: 0;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.lp-g-shot img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 3 / 4;
+  object-fit: cover;
+  background: #262626;
+  border: 1px solid #4a4a4a;
+  border-radius: 8px;
+  transition: border-color .12s;
+}
+.lp-g-shot:hover img { border-color: #7a7a7a; }
+.lp-g-off {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  padding: 3px 8px;
+  font-size: 11px;
+  white-space: nowrap;
+  color: #ffd7d7;
+  background: rgba(58, 22, 22, .82);
+  border: 1px solid #7a4444;
+  border-radius: 999px;
+}
+/* 卡片有标签被加进「新提示词」：右上角亮个计数点，配色跟 clip 点亮一致 */
+.lp-g-tagdot {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1;
+  color: #b9e6da;
+  background: rgba(30, 45, 42, .92);
+  border: 1px solid #476b64;
+  border-radius: 999px;
+  box-shadow: 0 0 6px rgba(127, 208, 192, .55);
+  pointer-events: none;
+}
+.lp-g-name {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 0;
+  font-size: 11px;
+  text-align: left;
+  color: #b9b9b9;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lp-g-name:hover { color: #f0f0f0; }
+.lp-g-name.copied { color: #7bd39a; }
+.lp-g-ctrl {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 5px;
+}
+.lp-g-step {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 22px;
+  background: #1f1f1f;
+  border: 1px solid #4a4a4a;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.lp-g-step input {
+  width: 100%;
+  min-width: 0;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: #dedede;
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: center;
+  outline: none;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.lp-g-step input::-webkit-outer-spin-button,
+.lp-g-step input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+.lp-g-step input:focus { background: #262626; }
+.lp-g-step.muted { opacity: .5; }
+.lp-g-step.muted input,
+.lp-g-step.muted .lp-g-arrow { cursor: not-allowed; }
+.lp-g-arrow {
+  width: 16px;
+  height: 20px;
+  flex: 0 0 auto;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: 1;
+  color: #9a9a9a;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+.lp-g-arrow:hover:not(:disabled) { background: #404040; color: #e6e6e6; }
+.lp-g-clip {
+  width: 30px;
+  height: 22px;
+  font-size: 9px;
+}
+.lp-g-cmp {
+  width: 26px;
+  height: 22px;
+}
+/* 卡片里的「标签」：打开触发词面板 */
+.lp-g-tag {
+  position: relative;
+  flex: 0 0 auto;
+  width: 34px;
+  height: 22px;
+  padding: 0;
+  font-size: 10px;
+  line-height: 1;
+  color: #8f8f8f;
+  background: #2a2a2a;
+  border: 1px solid #484848;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color .12s, background .12s, border-color .12s;
+}
+.lp-g-tag:hover { color: #dedede; background: #343434; border-color: #5f5f5f; }
+.lp-g-tag.on {
+  color: #cfe6fb;
+  background: #3d5468;
+  border-color: #4d6a85;
+}
+/* 已经有标签进了新提示词：跟 clip 点亮同一套配色，右上角加个亮 */
+.lp-g-tag.tagged,
+.lp-g-tag.on.tagged {
+  color: #b9e6da;
+  background: #2f4440;
+  border-color: #476b64;
+  box-shadow: 0 0 0 1px rgba(127, 208, 192, .16);
+}
+.lp-g-tag.tagged::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #7fd0c0;
+  box-shadow: 0 0 5px rgba(127, 208, 192, .8);
+}
+
+/* 触发词面板：只负责把这个 LoRA 的触发词交出去，标签队列显示在主提示词框上方 */
+.lp-tags {
+  position: fixed;
+  z-index: 9998;
+  width: 300px;
+  max-height: min(420px, calc(100vh - 24px));
+  display: flex;
+  flex-direction: column;
+  background: #3a3a3a;
+  border: 1px solid #565656;
+  border-radius: 10px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, .6);
+  overflow: hidden;
+}
+.lp-tags-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: #333;
+  border-bottom: 1px solid #4a4a4a;
+}
+.lp-tags-title { flex: 0 0 auto; font-size: 11.5px; color: #dedede; }
+.lp-tags-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 10.5px;
+  color: #9fb7a8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lp-tags-close {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+  color: #9a9a9a;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.lp-tags-close:hover { background: #4a4a4a; color: #f0f0f0; }
+.lp-tags-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.lp-tags-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 8px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #555 transparent;
+}
+.lp-tags-list { display: flex; flex-direction: column; gap: 4px; }
+.lp-tags-label { font-size: 10.5px; color: #b9b9b9; }
+.lp-tags-list-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.lp-tags-list-head .lp-tags-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.lp-tags-multi {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: #9a9a9a;
+  cursor: pointer;
+  user-select: none;
+}
+.lp-tags-multi:hover { color: #d6d6d6; }
+.lp-tags-multi input {
+  width: 12px;
+  height: 12px;
+  margin: 0;
+  accent-color: #4b8fce;
+  cursor: pointer;
+}
+.lp-tags-foot {
+  margin: 0;
+  padding: 6px 8px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: #8f8f8f;
+  background: #333;
+  border-top: 1px solid #4a4a4a;
+}
+.lp-tags-word {
+  display: block;
+  width: 100%;
+  padding: 4px 6px;
+  font-size: 10.5px;
+  text-align: left;
+  color: #d6d6d6;
+  background: #2f2f2f;
+  border: 1px solid #4a4a4a;
+  border-radius: 5px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lp-tags-word:hover { color: #f0f0f0; background: #3f3f3f; border-color: #5f5f5f; }
+.lp-tags-word.on { color: #7bd39a; background: #2f3d34; border-color: #476b4f; }
+/* 例图提示词很长：缩略图 + 两行截断，悬停看大图 */
+.lp-tags-prompt {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 4px;
+  text-align: left;
+}
+/* 例图没有提示词：只占个图位，点它没反应 */
+.lp-tags-prompt.blank { cursor: default; }
+.lp-tags-thumb {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 46px;
+  object-fit: cover;
+  border-radius: 4px;
+  background: #2a2a2a;
+}
+.lp-tags-prompt-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  white-space: normal;
+  line-height: 1.45;
+  overflow: hidden;
+}
+.lp-tags-idx {
+  font-style: normal;
+  font-family: var(--mono);
+  font-size: 9px;
+  color: #8fc7a6;
+  margin-right: 5px;
+}
+.lp-tags-empty { margin: 0; font-size: 10.5px; line-height: 1.5; color: #8f8f8f; }
+.lp-g-clip-step { margin-top: 4px; }
+.lp-g-clip-tag {
+  flex: 0 0 auto;
+  padding-left: 4px;
+  font-family: var(--mono);
+  font-size: 9px;
+  color: #8fc7a6;
+}
+.lp-gallery-item.bypassed img { opacity: .45; filter: grayscale(.6); }
+.lp-gallery-item.bypassed .lp-g-name {
+  color: #e07070;
+  text-decoration: line-through;
+  text-decoration-color: #a15959;
+}
+.lp-gallery-item.bypassed .lp-g-name.copied {
+  color: #7bd39a;
+  text-decoration: none;
+}
+.lp-gallery-item.bypassed .lp-g-step input { color: #e07070; }
+.lp-gallery-empty { margin: 0; padding: 16px 12px; font-size: 11.5px; color: #9a9a9a; }
+@media (max-width: 1000px) {
+  .lp-gallery { right: 16px; max-height: 46vh; }
+}
+/* 已勾选 = 绿字；未勾选 = 灰字；临时禁用（⊘）= 红字 */
+.lp-row-wrap.on .lp-name { color: #7bd39a; }
 .lp-row-wrap.off .lp-name { color: #858585; }
 .lp-row-wrap.sweeping { background: #2f3438; }
+/* 禁用保留：仍勾选，但生成时不生效 */
+.lp-row-wrap.bypassed .lp-name {
+  color: #e07070;
+  text-decoration: line-through;
+  text-decoration-color: #a15959;
+}
+.lp-row-wrap.bypassed .lp-step { opacity: .55; }
 
 .lp-row {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 10px;
-  cursor: pointer;
-  transition: background .12s;
+  padding: 10px 10px 10px 0;
+  cursor: default;
 }
-.lp-row:hover { background: #3b3b3b; }
 .lp-row.off .lp-name { color: #858585; }
 /* 极速目录里的行：点亮的闪电；否则灰掉 */
 .lp-bolt {
@@ -1275,11 +2775,26 @@ onBeforeUnmount(() => {
 .lp-name {
   flex: 1 1 auto;
   min-width: 0;
+  padding: 2px 4px;
+  margin: -2px -4px;
+  border-radius: 4px;
   font-size: 12px;
   color: #d6d6d6;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+  transition: color .12s, background .12s;
+}
+/* 只有名称这一片区域承担「启用/停用」，避免行内误点 */
+.lp-name:hover { color: #f2f2f2; background: #424242; }
+/* 悬停保留各自的状态色：绿 / 红，不亮回普通行 */
+.lp-row-wrap.on .lp-name:hover { color: #a5e9bd; background: #2f3d34; }
+.lp-row-wrap.bypassed .lp-name:hover {
+  color: #f08b8b;
+  text-decoration: line-through;
+  text-decoration-color: #a15959;
+  background: #3d2b2b;
 }
 
 /* 强度步进：‹ 1.00 › */
@@ -1315,6 +2830,10 @@ onBeforeUnmount(() => {
   margin: 0;
 }
 .lp-step input:focus { background: #262626; box-shadow: none; }
+/* 权重数字跟着名称的状态色走 */
+.lp-row-wrap.on .lp-step input { color: #7bd39a; }
+.lp-row-wrap.off .lp-step input { color: #858585; }
+.lp-row-wrap.bypassed .lp-step input { color: #e07070; }
 .lp-arrow {
   width: 20px;
   height: 22px;
@@ -1339,9 +2858,9 @@ onBeforeUnmount(() => {
 /* 对比开关：⇄ / ×N */
 .lp-cmp {
   flex: 0 0 auto;
-  min-width: 28px;
+  width: 30px;
   height: 24px;
-  padding: 0 6px;
+  padding: 0;
   font-family: var(--mono);
   font-size: 11px;
   line-height: 1;
@@ -1360,6 +2879,107 @@ onBeforeUnmount(() => {
   box-shadow: 0 0 0 1px rgba(91, 155, 213, .2);
 }
 .lp-cmp:disabled { opacity: .35; cursor: not-allowed; }
+
+/* 禁用保留开关：⊘ */
+.lp-keep {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 24px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  line-height: 1;
+  color: #8f8f8f;
+  background: #2a2a2a;
+  border: 1px solid #484848;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color .12s, background .12s, border-color .12s;
+}
+/* 已临时禁用的按钮悬停时保留琥珀色高亮，不回落到普通灰 */
+.lp-keep:hover:not(:disabled):not(.on) { color: #dedede; background: #343434; border-color: #5f5f5f; }
+.lp-keep.on:hover { color: #ffcf5c; background: #54471f; border-color: #7a6430; }
+.lp-keep.on {
+  color: #ffcf5c;
+  background: #4a3f22;
+  border-color: #6d5a29;
+  box-shadow: 0 0 0 1px rgba(255, 207, 92, .18);
+}
+.lp-keep:disabled { opacity: .35; cursor: not-allowed; }
+
+/* CLIP 开关：展开后单独控制 clip 强度（固定宽度，避免点亮后挤动左边的权重框） */
+.lp-clip-btn {
+  position: relative;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 24px;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: .2px;
+  line-height: 1;
+  color: #8f8f8f;
+  background: #2a2a2a;
+  border: 1px solid #484848;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: color .12s, background .12s, border-color .12s;
+}
+.lp-clip-btn:hover { color: #dedede; background: #343434; border-color: #5f5f5f; }
+.lp-clip-btn.on {
+  color: #b9e6da;
+  background: #2f4440;
+  border-color: #476b64;
+  box-shadow: 0 0 0 1px rgba(127, 208, 192, .16);
+}
+.lp-clip-btn.on::after {
+  content: '';
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #7fd0c0;
+  box-shadow: 0 0 5px rgba(127, 208, 192, .8);
+}
+
+/* clip 展开行：[clip] 名称 ‹ 1.00 ›（右侧留出与上一行 clip/⇄ 等宽的空白，权重框右边缘对齐） */
+.lp-clip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 94px 7px 18px;
+  background: #2c3533;
+  border-top: 1px dashed #3f4f4b;
+  cursor: default;
+}
+.lp-clip-tag {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: #7fd0c0;
+  letter-spacing: .2px;
+}
+.lp-clip-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: #9fb8b2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* [clip] 行里的名字跟主行保持同一状态色 */
+.lp-row-wrap.on .lp-clip-name { color: #8fc7a6; }
+.lp-row-wrap.bypassed .lp-clip-name { color: #c98a8a; }
+/* 尺寸与主行权重框完全一致 */
+.lp-clip-step { border-color: #47605b; }
+.lp-clip-step input { color: #d6efe8; }
+.lp-row-wrap.on .lp-clip-step input { color: #7bd39a; }
+.lp-row-wrap.bypassed .lp-clip-step input { color: #e07070; }
 
 /* 权重对比展开区 */
 .lp-sweep {
@@ -1560,6 +3180,50 @@ onBeforeUnmount(() => {
   font-size: 10.5px;
   font-weight: 600;
   font-family: var(--mono);
+}
+
+/* 常用权重弹层：挂在 body 上，避免被列表滚动裁掉 */
+.lp-weight-menu {
+  position: fixed;
+  z-index: 9999;
+  width: 232px;
+  padding: 8px;
+  background: #262626;
+  border: 1px solid #4a4a4a;
+  border-radius: 8px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, .45);
+}
+.lp-weight-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px 6px;
+  font-size: 10.5px;
+  color: #9a9a9a;
+}
+.lp-weight-hint { color: #6f6f6f; }
+.lp-weight-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+}
+.lp-weight-val {
+  height: 24px;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: #cfcfcf;
+  background: #303030;
+  border: 1px solid #454545;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background .12s, color .12s, border-color .12s;
+}
+.lp-weight-val:hover { background: #3c3c3c; color: #fff; border-color: #5f5f5f; }
+.lp-weight-val.on {
+  color: #cfe6fb;
+  background: #3d5468;
+  border-color: #4d6a85;
 }
 
 @media (max-width: 640px) {

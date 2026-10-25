@@ -270,6 +270,15 @@ function loraActive(item) {
   return true
 }
 
+/** 禁用保留：勾着留在列表里，但生成时不生效 */
+function loraBypassed(item) {
+  return !!(item && typeof item === 'object' && item.bypass)
+}
+
+function loraEffective(item) {
+  return loraActive(item) && !loraBypassed(item)
+}
+
 /** LoRA 堆叠节点：输入里有 loras 列表（Lora Stacker / LoraManager） */
 const loraNodes = computed(() => {
   const out = []
@@ -281,7 +290,7 @@ const loraNodes = computed(() => {
       cls: String(node?.class_type || ''),
       title: node?._meta?.title || '',
       count: loras.length,
-      activeCount: loras.filter(loraActive).length,
+      activeCount: loras.filter(loraEffective).length,
       loras,
     })
   }
@@ -405,7 +414,7 @@ const loraSweepDims = computed(() => {
     if (!byIndex) continue
     for (const [idx, raw] of Object.entries(byIndex)) {
       const item = stack.loras[Number(idx)]
-      if (!item || !loraActive(item)) continue
+      if (!item || !loraEffective(item)) continue
       const values = []
       for (const v of Array.isArray(raw) ? raw : []) {
         const n = Math.round(Number(v) * 100) / 100
@@ -464,6 +473,16 @@ const groupTexts = computed(() => splitGroups(groupRaw.value))
 /** 组框里只要识别到内容就自动接管，主输入框和「对比用」额外框都不再参与 */
 const groupActive = computed(() => groupTexts.value.length > 0)
 
+// 一组提示词默认收起，点标题行展开；这个字段本来就有分组就直接展开
+const groupOpen = ref(false)
+watch(
+  promptKey,
+  () => {
+    groupOpen.value = groupActive.value
+  },
+  { immediate: true }
+)
+
 // 组内容比较长，按字段存进 localStorage，刷新页面不丢（只留最近 40 个有内容的字段）
 watch(
   () => state.promptGroups,
@@ -509,6 +528,126 @@ const promptText = computed({
     if (!promptKey.value) return
     state.textDrafts = { ...state.textDrafts, [promptKey.value]: v }
   },
+})
+
+/**
+ * LoRA 预览图面板的「标签」：点一个触发词就在新提示词上方排一个标签。
+ * 标签队列是唯一数据源，改动后整块重写进提示词，不重复追加。
+ */
+const loraTags = ref([]) // [{ id, name, word }]，点过的触发词都记着（含被临时禁用的）
+const loraTagBlock = ref('') // 上一次写进提示词的那一块，就地在同位置替换
+const loraDragIndex = ref(-1)
+
+function loraNameKey(v) {
+  return String(v ?? '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .pop()
+    .toLowerCase()
+    .replace(/\.(safetensors|sft|pt|pth|ckpt|bin)$/, '')
+}
+function loraItemName(item) {
+  return item && typeof item === 'object' ? item.name ?? item.lora ?? '' : item
+}
+
+/** 同一个 LoRA 可能挂在好几个堆叠节点上，所以按标签来源节点单独判断 */
+function loraTagEnabled(tag) {
+  const list = loraList(state.nodes?.[tag.nodeId]?.inputs?.loras) || []
+  const key = loraNameKey(tag.name)
+  if (!key || !list.length) return true
+  const hit = list.find((it) => loraNameKey(loraItemName(it)) === key)
+  // 那个节点上已经找不到这条 LoRA（换过工作流）：保持显示，别把用户的词吞掉
+  if (!hit) return true
+  return loraEffective(hit)
+}
+
+/** 临时禁用的 LoRA：点过的触发词先从新提示词里撤下来，重新启用再放回 */
+const visibleLoraTags = computed(() => loraTags.value.filter(loraTagEnabled))
+const loraTagWords = computed(() => visibleLoraTags.value.map((t) => t.word))
+
+function syncLoraTagBlock() {
+  if (inFieldMeta.value?.type !== 'text') return
+  const target = groupActive.value ? groupRaw : promptText
+  let cur = String(target.value || '')
+  const prev = loraTagBlock.value
+  if (prev) {
+    const at = cur.lastIndexOf(prev)
+    if (at >= 0) cur = cur.slice(0, at) + cur.slice(at + prev.length)
+  }
+  const next = loraTagWords.value.join(', ')
+  loraTagBlock.value = next
+  cur = cur
+    .replace(/[ \t]*,[ \t]*(?=[,，])/g, '')
+    .replace(/^[\s,，]+/, '')
+    .replace(/[\s,，]+$/, '')
+  target.value = [cur, next].filter(Boolean).join(', ')
+}
+
+// LoRA 启用状态变了：被临时禁用的词撤掉，重新启用又写回来
+watch(
+  () => loraTagWords.value.join('\n'),
+  () => {
+    if (loraTags.value.length) syncLoraTagBlock()
+  }
+)
+
+/** 触发词标签：面板里点一下加进来，同一个词再点一下取消 */
+function toggleLoraTag(payload) {
+  if (inFieldMeta.value?.type !== 'text') return
+  const word = String(payload?.word || '').trim()
+  if (!word) return
+  if (loraTags.value.some((t) => t.word === word)) {
+    loraTags.value = loraTags.value.filter((t) => t.word !== word)
+  } else {
+    loraTags.value = [
+      ...loraTags.value,
+      {
+        id: String(payload?.id || ''),
+        name: String(payload?.name || ''),
+        nodeId: state.loraId,
+        word,
+      },
+    ]
+  }
+  syncLoraTagBlock()
+}
+
+function removeLoraTag(index) {
+  const tag = visibleLoraTags.value[index]
+  if (!tag) return
+  loraTags.value = loraTags.value.filter((t) => t.word !== tag.word)
+  syncLoraTagBlock()
+}
+
+function onLoraTagDragStart(index, event) {
+  loraDragIndex.value = index
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', String(index))
+  }
+}
+
+function onLoraTagDrop(index) {
+  const from = loraDragIndex.value
+  loraDragIndex.value = -1
+  if (from < 0 || from === index) return
+  const vis = visibleLoraTags.value
+  const moved = vis[from]
+  const target = vis[index]
+  if (!moved || !target || moved.word === target.word) return
+  // 只换可见标签的相对位置，被临时禁用的标签原样留着
+  const list = loraTags.value.filter((t) => t.word !== moved.word)
+  const at = list.findIndex((t) => t.word === target.word)
+  if (at < 0) return
+  list.splice(at, 0, moved)
+  loraTags.value = list
+  syncLoraTagBlock()
+}
+
+// 换字段后旧标签留在原来的提示词里，别再想着替换它
+watch(promptKey, () => {
+  loraTags.value = []
+  loraTagBlock.value = ''
 })
 
 /** 当前字段的编辑值：文本用提示词草稿，数字/开关/下拉用 fieldDrafts */
@@ -1276,7 +1415,7 @@ function pruneLoraSweeps(nodeId, list) {
   let changed = false
   for (const key of Object.keys(next)) {
     const item = list[Number(key)]
-    if (item && loraActive(item)) continue
+    if (item && loraEffective(item)) continue
     delete next[key]
     changed = true
   }
@@ -1366,7 +1505,7 @@ function applyClipboardToggles(nodes) {
 
 /**
  * 把这一组的 LoRA 权重写进提交副本（只改 loras 数组里的值，不增删节点）。
- * LoraManager 执行时读 strength / clipStrength，面板只有一个权重，两个一起写。
+ * 展开过 clip 的行保留自己的 clip 强度；没收起的行 clip 跟随模型强度。
  */
 function applyLoraWeights(nodes, params) {
   for (const [key, val] of Object.entries(params || {})) {
@@ -1379,7 +1518,25 @@ function applyLoraWeights(nodes, params) {
     const item = Array.isArray(list) ? list[Number(m[2])] : null
     if (!item || typeof item !== 'object') continue
     item.strength = weight
-    if ('clipStrength' in item) item.clipStrength = weight
+    if ('clipStrength' in item && !item.expanded) item.clipStrength = weight
+  }
+}
+
+/**
+ * 禁用保留：面板里勾着但标了 bypass 的 LoRA，只在提交副本里写成 active:false，
+ * 工作流里仍然保持勾选与权重。
+ */
+function applyLoraBypass(nodes) {
+  for (const node of Object.values(nodes)) {
+    const list = loraList(node?.inputs?.loras)
+    if (!Array.isArray(list)) continue
+    for (const item of list) {
+      if (!loraBypassed(item)) continue
+      item.active = false
+      if ('enabled' in item) item.enabled = false
+      if ('on' in item) item.on = false
+      delete item.bypass
+    }
   }
 }
 
@@ -1423,6 +1580,7 @@ function buildNodes(params, opts = {}) {
     randomizeSeeds(nodes)
   }
   applyClipboardToggles(nodes)
+  applyLoraBypass(nodes)
   wrapListWidgets(nodes)
   return nodes
 }
@@ -2588,6 +2746,34 @@ onUnmounted(() => {
                 </button>
               </div>
             </div>
+            <div
+              v-if="inFieldMeta.type === 'text' && visibleLoraTags.length"
+              class="lora-tags"
+            >
+              <span class="lora-tags-title">新提示词</span>
+              <span
+                v-for="(t, i) in visibleLoraTags"
+                :key="t.word"
+                class="lora-tag"
+                :class="{ dragging: loraDragIndex === i }"
+                draggable="true"
+                :title="`${t.word}${t.name ? ' · ' + t.name : ''}\n拖动可换顺序，× 移出提示词`"
+                @dragstart="onLoraTagDragStart(i, $event)"
+                @dragover.prevent
+                @drop.prevent="onLoraTagDrop(i)"
+                @dragend="loraDragIndex = -1"
+              >
+                <span class="lora-tag-text">{{ t.word }}</span>
+                <button
+                  type="button"
+                  class="lora-tag-del"
+                  title="从新提示词里移除"
+                  @click.stop="removeLoraTag(i)"
+                >
+                  ×
+                </button>
+              </span>
+            </div>
             <div v-if="inFieldMeta.type === 'text'" class="prompt-more-foot">
               <button v-if="!groupActive" class="mini" @click="addPromptExtra">
                 ＋ {{ state.promptExtra.length ? '再加一个提示词' : '加一个提示词（对比用）' }}
@@ -2602,30 +2788,33 @@ onUnmounted(() => {
               class="prompt-group"
               :class="{ off: !groupActive }"
             >
-              <div class="pg-head">
+              <button type="button" class="pg-head" @click="groupOpen = !groupOpen">
                 <span class="pg-title">一组提示词</span>
                 <span class="hint">
-                  {{ groupActive ? '已生效 · 第 1 组就是主提示词' : '留空则用上面的单个提示词' }}
+                  {{ groupActive ? `已生效 · 识别到 ${groupTexts.length} 组` : '留空则用上面的单个提示词' }}
                 </span>
-              </div>
-              <textarea
-                v-model="groupRaw"
-                placeholder="每行一组，或用 ; 分隔：&#10;a cat, best quality;&#10;a dog, best quality;&#10;a red apple"
-              ></textarea>
-              <div class="pg-foot">
-                <span class="pg-count" :class="{ on: groupActive }">
-                  {{ groupActive ? `识别到 ${groupTexts.length} 组` : '还没识别到组' }}
-                </span>
-                <div class="pg-tags" v-if="groupActive">
-                  <span v-for="(g, i) in groupTexts" :key="i" class="pg-tag" :title="g">
-                    <em>{{ i + 1 }}</em>{{ g.length > 16 ? `${g.slice(0, 16)}…` : g }}
+                <span class="pg-caret">{{ groupOpen ? '▾' : '▸' }}</span>
+              </button>
+              <template v-if="groupOpen">
+                <textarea
+                  v-model="groupRaw"
+                  placeholder="每行一组，或用 ; 分隔：&#10;a cat, best quality;&#10;a dog, best quality;&#10;a red apple"
+                ></textarea>
+                <div class="pg-foot">
+                  <span class="pg-count" :class="{ on: groupActive }">
+                    {{ groupActive ? `识别到 ${groupTexts.length} 组` : '还没识别到组' }}
                   </span>
+                  <div class="pg-tags" v-if="groupActive">
+                    <span v-for="(g, i) in groupTexts" :key="i" class="pg-tag" :title="g">
+                      <em>{{ i + 1 }}</em>{{ g.length > 16 ? `${g.slice(0, 16)}…` : g }}
+                    </span>
+                  </div>
+                  <button v-if="groupRaw" class="mini" @click="groupRaw = ''">清空</button>
                 </div>
-                <button v-if="groupRaw" class="mini" @click="groupRaw = ''">清空</button>
-              </div>
-              <p class="hint pg-tip">
-                分号 ; 和换行都算分组，组内逗号照常；只有 1 组时按普通单次跑
-              </p>
+                <p class="hint pg-tip">
+                  分号 ; 和换行都算分组，组内逗号照常；只有 1 组时按普通单次跑
+                </p>
+              </template>
             </div>
             <!-- 注意：上面这些 v-if 是各自独立的，不能改成 v-else-if 链——
                  主输入框在「一组提示词」生效时不渲染，链一断就会掉到最后的 else 分支 -->
@@ -3088,6 +3277,8 @@ onUnmounted(() => {
       @reset="resetLoras"
       @sweep="setLoraSweep"
       @clear-sweeps="clearLoraSweeps"
+      :added-words="loraTagWords"
+      @prompt-tag-toggle="toggleLoraTag"
     />
 
     <!-- 通用确认弹窗 -->
@@ -3383,6 +3574,57 @@ onUnmounted(() => {
 .prompt-del:hover { color: var(--bad); border-color: var(--bad); }
 .prompt-more-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
 
+/* —— LoRA 触发词标签：排在「加一个提示词」上面，拖动换顺序，× 移出 —— */
+.lora-tags {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+.lora-tags-title {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  color: var(--ink-3);
+}
+.lora-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 100%;
+  padding: 2px 2px 2px 7px;
+  font-size: 10.5px;
+  color: var(--brand);
+  background: var(--brand-soft);
+  border: 1px solid var(--brand-line);
+  border-radius: 999px;
+  cursor: grab;
+  user-select: none;
+}
+.lora-tag:active { cursor: grabbing; }
+.lora-tag.dragging { opacity: .45; }
+.lora-tag-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lora-tag-del {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--brand);
+  background: transparent;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  opacity: .6;
+}
+.lora-tag-del:hover { opacity: 1; background: var(--brand-line); }
+
 /* —— 一组提示词：常驻，识别到内容就自动生效（边框转实线 + 暖色） —— */
 .prompt-group {
   margin-top: 8px;
@@ -3396,9 +3638,32 @@ onUnmounted(() => {
   border-color: var(--warn-line, var(--line-strong));
 }
 .prompt-group.off .pg-title { color: var(--ink-3); }
-.prompt-group textarea { min-height: 78px; }
-.pg-head { display: flex; align-items: baseline; gap: 6px; margin-bottom: 6px; }
-.pg-title { font-size: 11px; color: var(--ink-2); font-weight: 600; }
+.prompt-group textarea { margin-top: 6px; min-height: 38px; }
+/* 标题行本身就是展开 / 收起的按钮 */
+.pg-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  font: inherit;
+  text-align: left;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+.pg-caret { flex: 0 0 auto; font-size: 10px; color: var(--ink-3); }
+.pg-title { flex: 0 0 auto; font-size: 11px; color: var(--ink-2); font-weight: 600; }
+/* 说明文字固定一行，长了用省略号，别把标题挤成两行 */
+.pg-head .hint {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .pg-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
 .pg-count {
   font-family: var(--mono);
