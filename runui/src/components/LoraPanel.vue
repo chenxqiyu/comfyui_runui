@@ -606,6 +606,8 @@ const promptTab = ref('tags')
 /** 随机组合：默认抽 10 个，可以自己改；randTag 记着上一次随机出来的串，用来「再点一下取消」 */
 const randCount = ref(10)
 const randTag = ref('')
+/** 「前 n 个按顺序串联」当前挂着的那条 */
+const topTag = ref('')
 /** 默认第一条：这个 LoRA 还没点过触发词时，自动把第一条加上 */
 const autoFirst = ref(false)
 /** 例图提示词：默认单选（选另一张会替换），勾上「多选」才允许同时选多条 */
@@ -817,6 +819,12 @@ const promptFreqNow = computed(() => promptFreq.value[promptKeyNow.value] || [])
 const allWordsTag = computed(() => promptFreqNow.value.map((w) => w.word).join(', '))
 const allWordsOn = computed(() => !!allWordsTag.value && props.addedWords.includes(allWordsTag.value))
 const randTagOn = computed(() => !!randTag.value && props.addedWords.includes(randTag.value))
+const topTagOn = computed(() => !!topTag.value && props.addedWords.includes(topTag.value))
+/** 「前 n 个」用的 n：跟随机共用那个输入框，超过词表长度按词表长度算 */
+const topCount = computed(() =>
+  Math.max(1, Math.min(Math.floor(Number(randCount.value) || 1), promptFreqNow.value.length || 1))
+)
+const topTagCount = computed(() => (topTag.value ? topTag.value.split(', ').length : 0))
 /** 训练词 tab 当前挂在新提示词上的条目（单选词 + 批量组合），清除按钮按它计数 */
 const freqPickedNow = computed(() => {
   const picked = new Set(props.addedWords)
@@ -929,8 +937,9 @@ function openPromptPanel(p, event) {
     top: Math.max(8, Math.min(rect.top - 8, window.innerHeight - height - 8)),
   }
   promptTab.value = 'tags'
-  // 换了个 LoRA，上次随机出来的组合不再对应这个面板
+  // 换了个 LoRA，上次随机/前 N 串出来的组合不再对应这个面板
   randTag.value = ''
+  topTag.value = ''
   closeWeightMenu()
   hideBigPreview()
   fetchTrainedWords(p.name, true)
@@ -1033,12 +1042,37 @@ function clearRandomTag() {
   randTag.value = ''
 }
 
+/** 前 n 个按顺序串联：取词频最高的前 n 个原样用逗号串起来；同一串再点一次撤掉 */
+function pickTopWords() {
+  const list = promptFreqNow.value
+  if (!list.length) return
+  const name = promptPanel.value?.name || ''
+  const key = promptKeyNow.value
+  const text = list.slice(0, topCount.value).map((w) => w.word).join(', ')
+  if (props.addedWords.includes(text)) {
+    emitTag(name, text)
+    rememberAggregate(key, text, false)
+    if (topTag.value === text) topTag.value = ''
+    return
+  }
+  // 换了 n 再点：先把上一条「前 N」撤掉，别同时挂两条
+  if (topTag.value && topTag.value !== text && props.addedWords.includes(topTag.value)) {
+    emitTag(name, topTag.value)
+    rememberAggregate(key, topTag.value, false)
+  }
+  topTag.value = text
+  emitTag(name, text)
+  rememberAggregate(key, text, true)
+  copyQuiet(text)
+}
+
 /** 一键清掉这个 LoRA 的训练词点选：单词、全部串联、随机组合都撤掉 */
 function clearFreqPicks() {
   const name = promptPanel.value?.name || ''
   const key = promptKeyNow.value
   for (const text of freqPickedNow.value) emitTag(name, text)
   randTag.value = ''
+  topTag.value = ''
   freqAggregates.value = { ...freqAggregates.value, [key]: [] }
 }
 
@@ -1831,6 +1865,19 @@ onBeforeUnmount(() => {
                   取消随机
                 </button>
               </div>
+              <button
+                type="button"
+                class="lp-words-btn lp-words-top"
+                :class="{ on: topTagOn }"
+                :title="
+                  topTagOn
+                    ? `再点一下从「新提示词」里移除：\n${topTag}`
+                    : `取词频最高的前 ${topCount} 个，按现在的顺序用逗号串成一条标签`
+                "
+                @click="pickTopWords"
+              >
+                {{ topTagOn ? `取消前 ${topTagCount} 个串联` : `前 ${topCount} 个按顺序串联` }}
+              </button>
               <button
                 type="button"
                 class="lp-words-btn lp-words-clear"
