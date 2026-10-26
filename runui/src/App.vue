@@ -534,8 +534,26 @@ const promptText = computed({
  * LoRA 预览图面板的「标签」：点一个触发词就在新提示词上方排一个标签。
  * 标签队列是唯一数据源，改动后整块重写进提示词，不重复追加。
  */
-const loraTags = ref([]) // [{ id, name, word }]，点过的触发词都记着（含被临时禁用的）
-const loraTagBlock = ref('') // 上一次写进提示词的那一块，就地在同位置替换
+const loraTagsByKey = ref({}) // promptKey -> [{ id, name, nodeId, word }]，点过的触发词都记着（含被临时禁用的）
+const loraTagBlockByKey = ref({}) // promptKey -> 上一次写进那条提示词的那一块，就地在同位置替换
+
+// 标签跟「输入节点 + 字段」走：换节点回来还在，也不会把上一个节点的标签带进新的提示词
+const loraTags = computed({
+  get: () => loraTagsByKey.value[promptKey.value] || [],
+  set: (list) => {
+    const key = promptKey.value
+    if (!key) return
+    loraTagsByKey.value = { ...loraTagsByKey.value, [key]: list }
+  },
+})
+const loraTagBlock = computed({
+  get: () => loraTagBlockByKey.value[promptKey.value] || '',
+  set: (v) => {
+    const key = promptKey.value
+    if (!key) return
+    loraTagBlockByKey.value = { ...loraTagBlockByKey.value, [key]: v }
+  },
+})
 const loraDragIndex = ref(-1)
 
 function loraNameKey(v) {
@@ -643,12 +661,6 @@ function onLoraTagDrop(index) {
   loraTags.value = list
   syncLoraTagBlock()
 }
-
-// 换字段后旧标签留在原来的提示词里，别再想着替换它
-watch(promptKey, () => {
-  loraTags.value = []
-  loraTagBlock.value = ''
-})
 
 /** 当前字段的编辑值：文本用提示词草稿，数字/开关/下拉用 fieldDrafts */
 const fieldDraft = computed({
@@ -1337,6 +1349,9 @@ function applyPicked(picked) {
   state.clipboardOff = {}
   state.textDrafts = {}
   state.fieldDrafts = {}
+  // 草稿都清了，标签也一起清；不然切回来会拿旧标签去重写新的提示词
+  loraTagsByKey.value = {}
+  loraTagBlockByKey.value = {}
   state.message = ''
 }
 
