@@ -536,6 +536,13 @@ function hideBigPreview() {
 
 /* ---------------------------------------------------------------- 已勾选预览图 */
 const gallery = ref(false)
+/** 拖过之后记下位置；null 表示还用 CSS 里那个右上角的默认位置 */
+const galleryPos = ref(null)
+const galleryStyle = computed(() =>
+  galleryPos.value
+    ? { left: `${galleryPos.value.left}px`, top: `${galleryPos.value.top}px`, right: 'auto' }
+    : null
+)
 /* 顶置：已启用（勾选且没禁用）的排前面，临时禁用的沉到下面 */
 const galleryTop = ref(true)
 const checkedPreviews = computed(() => {
@@ -815,6 +822,8 @@ const promptWordsNow = computed(() => promptWords.value[promptKeyNow.value] || [
 const promptPromptsNow = computed(() => promptImagePrompts.value[promptKeyNow.value] || [])
 const promptDescNow = computed(() => promptDescriptions.value[promptKeyNow.value] || '')
 const promptFreqNow = computed(() => promptFreq.value[promptKeyNow.value] || [])
+/** 标题栏的小封面：复用卡片的预览图缓存，悬停时交给大图浮层 */
+const promptCoverUrl = computed(() => previews.value[promptKeyNow.value] || '')
 /** 训练词 tab 顶部两个批量操作：全部串成一条 / 随机抽 n 条 */
 const allWordsTag = computed(() => promptFreqNow.value.map((w) => w.word).join(', '))
 const allWordsOn = computed(() => !!allWordsTag.value && props.addedWords.includes(allWordsTag.value))
@@ -943,6 +952,7 @@ function openPromptPanel(p, event) {
   closeWeightMenu()
   hideBigPreview()
   fetchTrainedWords(p.name, true)
+  fetchPreview(p.name)
 }
 
 function closePromptPanel() {
@@ -950,39 +960,52 @@ function closePromptPanel() {
   hideBigPreview()
 }
 
-/** 面板不点外面关闭，改成按住标题栏拖动；拖的过程中只改 left/top，不碰其它状态 */
-let promptDrag = null
+/** 两个浮窗都靠标题栏拖动：拖的过程中只把结果交给调用方，不碰其它状态 */
+let winDrag = null
 
-function onPromptDragStart(event) {
-  if (event.button !== 0 || !promptPanel.value) return
-  if (event.target.closest?.('.lp-tags-close')) return
-  const rect = event.currentTarget.closest('.lp-tags')?.getBoundingClientRect()
-  if (!rect) return
-  promptDrag = {
+function startWinDrag(event, ignoreSelector, apply) {
+  if (event.button !== 0 || winDrag) return
+  const el = event.currentTarget.closest?.('.lp-tags, .lp-gallery')
+  if (!el || event.target.closest?.(ignoreSelector)) return
+  const rect = el.getBoundingClientRect()
+  winDrag = {
     dx: event.clientX - rect.left,
     dy: event.clientY - rect.top,
     width: rect.width,
     height: rect.height,
+    apply,
   }
-  window.addEventListener('mousemove', onPromptDragMove)
-  window.addEventListener('mouseup', onPromptDragEnd)
+  window.addEventListener('mousemove', onWinDragMove)
+  window.addEventListener('mouseup', stopWinDrag)
   event.preventDefault()
 }
 
-function onPromptDragMove(event) {
-  if (!promptDrag || !promptPanel.value) return
-  const { dx, dy, width, height } = promptDrag
-  promptPanel.value = {
-    ...promptPanel.value,
-    left: Math.min(Math.max(0, event.clientX - dx), Math.max(0, window.innerWidth - width)),
-    top: Math.min(Math.max(0, event.clientY - dy), Math.max(0, window.innerHeight - height)),
-  }
+function onWinDragMove(event) {
+  if (!winDrag) return
+  const { dx, dy, width, height, apply } = winDrag
+  apply(
+    Math.min(Math.max(0, event.clientX - dx), Math.max(0, window.innerWidth - width)),
+    Math.min(Math.max(0, event.clientY - dy), Math.max(0, window.innerHeight - height))
+  )
 }
 
-function onPromptDragEnd() {
-  promptDrag = null
-  window.removeEventListener('mousemove', onPromptDragMove)
-  window.removeEventListener('mouseup', onPromptDragEnd)
+function stopWinDrag() {
+  winDrag = null
+  window.removeEventListener('mousemove', onWinDragMove)
+  window.removeEventListener('mouseup', stopWinDrag)
+}
+
+function onPromptDragStart(event) {
+  if (!promptPanel.value) return
+  startWinDrag(event, '.lp-tags-close', (left, top) => {
+    if (promptPanel.value) promptPanel.value = { ...promptPanel.value, left, top }
+  })
+}
+
+function onGalleryDragStart(event) {
+  startWinDrag(event, 'button, input, label', (left, top) => {
+    galleryPos.value = { left, top }
+  })
 }
 
 /** 点触发词：加进「新提示词」；已经加过的再点一次就取消 */
@@ -1363,7 +1386,7 @@ onBeforeUnmount(() => {
   clearTimeout(copiedTimer)
   document.removeEventListener('mousedown', onDocMouseDown, true)
   window.removeEventListener('resize', closeWeightMenu)
-  onPromptDragEnd()
+  stopWinDrag()
 })
 
 </script>
@@ -1784,6 +1807,14 @@ onBeforeUnmount(() => {
       >
         <header class="lp-tags-head" title="按住这里拖动面板" @mousedown="onPromptDragStart">
           <span class="lp-tags-title">提示词</span>
+          <img
+            v-if="promptCoverUrl"
+            class="lp-tags-cover"
+            :src="promptCoverUrl"
+            alt=""
+            @mouseenter="showBigUrl(promptCoverUrl, promptPanel.name, $event)"
+            @mouseleave="hideBigPreview"
+          />
           <span class="lp-tags-name" :title="promptPanel.name">{{ promptPanel.name }}</span>
           <button type="button" class="lp-tags-close" title="关闭" @click="closePromptPanel">
             ×
@@ -1974,8 +2005,13 @@ onBeforeUnmount(() => {
     </Teleport>
 
     <Teleport to="body">
-      <section v-if="gallery" class="lp-gallery" aria-label="已勾选 LoRA 预览图">
-        <header class="lp-gallery-head">
+      <section
+        v-if="gallery"
+        class="lp-gallery"
+        aria-label="已勾选 LoRA 预览图"
+        :style="galleryStyle"
+      >
+        <header class="lp-gallery-head" title="按住这里拖动" @mousedown="onGalleryDragStart">
           <span>已勾选预览图</span>
           <span class="lp-gallery-count">{{ checkedPreviews.length }} 张</span>
           <label class="lp-gallery-pin" title="开启后：已启用的排前面，临时禁用的沉到下面">
@@ -2714,6 +2750,9 @@ onBeforeUnmount(() => {
   border-bottom: 1px solid #454545;
   font-size: 12px;
   color: #d6d6d6;
+  /* 标题栏就是拖动手柄 */
+  cursor: move;
+  user-select: none;
 }
 .lp-gallery-count { font-size: 11px; color: #9a9a9a; }
 .lp-gallery-pin {
@@ -2966,6 +3005,17 @@ onBeforeUnmount(() => {
   user-select: none;
 }
 .lp-tags-title { flex: 0 0 auto; font-size: 11.5px; color: #dedede; }
+/* 标题后的小封面：点开面板时顺便看一眼这个 LoRA 长什么样，悬停出大图 */
+.lp-tags-cover {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 26px;
+  object-fit: cover;
+  border: 1px solid #4a4a4a;
+  border-radius: 4px;
+  background: #2a2a2a;
+  cursor: zoom-in;
+}
 .lp-tags-name {
   flex: 1 1 auto;
   min-width: 0;
