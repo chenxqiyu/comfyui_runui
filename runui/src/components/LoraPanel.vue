@@ -600,8 +600,12 @@ const promptWords = ref({}) // name -> string[]
 const promptBusy = new Set()
 const promptImagePrompts = ref({}) // name -> [{ i, text }]，civitai 例图里带的完整提示词
 const promptDescriptions = ref({}) // name -> 清洗过的描述 HTML（空串 = 没有描述，不显示 tab）
-/** 描述 tab 只在有描述时出现，默认停在标签那一页 */
+const promptFreq = ref({}) // name -> [{ word, count }]，LoraManager 的词频表（训练词 tab）
+/** 描述 / 训练词 tab 只在有内容时出现，默认停在标签那一页 */
 const promptTab = ref('tags')
+/** 随机组合：默认抽 10 个，可以自己改；randTag 记着上一次随机出来的串，用来「再点一下取消」 */
+const randCount = ref(10)
+const randTag = ref('')
 /** 默认第一条：这个 LoRA 还没点过触发词时，自动把第一条加上 */
 const autoFirst = ref(false)
 /** 例图提示词：默认单选（选另一张会替换），勾上「多选」才允许同时选多条 */
@@ -610,6 +614,20 @@ const exampleMulti = ref(false)
 function normalizeWords(meta) {
   const raw = meta?.trainedWords || meta?.civitai?.trainedWords || []
   return (Array.isArray(raw) ? raw : []).map((w) => String(w || '').trim()).filter(Boolean)
+}
+
+/** /api/lm/trained-words 的 [[词, 次数], …]：去首尾空格，同名只留次数高的那条（接口里会带前导空格的重复项） */
+function normalizeFreqWords(data) {
+  const raw = data?.trained_words || data?.trainedWords || []
+  const out = []
+  const seen = new Set()
+  for (const it of Array.isArray(raw) ? raw : []) {
+    const word = String(Array.isArray(it) ? it[0] : it?.word ?? it ?? '').trim()
+    if (!word || seen.has(word)) continue
+    seen.add(word)
+    out.push({ word, count: Number(Array.isArray(it) ? it[1] : it?.count) || 0 })
+  }
+  return out
 }
 
 /** 例图里的提示词：按 images 顺序记下标，方便在面板里标「图 N」；只有图没有 prompt 的也留着 */
@@ -719,6 +737,9 @@ async function fetchTrainedWords(name, force = false) {
     const nextDesc = { ...promptDescriptions.value }
     delete nextDesc[key]
     promptDescriptions.value = nextDesc
+    const nextFreq = { ...promptFreq.value }
+    delete nextFreq[key]
+    promptFreq.value = nextFreq
   } else if (key in promptWords.value) return
   promptBusy.add(key)
   try {
@@ -755,12 +776,14 @@ async function fetchTrainedWords(name, force = false) {
     let words = normalizeWords({ trainedWords: hit?.civitai?.trainedWords })
     let prompts = []
     let describe = ''
+    let freq = []
     if (hit?.file_path) {
       const q = encodeURIComponent(hit.file_path)
-      // 描述和 metadata 一起发，别让描述 tab 多等一次往返
-      const [metaRes, descRes] = await Promise.allSettled([
+      // 描述 / metadata / 词频一次并发取完，三个 tab 不用各自等往返
+      const [metaRes, descRes, freqRes] = await Promise.allSettled([
         apiGet(`/api/lm/loras/metadata?file_path=${q}`),
         apiGet(`/api/lm/loras/model-description?file_path=${q}`),
+        apiGet(`/api/lm/trained-words?file_path=${q}`),
       ])
       // metadata 读不到就退回列表里自带的触发词
       if (metaRes.status === 'fulfilled') {
@@ -769,14 +792,17 @@ async function fetchTrainedWords(name, force = false) {
         prompts = normalizeImagePrompts(metaRes.value?.metadata)
       }
       if (descRes.status === 'fulfilled') describe = cleanDescription(descRes.value?.description)
+      if (freqRes.status === 'fulfilled') freq = normalizeFreqWords(freqRes.value)
     }
     promptWords.value = { ...promptWords.value, [key]: words }
     promptImagePrompts.value = { ...promptImagePrompts.value, [key]: prompts }
     promptDescriptions.value = { ...promptDescriptions.value, [key]: describe }
+    promptFreq.value = { ...promptFreq.value, [key]: freq }
   } catch {
     promptWords.value = { ...promptWords.value, [key]: [] }
     promptImagePrompts.value = { ...promptImagePrompts.value, [key]: [] }
     promptDescriptions.value = { ...promptDescriptions.value, [key]: '' }
+    promptFreq.value = { ...promptFreq.value, [key]: [] }
   } finally {
     promptBusy.delete(key)
   }
@@ -786,10 +812,18 @@ const promptKeyNow = computed(() => normName(promptPanel.value?.name || ''))
 const promptWordsNow = computed(() => promptWords.value[promptKeyNow.value] || [])
 const promptPromptsNow = computed(() => promptImagePrompts.value[promptKeyNow.value] || [])
 const promptDescNow = computed(() => promptDescriptions.value[promptKeyNow.value] || '')
-// 没描述时 tab 条整个不显示，停在「描述」上也要退回标签页
-const activePromptTab = computed(() =>
-  promptTab.value === 'desc' && promptDescNow.value ? 'desc' : 'tags'
-)
+const promptFreqNow = computed(() => promptFreq.value[promptKeyNow.value] || [])
+/** 训练词 tab 顶部两个批量操作：全部串成一条 / 随机抽 n 条 */
+const allWordsTag = computed(() => promptFreqNow.value.map((w) => w.word).join(', '))
+const allWordsOn = computed(() => !!allWordsTag.value && props.addedWords.includes(allWordsTag.value))
+const randTagOn = computed(() => !!randTag.value && props.addedWords.includes(randTag.value))
+// 没有对应内容时那个 tab 不显示，停在它上面也要退回标签页
+const activePromptTab = computed(() => {
+  const tab = promptTab.value
+  if (tab === 'desc' && promptDescNow.value) return 'desc'
+  if (tab === 'words' && promptFreqNow.value.length) return 'words'
+  return 'tags'
+})
 const promptLoading = computed(
   () => !!promptPanel.value && !(promptKeyNow.value in promptWords.value)
 )
@@ -872,6 +906,8 @@ function openPromptPanel(p, event) {
     top: Math.max(8, Math.min(rect.top - 8, window.innerHeight - height - 8)),
   }
   promptTab.value = 'tags'
+  // 换了个 LoRA，上次随机出来的组合不再对应这个面板
+  randTag.value = ''
   closeWeightMenu()
   hideBigPreview()
   fetchTrainedWords(p.name, true)
@@ -899,6 +935,44 @@ function emitTag(name, word) {
 
 function addPromptTag(word) {
   emitTag(promptPanel.value?.name || '', word)
+}
+
+/** 训练词：点一下加进新提示词，同时静默复制一份；取消时只取消、不复制 */
+function pickFreqWord(word) {
+  const wasAdded = props.addedWords.includes(word)
+  addPromptTag(word)
+  if (!wasAdded) copyQuiet(word)
+}
+
+/** 全部串成一个标签：词表是确定的，同一串再点一次就整体取消 */
+function pickAllWords() {
+  if (!allWordsTag.value) return
+  const wasAdded = allWordsOn.value
+  emitTag(promptPanel.value?.name || '', allWordsTag.value)
+  if (!wasAdded) copyQuiet(allWordsTag.value)
+}
+
+/** 随机组合：抽 n 个不重复的词串成一条标签；上一条随机组合还挂着就先换掉它 */
+function pickRandomWords() {
+  const list = promptFreqNow.value
+  if (!list.length) return
+  const name = promptPanel.value?.name || ''
+  if (randTagOn.value) emitTag(name, randTag.value)
+  const n = Math.max(1, Math.min(Math.floor(Number(randCount.value) || 1), list.length))
+  randCount.value = n
+  const pool = list.map((w) => w.word)
+  const picked = []
+  for (let i = 0; i < n; i++) picked.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0])
+  randTag.value = picked.join(', ')
+  emitTag(name, randTag.value)
+  copyQuiet(randTag.value)
+}
+
+/** 只撤掉当前这条随机组合，不动面板里点出来的其它标签 */
+function clearRandomTag() {
+  if (!randTagOn.value) return
+  emitTag(promptPanel.value?.name || '', randTag.value)
+  randTag.value = ''
 }
 
 /** 例图提示词：点选就把整段复制走，不给任何提示；单选时选另一张会把这一组里已选的那条换掉 */
@@ -1614,7 +1688,7 @@ onBeforeUnmount(() => {
             ×
           </button>
         </header>
-        <div v-if="promptDescNow" class="lp-tags-tabs">
+        <div v-if="promptDescNow || promptFreqNow.length" class="lp-tags-tabs">
           <button
             type="button"
             class="lp-tags-tab"
@@ -1624,6 +1698,17 @@ onBeforeUnmount(() => {
             标签
           </button>
           <button
+            v-if="promptFreqNow.length"
+            type="button"
+            class="lp-tags-tab"
+            :class="{ on: activePromptTab === 'words' }"
+            :title="`LoraManager 里 ${promptFreqNow.length} 个训练词，按出现次数排`"
+            @click="promptTab = 'words'"
+          >
+            训练词
+          </button>
+          <button
+            v-if="promptDescNow"
             type="button"
             class="lp-tags-tab"
             :class="{ on: activePromptTab === 'desc' }"
@@ -1635,6 +1720,76 @@ onBeforeUnmount(() => {
         </div>
         <div class="lp-tags-body">
           <div v-if="activePromptTab === 'desc'" class="lp-tags-desc" v-html="promptDescNow"></div>
+          <div v-else-if="activePromptTab === 'words'" class="lp-words">
+            <div class="lp-words-ops">
+              <button
+                type="button"
+                class="lp-words-btn"
+                :class="{ on: allWordsOn }"
+                :title="
+                  allWordsOn
+                    ? '再点一下从「新提示词」里移除这条'
+                    : `把 ${promptFreqNow.length} 个训练词用逗号串成一条，放进新提示词`
+                "
+                @click="pickAllWords"
+              >
+                {{ allWordsOn ? `取消全部串联（${promptFreqNow.length} 词）` : `全部串成一个标签（${promptFreqNow.length} 词）` }}
+              </button>
+              <div class="lp-words-rand">
+                <span class="lp-words-rand-text">随机抽取</span>
+                <input
+                  v-model.number="randCount"
+                  class="lp-words-num"
+                  type="number"
+                  min="1"
+                  :max="promptFreqNow.length"
+                  title="随机组合用的词数，超过词表长度按词表长度算"
+                />
+                <span class="lp-words-rand-text">个</span>
+                <button
+                  type="button"
+                  class="lp-words-btn lp-words-rand-btn"
+                  title="按上面的数量立刻随机组合成一条标签；已经有随机组合就直接换掉"
+                  @click="pickRandomWords"
+                >
+                  随机组合
+                </button>
+                <button
+                  type="button"
+                  class="lp-words-btn lp-words-rand-btn"
+                  :disabled="!randTagOn"
+                  :title="randTagOn ? `移除这条随机组合：${randTag}` : '当前没有随机组合'"
+                  @click="clearRandomTag"
+                >
+                  取消随机
+                </button>
+              </div>
+            </div>
+            <div class="lp-words-scroll">
+              <div class="lp-words-head">
+                <span>训练词 · 点一下加到新提示词</span>
+                <span class="lp-words-found">找到 {{ promptFreqNow.length }} 个词</span>
+              </div>
+              <div class="lp-words-grid">
+                <button
+                  v-for="w in promptFreqNow"
+                  :key="w.word"
+                  type="button"
+                  class="lp-words-chip"
+                  :class="{ on: addedWords.includes(w.word) }"
+                  :title="
+                    addedWords.includes(w.word)
+                      ? `${w.word}\n再点一下从「新提示词」里移除`
+                      : `${w.word}${w.count ? ` · 出现 ${w.count} 次` : ''}\n点一下加进新提示词并复制`
+                  "
+                  @click="pickFreqWord(w.word)"
+                >
+                  <span class="lp-words-text">{{ w.word }}</span>
+                  <span v-if="w.count" class="lp-words-badge">{{ w.count }}</span>
+                </button>
+              </div>
+            </div>
+          </div>
           <template v-else>
             <div class="lp-tags-scroll">
               <div class="lp-tags-list">
@@ -2816,6 +2971,115 @@ onBeforeUnmount(() => {
   background: #333;
   border-top: 1px solid #4a4a4a;
 }
+/* 训练词 tab：上面两条批量操作，下面是按词频排的 chip 墙 */
+.lp-words {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 8px;
+}
+.lp-words-ops {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 7px;
+  border-bottom: 1px dashed #4a4a4a;
+}
+.lp-words-btn {
+  width: 100%;
+  padding: 5px 8px;
+  font-size: 10.5px;
+  text-align: left;
+  color: #cfe6fb;
+  background: #2f3742;
+  border: 1px solid #40566b;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.lp-words-btn:hover { background: #38434f; border-color: #4d6b85; }
+.lp-words-btn.on { color: #7bd39a; background: #2f3d34; border-color: #476b4f; }
+.lp-words-rand { display: flex; align-items: center; gap: 5px; }
+.lp-words-rand-text { flex: 0 0 auto; font-size: 10px; color: #9a9a9a; }
+.lp-words-num {
+  flex: 0 0 auto;
+  width: 46px;
+  padding: 3px 4px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  text-align: center;
+  color: #dedede;
+  background: #2b2b2b;
+  border: 1px solid #4a4a4a;
+  border-radius: 5px;
+}
+.lp-words-rand-btn { flex: 1 1 0; width: auto; padding: 5px 4px; text-align: center; }
+.lp-words-rand-btn:disabled {
+  color: #7a7a7a;
+  background: #333;
+  border-color: #444;
+  cursor: default;
+}
+.lp-words-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: #555 transparent;
+}
+.lp-words-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 6px;
+  font-size: 10.5px;
+  color: #b9b9b9;
+}
+.lp-words-found {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: #8f8f8f;
+}
+.lp-words-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.lp-words-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 3px 4px 3px 7px;
+  font-size: 11px;
+  color: #7fb2e5;
+  background: #2f2f2f;
+  border: 1px solid #464646;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.lp-words-chip:hover { background: #3a3a3a; border-color: #5a5a5a; }
+.lp-words-chip.on { color: #7bd39a; background: #2f3d34; border-color: #476b4f; }
+.lp-words-text {
+  min-width: 0;
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lp-words-badge {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  font-size: 9.5px;
+  line-height: 14px;
+  color: #b0b0b0;
+  background: #3d3d3d;
+  border-radius: 7px;
+}
+.lp-words-chip.on .lp-words-badge { color: #a9d4b6; background: #3b4a40; }
 .lp-tags-word {
   display: block;
   width: 100%;
