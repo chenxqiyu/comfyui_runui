@@ -846,6 +846,21 @@ const activeTabOf = (pn) => {
 const isPanelOpen = (item) =>
   panels.value.some((pn) => pn.id === normName(readName(item)))
 
+/** 浮窗标题按 LoRA 的临时禁用状态变红划线：同一个 LoRA 挂在好几个节点上时，只要有一份还启用就不算禁用 */
+const bypassedOf = (pn) => {
+  const key = keyOf(pn)
+  if (!key) return false
+  const found = []
+  for (const n of props.nodes) {
+    for (const it of Array.isArray(n.loras) ? n.loras : []) {
+      if (normName(readName(it)) === key) found.push(it)
+    }
+  }
+  const active = found.filter(isActive)
+  const pool = active.length ? active : found
+  return pool.length > 0 && pool.every(isBypassed)
+}
+
 /** 训练词 tab 批量生成的组合标签（全部串联 / 随机组合），不是词表里的单条词，单独记一份好让卡片亮灯 */
 const freqAggregates = ref({}) // name -> string[]
 
@@ -1817,7 +1832,7 @@ onBeforeUnmount(() => {
         @mousedown="bringToFront(pn)"
       >
         <header class="lp-tags-head" title="按住这里拖动面板" @mousedown="onPromptDragStart($event, pn)">
-          <span class="lp-tags-title">提示词</span>
+          <span class="lp-tags-title" :class="{ bypassed: bypassedOf(pn) }">提示词</span>
           <img
             v-if="coverOf(pn)"
             class="lp-tags-cover"
@@ -1826,7 +1841,11 @@ onBeforeUnmount(() => {
             @mouseenter="showBigUrl(coverOf(pn), pn.name, $event)"
             @mouseleave="hideBigPreview"
           />
-          <span class="lp-tags-name" :title="pn.name">{{ pn.name }}</span>
+          <span
+            class="lp-tags-name"
+            :class="{ bypassed: bypassedOf(pn) }"
+            :title="bypassedOf(pn) ? `${pn.name}\n已临时禁用：生成时不参与` : pn.name"
+          >{{ pn.name }}</span>
           <button type="button" class="lp-tags-close" title="关闭" @click="closePromptPanel(pn)">
             ×
           </button>
@@ -3020,7 +3039,9 @@ onBeforeUnmount(() => {
   cursor: move;
   user-select: none;
 }
-.lp-tags-title { flex: 0 0 auto; font-size: 13px; color: #dedede; }
+/* 标题跟着 LoRA 状态走：启用绿、临时禁用红 */
+.lp-tags-title { flex: 0 0 auto; font-size: 13px; color: #7bd39a; }
+.lp-tags-title.bypassed { color: #e07070; }
 /* 标题后的小封面：点开面板时顺便看一眼这个 LoRA 长什么样，悬停出大图 */
 .lp-tags-cover {
   flex: 0 0 auto;
@@ -3036,10 +3057,16 @@ onBeforeUnmount(() => {
   flex: 1 1 auto;
   min-width: 0;
   font-size: 12px;
-  color: #9fb7a8;
+  color: #7bd39a;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 临时禁用的 LoRA：标题变红划线，和卡片里的禁用样式对齐 */
+.lp-tags-name.bypassed {
+  color: #e07070;
+  text-decoration: line-through;
+  text-decoration-color: #a15959;
 }
 .lp-tags-close {
   flex: 0 0 auto;
