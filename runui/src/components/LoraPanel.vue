@@ -817,6 +817,14 @@ const promptFreqNow = computed(() => promptFreq.value[promptKeyNow.value] || [])
 const allWordsTag = computed(() => promptFreqNow.value.map((w) => w.word).join(', '))
 const allWordsOn = computed(() => !!allWordsTag.value && props.addedWords.includes(allWordsTag.value))
 const randTagOn = computed(() => !!randTag.value && props.addedWords.includes(randTag.value))
+/** 训练词 tab 当前挂在新提示词上的条目（单选词 + 批量组合），清除按钮按它计数 */
+const freqPickedNow = computed(() => {
+  const picked = new Set(props.addedWords)
+  const out = new Set()
+  for (const w of promptFreqNow.value) if (picked.has(w.word)) out.add(w.word)
+  for (const t of freqAggregates.value[promptKeyNow.value] || []) if (picked.has(t)) out.add(t)
+  return out
+})
 // 没有对应内容时那个 tab 不显示，停在它上面也要退回标签页
 const activePromptTab = computed(() => {
   const tab = promptTab.value
@@ -828,7 +836,18 @@ const promptLoading = computed(
   () => !!promptPanel.value && !(promptKeyNow.value in promptWords.value)
 )
 
-/** 每张卡里已经加进「新提示词」的标签（触发词 + 例图提示词），用于卡片右上角亮灯 */
+/** 训练词 tab 批量生成的组合标签（全部串联 / 随机组合），不是词表里的单条词，单独记一份好让卡片亮灯 */
+const freqAggregates = ref({}) // name -> string[]
+
+function rememberAggregate(key, text, on) {
+  if (!key || !text) return
+  const list = new Set(freqAggregates.value[key] || [])
+  if (on) list.add(text)
+  else list.delete(text)
+  freqAggregates.value = { ...freqAggregates.value, [key]: [...list] }
+}
+
+/** 每张卡里已经加进「新提示词」的标签（触发词 + 例图提示词 + 训练词），用于卡片右上角亮灯 */
 const taggedByCard = computed(() => {
   const picked = new Set(props.addedWords)
   const out = new Map()
@@ -837,8 +856,12 @@ const taggedByCard = computed(() => {
     const key = normName(p.name)
     if (!key || out.has(key)) continue
     const words = new Set(
-      [...(promptWords.value[key] || []), ...(promptImagePrompts.value[key] || []).map((it) => it.text)]
-        .filter((w) => picked.has(w))
+      [
+        ...(promptWords.value[key] || []),
+        ...(promptImagePrompts.value[key] || []).map((it) => it.text),
+        ...(promptFreq.value[key] || []).map((it) => it.word),
+        ...(freqAggregates.value[key] || []),
+      ].filter((w) => picked.has(w))
     )
     if (words.size) out.set(key, [...words])
   }
@@ -918,12 +941,39 @@ function closePromptPanel() {
   hideBigPreview()
 }
 
-function onDocMouseDownPrompt(event) {
-  if (!promptPanel.value) return
-  if (event.target.closest?.('.lp-tags')) return
-  // 点同一个「标签」按钮由 click 自己切换开关，别在 mousedown 就关掉再重开
-  if (event.target.closest?.('.lp-g-tag')) return
-  closePromptPanel()
+/** 面板不点外面关闭，改成按住标题栏拖动；拖的过程中只改 left/top，不碰其它状态 */
+let promptDrag = null
+
+function onPromptDragStart(event) {
+  if (event.button !== 0 || !promptPanel.value) return
+  if (event.target.closest?.('.lp-tags-close')) return
+  const rect = event.currentTarget.closest('.lp-tags')?.getBoundingClientRect()
+  if (!rect) return
+  promptDrag = {
+    dx: event.clientX - rect.left,
+    dy: event.clientY - rect.top,
+    width: rect.width,
+    height: rect.height,
+  }
+  window.addEventListener('mousemove', onPromptDragMove)
+  window.addEventListener('mouseup', onPromptDragEnd)
+  event.preventDefault()
+}
+
+function onPromptDragMove(event) {
+  if (!promptDrag || !promptPanel.value) return
+  const { dx, dy, width, height } = promptDrag
+  promptPanel.value = {
+    ...promptPanel.value,
+    left: Math.min(Math.max(0, event.clientX - dx), Math.max(0, window.innerWidth - width)),
+    top: Math.min(Math.max(0, event.clientY - dy), Math.max(0, window.innerHeight - height)),
+  }
+}
+
+function onPromptDragEnd() {
+  promptDrag = null
+  window.removeEventListener('mousemove', onPromptDragMove)
+  window.removeEventListener('mouseup', onPromptDragEnd)
 }
 
 /** 点触发词：加进「新提示词」；已经加过的再点一次就取消 */
@@ -947,8 +997,10 @@ function pickFreqWord(word) {
 /** 全部串成一个标签：词表是确定的，同一串再点一次就整体取消 */
 function pickAllWords() {
   if (!allWordsTag.value) return
+  const name = promptPanel.value?.name || ''
   const wasAdded = allWordsOn.value
-  emitTag(promptPanel.value?.name || '', allWordsTag.value)
+  emitTag(name, allWordsTag.value)
+  rememberAggregate(promptKeyNow.value, allWordsTag.value, !wasAdded)
   if (!wasAdded) copyQuiet(allWordsTag.value)
 }
 
@@ -957,7 +1009,11 @@ function pickRandomWords() {
   const list = promptFreqNow.value
   if (!list.length) return
   const name = promptPanel.value?.name || ''
-  if (randTagOn.value) emitTag(name, randTag.value)
+  const key = promptKeyNow.value
+  if (randTagOn.value) {
+    emitTag(name, randTag.value)
+    rememberAggregate(key, randTag.value, false)
+  }
   const n = Math.max(1, Math.min(Math.floor(Number(randCount.value) || 1), list.length))
   randCount.value = n
   const pool = list.map((w) => w.word)
@@ -965,6 +1021,7 @@ function pickRandomWords() {
   for (let i = 0; i < n; i++) picked.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0])
   randTag.value = picked.join(', ')
   emitTag(name, randTag.value)
+  rememberAggregate(key, randTag.value, true)
   copyQuiet(randTag.value)
 }
 
@@ -972,7 +1029,17 @@ function pickRandomWords() {
 function clearRandomTag() {
   if (!randTagOn.value) return
   emitTag(promptPanel.value?.name || '', randTag.value)
+  rememberAggregate(promptKeyNow.value, randTag.value, false)
   randTag.value = ''
+}
+
+/** 一键清掉这个 LoRA 的训练词点选：单词、全部串联、随机组合都撤掉 */
+function clearFreqPicks() {
+  const name = promptPanel.value?.name || ''
+  const key = promptKeyNow.value
+  for (const text of freqPickedNow.value) emitTag(name, text)
+  randTag.value = ''
+  freqAggregates.value = { ...freqAggregates.value, [key]: [] }
 }
 
 /** 例图提示词：点选就把整段复制走，不给任何提示；单选时选另一张会把这一组里已选的那条换掉 */
@@ -1218,7 +1285,6 @@ function onWeightKeydown(event) {
 }
 
 function onDocMouseDown(event) {
-  onDocMouseDownPrompt(event)
   if (!weightMenu.value) return
   if (event.target.closest?.('.lp-weight-menu')) return
   if (event.target.closest?.('.lp-step')) return
@@ -1263,6 +1329,7 @@ onBeforeUnmount(() => {
   clearTimeout(copiedTimer)
   document.removeEventListener('mousedown', onDocMouseDown, true)
   window.removeEventListener('resize', closeWeightMenu)
+  onPromptDragEnd()
 })
 
 </script>
@@ -1681,7 +1748,7 @@ onBeforeUnmount(() => {
         class="lp-tags"
         :style="{ left: promptPanel.left + 'px', top: promptPanel.top + 'px' }"
       >
-        <header class="lp-tags-head">
+        <header class="lp-tags-head" title="按住这里拖动面板" @mousedown="onPromptDragStart">
           <span class="lp-tags-title">提示词</span>
           <span class="lp-tags-name" :title="promptPanel.name">{{ promptPanel.name }}</span>
           <button type="button" class="lp-tags-close" title="关闭" @click="closePromptPanel">
@@ -1764,6 +1831,19 @@ onBeforeUnmount(() => {
                   取消随机
                 </button>
               </div>
+              <button
+                type="button"
+                class="lp-words-btn lp-words-clear"
+                :disabled="!freqPickedNow.size"
+                :title="
+                  freqPickedNow.size
+                    ? '把这个 LoRA 的训练词点选全部撤掉（单个词和批量组合都算）'
+                    : '当前没有训练词点选'
+                "
+                @click="clearFreqPicks"
+              >
+                清除训练词点选{{ freqPickedNow.size ? `（${freqPickedNow.size}）` : '' }}
+              </button>
             </div>
             <div class="lp-words-scroll">
               <div class="lp-words-head">
@@ -2834,6 +2914,9 @@ onBeforeUnmount(() => {
   padding: 8px 10px;
   background: #333;
   border-bottom: 1px solid #4a4a4a;
+  /* 标题栏就是拖动手柄 */
+  cursor: move;
+  user-select: none;
 }
 .lp-tags-title { flex: 0 0 auto; font-size: 11.5px; color: #dedede; }
 .lp-tags-name {
@@ -3017,6 +3100,19 @@ onBeforeUnmount(() => {
 }
 .lp-words-rand-btn { flex: 1 1 0; width: auto; padding: 5px 4px; text-align: center; }
 .lp-words-rand-btn:disabled {
+  color: #7a7a7a;
+  background: #333;
+  border-color: #444;
+  cursor: default;
+}
+.lp-words-clear {
+  color: #dbb3b3;
+  background: #3a2f2f;
+  border-color: #5c4343;
+  text-align: center;
+}
+.lp-words-clear:hover:not(:disabled) { color: #f2c6c6; background: #473535; border-color: #7a5652; }
+.lp-words-clear:disabled {
   color: #7a7a7a;
   background: #333;
   border-color: #444;
