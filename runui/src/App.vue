@@ -1070,6 +1070,41 @@ const primaryLabel = computed(() => {
   return '发送到 ComfyUI'
 })
 
+/* ------------------ 生成中：中上角浮动提示（带用时） ------------------ */
+const generating = computed(() => state.submitting || state.running || state.comparing)
+const genStartedAt = ref(0)
+const genClock = ref(Date.now())
+let genTimer = null
+watch(generating, (on) => {
+  if (on) {
+    if (!genStartedAt.value) genStartedAt.value = Date.now()
+    genClock.value = Date.now()
+    if (!genTimer) {
+      genTimer = setInterval(() => {
+        genClock.value = Date.now()
+      }, 1000)
+    }
+  } else {
+    if (genTimer) {
+      clearInterval(genTimer)
+      genTimer = null
+    }
+    genStartedAt.value = 0
+  }
+})
+const genSeconds = computed(() =>
+  genStartedAt.value ? Math.max(0, Math.round((genClock.value - genStartedAt.value) / 1000)) : 0
+)
+const genTipText = computed(() => state.message || '正在生成…')
+const genTipTime = computed(() => {
+  const s = genSeconds.value
+  const mm = Math.floor(s / 60)
+  return mm ? `${mm}m${String(s % 60).padStart(2, '0')}s` : `${s}s`
+})
+const genTipTitle = computed(() =>
+  genStartedAt.value ? `开始于 ${fmtTime(genStartedAt.value)}` : ''
+)
+
 
 /* ------------------ 极速对比：一次请求连续出 N 张（Efficiency XY） ------------------ */
 const xyCheck = computed(() => canXySampler(state.nodes, state.samplerId))
@@ -2562,6 +2597,10 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('keydown', onLightboxKey)
   window.removeEventListener('resize', onWindowResize)
+  if (genTimer) {
+    clearInterval(genTimer)
+    genTimer = null
+  }
 })
 </script>
 
@@ -2631,7 +2670,7 @@ onUnmounted(() => {
     </div>
 
     <main class="grid">
-      <section class="card col">
+      <section class="card col flow-card">
         <div class="card-head">
           <span>① 当前工作流</span>
           <span class="tag" v-if="state.nodes && Object.keys(state.nodes).length">
@@ -2905,7 +2944,6 @@ onUnmounted(() => {
             </label>
             <span class="hint" v-if="state.running && !state.comparing">执行中 · {{ state.elapsed }}s</span>
           </div>
-
           <p class="msg" v-if="state.message" :class="{ bad: state.failed }">{{ state.message }}</p>
 
           <div v-if="state.warnings.length" class="warnbox">
@@ -3178,7 +3216,7 @@ onUnmounted(() => {
         </section>
       </div>
 
-      <section class="card col">
+      <section class="card col result-card">
           <div class="card-head result-head">
             <div class="head-left">
               <span>④ 对比结果</span>
@@ -3364,6 +3402,21 @@ onUnmounted(() => {
         <p class="lb-hint">← → 切换 · Esc 或点图片关闭</p>
       </figure>
     </div>
+
+    <!-- 生成中的中上角浮动提示：文案 + 用时，跑完自动消失 -->
+    <Teleport to="body">
+      <div
+        v-if="generating"
+        class="gen-tip"
+        :class="{ bad: state.failed }"
+        :title="genTipTitle"
+        aria-live="polite"
+      >
+        <span class="gen-tip-dot"></span>
+        <span class="gen-tip-msg">{{ genTipText }}</span>
+        <span class="gen-tip-time">{{ genTipTime }}</span>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -3487,8 +3540,35 @@ onUnmounted(() => {
   min-height: 0;
   display: grid;
   grid-template-columns: 296px minmax(360px, 400px) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
   gap: 12px;
   padding: 12px;
+}
+/* ③ 采样参数挪到左列上半、① 当前工作流在下半，两半平分；
+   ② 留在中间列，只占自己的高度，下面空出来 */
+.grid > .col.stack { display: contents; }
+.grid .sampler-card {
+  grid-column: 1;
+  grid-row: 1;
+  min-height: 0;
+}
+.grid > .flow-card {
+  grid-column: 1;
+  grid-row: 2;
+  min-height: 0;
+}
+.grid .card.grow {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: start;
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
+}
+.grid > .result-card {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  min-height: 0;
 }
 
 .col { display: flex; flex-direction: column; min-height: 0; }
@@ -4390,5 +4470,77 @@ button.primary.sending {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* —— 生成中：中上角浮动提示 —— */
+.gen-tip {
+  position: fixed;
+  left: 50%;
+  top: 14px;
+  transform: translateX(-50%);
+  z-index: 100035;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(720px, calc(100vw - 32px));
+  padding: 8px 14px;
+  font-size: 12.5px;
+  color: var(--ink);
+  background: var(--card);
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+  animation: gen-tip-in 0.16s ease-out;
+}
+.gen-tip.bad {
+  border-color: var(--bad);
+  color: var(--bad);
+}
+.gen-tip-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--brand);
+  animation: gen-tip-pulse 1.1s ease-in-out infinite;
+}
+.gen-tip.bad .gen-tip-dot {
+  background: var(--bad);
+  animation: none;
+}
+.gen-tip-msg {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gen-tip-time {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+  background: var(--panel-2);
+  border-radius: 6px;
+}
+@keyframes gen-tip-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+@keyframes gen-tip-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
 }
 </style>

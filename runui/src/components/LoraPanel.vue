@@ -2801,12 +2801,12 @@ onBeforeUnmount(() => {
   to { opacity: 1; transform: translate(-50%, 0); }
 }
 
-/* 已勾选预览图面板：屏幕右上、LoRA 面板左侧，互不遮挡 */
+/* 已勾选预览图面板：屏幕右上、LoRA 面板左侧，互不遮挡；层级压在 LoRA 堆叠器（.lora-dock 55）之上 */
 .lp-gallery {
   position: fixed;
   top: 16px;
   right: 492px;
-  z-index: 54;
+  z-index: 9990;
   width: 420px;
   max-height: calc(100vh - 32px);
   display: flex;
