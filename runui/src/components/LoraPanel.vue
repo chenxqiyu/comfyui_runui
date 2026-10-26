@@ -576,20 +576,44 @@ const galleryItems = computed(() => {
 const copiedName = ref('')
 let copiedTimer = null
 
-async function copyName(name) {
-  if (!name) return
+/** 复制统一提示：把内容带出来，自己消失 */
+const copyTip = ref('')
+let copyTipTimer = null
+
+function showCopyTip(text) {
+  copyTip.value = text
+  clearTimeout(copyTipTimer)
+  copyTipTimer = setTimeout(() => {
+    copyTip.value = ''
+  }, 1600)
+}
+
+/** 写剪贴板：优先 async API，不支持就退回复制 textarea */
+function writeClipboard(text) {
   try {
-    await navigator.clipboard.writeText(name)
-  } catch {
+    if (navigator.clipboard?.writeText) return navigator.clipboard.writeText(text).catch(() => {})
+  } catch { /* 走下面的兜底 */ }
+  try {
     const ta = document.createElement('textarea')
-    ta.value = name
+    ta.value = text
     ta.style.position = 'fixed'
     ta.style.opacity = '0'
     document.body.appendChild(ta)
     ta.select()
     document.execCommand('copy')
     ta.remove()
-  }
+  } catch { /* 剪贴板不可用就只当没复制 */ }
+}
+
+function copyText(text) {
+  if (!text) return
+  writeClipboard(text)
+  showCopyTip(text)
+}
+
+function copyName(name) {
+  if (!name) return
+  copyText(name)
   copiedName.value = name
   clearTimeout(copiedTimer)
   copiedTimer = setTimeout(() => {
@@ -1042,15 +1066,11 @@ function emitTag(name, word) {
   emit('prompt-tag-toggle', { id: key, name, word })
 }
 
+/** 点触发词 / 训练词：加进「新提示词」并复制一份；已经加过的再点一次只取消、不复制 */
 function addPromptTag(pn, word) {
-  emitTag(pn?.name || '', word)
-}
-
-/** 训练词：点一下加进新提示词，同时静默复制一份；取消时只取消、不复制 */
-function pickFreqWord(pn, word) {
   const wasAdded = props.addedWords.includes(word)
-  addPromptTag(pn, word)
-  if (!wasAdded) copyQuiet(word)
+  emitTag(pn?.name || '', word)
+  if (!wasAdded) copyText(word)
 }
 
 /** 全部串成一个标签：词表是确定的，同一串再点一次就整体取消 */
@@ -1060,7 +1080,7 @@ function pickAllWords(pn) {
   const wasAdded = allOnOf(pn)
   emitTag(pn.name, text)
   rememberAggregate(keyOf(pn), text, !wasAdded)
-  if (!wasAdded) copyQuiet(text)
+  if (!wasAdded) copyText(text)
 }
 
 /** 随机组合：抽 n 个不重复的词串成一条标签；上一条随机组合还挂着就先换掉它 */
@@ -1080,7 +1100,7 @@ function pickRandomWords(pn) {
   pn.randTag = picked.join(', ')
   emitTag(pn.name, pn.randTag)
   rememberAggregate(key, pn.randTag, true)
-  copyQuiet(pn.randTag)
+  copyText(pn.randTag)
 }
 
 /** 只撤掉当前这条随机组合，不动面板里点出来的其它标签 */
@@ -1111,7 +1131,7 @@ function pickTopWords(pn) {
   pn.topTag = text
   emitTag(pn.name, text)
   rememberAggregate(key, text, true)
-  copyQuiet(text)
+  copyText(text)
 }
 
 /** 一键清掉这个 LoRA 的训练词点选：单词、全部串联、随机组合都撤掉 */
@@ -1137,28 +1157,7 @@ function pickExamplePrompt(pn, item) {
   }
   emitTag(name, item.text)
   // 取消勾选时不复制，只有真正加进新提示词才顺手放进剪贴板
-  if (!wasAdded) copyQuiet(item.text)
-}
-
-/** 静默复制：不弹提示、不改按钮文案，失败就算了 */
-function copyQuiet(text) {
-  if (!text) return
-  try {
-    if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(text).catch(() => {})
-      return
-    }
-  } catch { /* 走下面的兜底 */ }
-  try {
-    const ta = document.createElement('textarea')
-    ta.value = text
-    ta.style.position = 'fixed'
-    ta.style.opacity = '0'
-    document.body.appendChild(ta)
-    ta.select()
-    document.execCommand('copy')
-    ta.remove()
-  } catch { /* 剪贴板不可用就只当没复制 */ }
+  if (!wasAdded) copyText(item.text)
 }
 
 function isFast(item) {
@@ -1408,6 +1407,7 @@ onBeforeUnmount(() => {
   pollToken++
   clearTimeout(bigTimer)
   clearTimeout(copiedTimer)
+  clearTimeout(copyTipTimer)
   document.removeEventListener('mousedown', onDocMouseDown, true)
   window.removeEventListener('resize', closeWeightMenu)
   stopWinDrag()
@@ -1971,9 +1971,9 @@ onBeforeUnmount(() => {
                   "
                   role="button"
                   tabindex="0"
-                  @click="pickFreqWord(pn, w.word)"
-                  @keydown.enter="pickFreqWord(pn, w.word)"
-                  @keydown.space.prevent="pickFreqWord(pn, w.word)"
+                  @click="addPromptTag(pn, w.word)"
+                  @keydown.enter="addPromptTag(pn, w.word)"
+                  @keydown.space.prevent="addPromptTag(pn, w.word)"
                 >
                   <span class="lp-words-text">{{ w.word }}</span>
                   <span v-if="w.count" class="lp-words-badge">{{ w.count }}</span>
@@ -2212,6 +2212,13 @@ onBeforeUnmount(() => {
         </div>
         <p v-else class="lp-gallery-empty">已勾选的 LoRA 还没有预览图</p>
       </section>
+    </Teleport>
+
+    <Teleport to="body">
+      <div v-if="copyTip" class="lp-copy-tip" aria-live="polite">
+        <span class="lp-copy-tip-tag">已复制</span>
+        <span class="lp-copy-tip-text">{{ copyTip }}</span>
+      </div>
     </Teleport>
 
     <Teleport to="body">
@@ -2758,6 +2765,40 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 复制提示：所有复制动作统一走这里，1.6s 后自己消失 */
+.lp-copy-tip {
+  position: fixed;
+  left: 50%;
+  top: 24px;
+  transform: translateX(-50%);
+  z-index: 100040;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: min(620px, calc(100vw - 32px));
+  padding: 7px 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #d8efdf;
+  background: rgba(32, 40, 35, .96);
+  border: 1px solid #476b4f;
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .5);
+  pointer-events: none;
+  animation: lp-copy-in .14s ease-out;
+}
+.lp-copy-tip-tag { flex: 0 0 auto; color: #7bd39a; }
+.lp-copy-tip-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@keyframes lp-copy-in {
+  from { opacity: 0; transform: translate(-50%, -6px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
 }
 
 /* 已勾选预览图面板：屏幕右上、LoRA 面板左侧，互不遮挡 */
