@@ -599,6 +599,9 @@ const promptPanel = ref(null) // { name, left, top }
 const promptWords = ref({}) // name -> string[]
 const promptBusy = new Set()
 const promptImagePrompts = ref({}) // name -> [{ i, text }]，civitai 例图里带的完整提示词
+const promptDescriptions = ref({}) // name -> 清洗过的描述 HTML（空串 = 没有描述，不显示 tab）
+/** 描述 tab 只在有描述时出现，默认停在标签那一页 */
+const promptTab = ref('tags')
 /** 默认第一条：这个 LoRA 还没点过触发词时，自动把第一条加上 */
 const autoFirst = ref(false)
 /** 例图提示词：默认单选（选另一张会替换），勾上「多选」才允许同时选多条 */
@@ -630,6 +633,66 @@ function normalizeImagePrompts(meta) {
   return out.slice(0, 12)
 }
 
+/* Civitai 的描述是富文本：只留白名单标签，属性除 a[href] 全部丢掉，
+ * 脚本/样式类标签整段删除，免得把远端 HTML 直接 v-html 进页面。 */
+const DESC_TAGS = new Set([
+  'P', 'BR', 'STRONG', 'B', 'EM', 'I', 'U', 'S', 'DEL', 'UL', 'OL', 'LI',
+  'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'BLOCKQUOTE', 'CODE', 'PRE', 'HR',
+  'A', 'SPAN', 'DIV', 'SMALL', 'SUB', 'SUP', 'DL', 'DT', 'DD',
+])
+const DESC_DROP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'IFRAME', 'OBJECT', 'EMBED', 'TEMPLATE', 'LINK', 'META'])
+const DESC_MAX = 20000
+
+function escapeText(s) {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+}
+
+function cleanChildren(parent) {
+  for (const node of [...parent.childNodes]) {
+    if (node.nodeType === 3) continue
+    if (node.nodeType !== 1) {
+      node.remove()
+      continue
+    }
+    const el = node
+    if (DESC_DROP.has(el.tagName)) {
+      el.remove()
+      continue
+    }
+    if (!DESC_TAGS.has(el.tagName)) {
+      cleanChildren(el)
+      el.replaceWith(...el.childNodes)
+      continue
+    }
+    const href = el.tagName === 'A' ? el.getAttribute('href') || '' : ''
+    for (const attr of [...el.attributes]) el.removeAttribute(attr.name)
+    if (el.tagName === 'A') {
+      cleanChildren(el)
+      if (/^(https?:\/\/|\/)/i.test(href)) {
+        el.setAttribute('href', href)
+        el.setAttribute('target', '_blank')
+        el.setAttribute('rel', 'noopener noreferrer')
+      } else {
+        el.replaceWith(...el.childNodes)
+        continue
+      }
+    }
+    cleanChildren(el)
+  }
+}
+
+/** 描述 -> 可安全 v-html 的片段；纯文本描述按换行转 <br>，空描述返回空串 */
+function cleanDescription(raw) {
+  let text = String(raw || '').trim()
+  if (!text) return ''
+  if (text.length > DESC_MAX) text = text.slice(0, DESC_MAX)
+  if (!/<[a-z!/][^>]*>/i.test(text)) return escapeText(text).replace(/\r?\n/g, '<br>')
+  const doc = new DOMParser().parseFromString(text, 'text/html')
+  cleanChildren(doc.body)
+  if (!doc.body.textContent.trim() && !doc.body.querySelector('hr, br, li')) return ''
+  return doc.body.innerHTML.trim()
+}
+
 /** 工作流里的名字可能带目录前缀 / 扩展名 / 训练步数后缀，逐个变体去搜 */
 function searchTerms(name) {
   const base = String(name || '').replace(/\\/g, '/').split('/').pop()
@@ -653,6 +716,9 @@ async function fetchTrainedWords(name, force = false) {
     const nextPrompts = { ...promptImagePrompts.value }
     delete nextPrompts[key]
     promptImagePrompts.value = nextPrompts
+    const nextDesc = { ...promptDescriptions.value }
+    delete nextDesc[key]
+    promptDescriptions.value = nextDesc
   } else if (key in promptWords.value) return
   promptBusy.add(key)
   try {
@@ -688,23 +754,29 @@ async function fetchTrainedWords(name, force = false) {
     if (!hit) hit = weak
     let words = normalizeWords({ trainedWords: hit?.civitai?.trainedWords })
     let prompts = []
+    let describe = ''
     if (hit?.file_path) {
-      try {
-        const data = await apiGet(
-          `/api/lm/loras/metadata?file_path=${encodeURIComponent(hit.file_path)}`
-        )
-        const metaWords = normalizeWords(data?.metadata)
+      const q = encodeURIComponent(hit.file_path)
+      // 描述和 metadata 一起发，别让描述 tab 多等一次往返
+      const [metaRes, descRes] = await Promise.allSettled([
+        apiGet(`/api/lm/loras/metadata?file_path=${q}`),
+        apiGet(`/api/lm/loras/model-description?file_path=${q}`),
+      ])
+      // metadata 读不到就退回列表里自带的触发词
+      if (metaRes.status === 'fulfilled') {
+        const metaWords = normalizeWords(metaRes.value?.metadata)
         if (metaWords.length) words = metaWords
-        prompts = normalizeImagePrompts(data?.metadata)
-      } catch {
-        // metadata 读不到就退回列表里自带的触发词
+        prompts = normalizeImagePrompts(metaRes.value?.metadata)
       }
+      if (descRes.status === 'fulfilled') describe = cleanDescription(descRes.value?.description)
     }
     promptWords.value = { ...promptWords.value, [key]: words }
     promptImagePrompts.value = { ...promptImagePrompts.value, [key]: prompts }
+    promptDescriptions.value = { ...promptDescriptions.value, [key]: describe }
   } catch {
     promptWords.value = { ...promptWords.value, [key]: [] }
     promptImagePrompts.value = { ...promptImagePrompts.value, [key]: [] }
+    promptDescriptions.value = { ...promptDescriptions.value, [key]: '' }
   } finally {
     promptBusy.delete(key)
   }
@@ -713,6 +785,11 @@ async function fetchTrainedWords(name, force = false) {
 const promptKeyNow = computed(() => normName(promptPanel.value?.name || ''))
 const promptWordsNow = computed(() => promptWords.value[promptKeyNow.value] || [])
 const promptPromptsNow = computed(() => promptImagePrompts.value[promptKeyNow.value] || [])
+const promptDescNow = computed(() => promptDescriptions.value[promptKeyNow.value] || '')
+// 没描述时 tab 条整个不显示，停在「描述」上也要退回标签页
+const activePromptTab = computed(() =>
+  promptTab.value === 'desc' && promptDescNow.value ? 'desc' : 'tags'
+)
 const promptLoading = computed(
   () => !!promptPanel.value && !(promptKeyNow.value in promptWords.value)
 )
@@ -794,6 +871,7 @@ function openPromptPanel(p, event) {
     left,
     top: Math.max(8, Math.min(rect.top - 8, window.innerHeight - height - 8)),
   }
+  promptTab.value = 'tags'
   closeWeightMenu()
   hideBigPreview()
   fetchTrainedWords(p.name, true)
@@ -1536,57 +1614,79 @@ onBeforeUnmount(() => {
             ×
           </button>
         </header>
+        <div v-if="promptDescNow" class="lp-tags-tabs">
+          <button
+            type="button"
+            class="lp-tags-tab"
+            :class="{ on: activePromptTab === 'tags' }"
+            @click="promptTab = 'tags'"
+          >
+            标签
+          </button>
+          <button
+            type="button"
+            class="lp-tags-tab"
+            :class="{ on: activePromptTab === 'desc' }"
+            title="LoraManager 里的模型描述"
+            @click="promptTab = 'desc'"
+          >
+            模型描述
+          </button>
+        </div>
         <div class="lp-tags-body">
-          <div class="lp-tags-scroll">
-            <div class="lp-tags-list">
-              <span class="lp-tags-label">触发词 · 点一下加到新提示词</span>
-              <p v-if="promptLoading" class="lp-tags-empty">读取中…</p>
-              <p v-else-if="!promptWordsNow.length" class="lp-tags-empty">
-                这个 LoRA 没取到触发词（需要 LoraManager 里有它的 metadata）
-              </p>
-              <button
-                v-for="w in promptWordsNow"
-                :key="w"
-                type="button"
-                class="lp-tags-word"
-                :class="{ on: addedWords.includes(w) }"
-                :title="addedWords.includes(w) ? `${w}\n再点一下从「新提示词」里移除` : w"
-                @click="addPromptTag(w)"
-              >
-                {{ w }}
-              </button>
-            </div>
-            <div v-if="promptPromptsNow.length" class="lp-tags-list">
-              <div class="lp-tags-list-head">
-                <span class="lp-tags-label">
-                  例图提示词 · {{ exampleMulti ? '多选' : '单选，选另一张会替换' }}
-                </span>
-                <label
-                  class="lp-tags-multi"
-                  title="关闭：一次只用一张例图提示词，选另一张会替换已选的；开启：可以同时选多张"
+          <div v-if="activePromptTab === 'desc'" class="lp-tags-desc" v-html="promptDescNow"></div>
+          <template v-else>
+            <div class="lp-tags-scroll">
+              <div class="lp-tags-list">
+                <span class="lp-tags-label">触发词 · 点一下加到新提示词</span>
+                <p v-if="promptLoading" class="lp-tags-empty">读取中…</p>
+                <p v-else-if="!promptWordsNow.length" class="lp-tags-empty">
+                  这个 LoRA 没取到触发词（需要 LoraManager 里有它的 metadata）
+                </p>
+                <button
+                  v-for="w in promptWordsNow"
+                  :key="w"
+                  type="button"
+                  class="lp-tags-word"
+                  :class="{ on: addedWords.includes(w) }"
+                  :title="addedWords.includes(w) ? `${w}\n再点一下从「新提示词」里移除` : w"
+                  @click="addPromptTag(w)"
                 >
-                  <input v-model="exampleMulti" type="checkbox" />
-                  <span>多选</span>
-                </label>
+                  {{ w }}
+                </button>
               </div>
-              <button
-                v-for="p in promptPromptsNow"
-                :key="p.i + p.text"
-                type="button"
-                class="lp-tags-word lp-tags-prompt"
-                :class="{ on: addedWords.includes(p.text), blank: !p.text }"
-                @click="pickExamplePrompt(p)"
-                @mouseenter="showBigUrl(p.url, `图 ${p.i + 1}`, $event)"
-                @mouseleave="hideBigPreview"
-              >
-                <img v-if="p.url" class="lp-tags-thumb" :src="p.url" alt="" loading="lazy" />
-                <span class="lp-tags-prompt-text">
-                  <em class="lp-tags-idx">图 {{ p.i + 1 }}</em>{{ p.text }}
-                </span>
-              </button>
+              <div v-if="promptPromptsNow.length" class="lp-tags-list">
+                <div class="lp-tags-list-head">
+                  <span class="lp-tags-label">
+                    例图提示词 · {{ exampleMulti ? '多选' : '单选，选另一张会替换' }}
+                  </span>
+                  <label
+                    class="lp-tags-multi"
+                    title="关闭：一次只用一张例图提示词，选另一张会替换已选的；开启：可以同时选多张"
+                  >
+                    <input v-model="exampleMulti" type="checkbox" />
+                    <span>多选</span>
+                  </label>
+                </div>
+                <button
+                  v-for="p in promptPromptsNow"
+                  :key="p.i + p.text"
+                  type="button"
+                  class="lp-tags-word lp-tags-prompt"
+                  :class="{ on: addedWords.includes(p.text), blank: !p.text }"
+                  @click="pickExamplePrompt(p)"
+                  @mouseenter="showBigUrl(p.url, `图 ${p.i + 1}`, $event)"
+                  @mouseleave="hideBigPreview"
+                >
+                  <img v-if="p.url" class="lp-tags-thumb" :src="p.url" alt="" loading="lazy" />
+                  <span class="lp-tags-prompt-text">
+                    <em class="lp-tags-idx">图 {{ p.i + 1 }}</em>{{ p.text }}
+                  </span>
+                </button>
+              </div>
             </div>
-          </div>
-          <p class="lp-tags-foot">标签排在「＋ 加一个提示词」上面，拖动可换顺序</p>
+            <p class="lp-tags-foot">标签排在「＋ 加一个提示词」上面，拖动可换顺序</p>
+          </template>
         </div>
       </section>
     </Teleport>
@@ -2604,7 +2704,65 @@ onBeforeUnmount(() => {
   cursor: pointer;
 }
 .lp-tags-close:hover { background: #4a4a4a; color: #f0f0f0; }
+/* 有模型描述才有这排 tab；没描述时整条不渲染 */
+.lp-tags-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 6px 8px 0;
+  background: #333;
+}
+.lp-tags-tab {
+  flex: 1 1 0;
+  padding: 4px 6px;
+  font-size: 10.5px;
+  color: #9a9a9a;
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  cursor: pointer;
+  transition: color .12s, background .12s, border-color .12s;
+}
+.lp-tags-tab:hover { color: #dedede; }
+.lp-tags-tab.on { color: #cfe6fb; background: #3a3a3a; border-color: #4a4a4a; }
+/* 描述可能是很长的富文本：独立滚动，不撑高面板 */
+.lp-tags-desc {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 8px 10px;
+  overflow-y: auto;
+  font-size: 11px;
+  line-height: 1.6;
+  color: #cfcfcf;
+  word-break: break-word;
+  scrollbar-width: thin;
+  scrollbar-color: #555 transparent;
+}
+.lp-tags-desc :deep(p),
+.lp-tags-desc :deep(ul),
+.lp-tags-desc :deep(ol),
+.lp-tags-desc :deep(blockquote),
+.lp-tags-desc :deep(pre),
+.lp-tags-desc :deep(dl) { margin: 0 0 6px; }
+.lp-tags-desc :deep(ul),
+.lp-tags-desc :deep(ol) { padding-left: 16px; }
+.lp-tags-desc :deep(h1),
+.lp-tags-desc :deep(h2),
+.lp-tags-desc :deep(h3),
+.lp-tags-desc :deep(h4),
+.lp-tags-desc :deep(h5),
+.lp-tags-desc :deep(h6) {
+  margin: 0 0 6px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #e8e8e8;
+}
+.lp-tags-desc :deep(a) { color: #7fb2e5; }
+.lp-tags-desc :deep(hr) { margin: 6px 0; border: none; border-top: 1px solid #4a4a4a; }
+.lp-tags-desc :deep(pre),
+.lp-tags-desc :deep(code) { font-family: var(--mono); font-size: 10.5px; }
 .lp-tags-body {
+  flex: 1 1 auto;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -2948,6 +3106,8 @@ onBeforeUnmount(() => {
 
 /* clip 展开行：[clip] 名称 ‹ 1.00 ›（右侧留出与上一行 clip/⇄ 等宽的空白，权重框右边缘对齐） */
 .lp-clip {
+  /* 卡片是「缩略图 + 内容」两列网格；展开区必须横跨两列，否则会掉进 44px 的缩略图列被挤扁 */
+  grid-column: 1 / -1;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -2983,6 +3143,8 @@ onBeforeUnmount(() => {
 
 /* 权重对比展开区 */
 .lp-sweep {
+  /* 同 .lp-clip：横跨缩略图列和内容列 */
+  grid-column: 1 / -1;
   display: flex;
   flex-direction: column;
   gap: 7px;
